@@ -1,0 +1,46 @@
+{
+  "schema": "replicaro-unsigned-build-inputs-v1",
+  "version": "1.0.0",
+  "toolchains": {
+    "go": "1.26.7",
+    "node": "24.19.0",
+    "npm": "11.17.0",
+    "innoSetup": "7.1.0"
+  },
+  "targets": {
+    "windows_amd64": {
+      "artifacts": [
+        "Replicaro-{version}-windows_amd64-portable.zip",
+        "Replicaro-{version}-windows_amd64-setup.exe"
+      ]
+    },
+    "linux_amd64": {
+      "artifacts": [
+        "Replicaro-{version}-linux_amd64.AppImage",
+        "replicaro-{version}-linux_amd64.deb",
+        "replicaro-{version}-linux_amd64.rpm",
+        "replicaro-{version}-linux_amd64.tar.gz"
+      ]
+    },
+    "linux_arm64": {
+      "artifacts": [
+        "Replicaro-{version}-linux_arm64.AppImage",
+        "replicaro-{version}-linux_arm64.deb",
+        "replicaro-{version}-linux_arm64.rpm",
+        "replicaro-{version}-linux_arm64.tar.gz"
+      ]
+    },
+    "darwin_amd64": {
+      "artifacts": [
+        "Replicaro-{version}-darwin_amd64-portable.zip",
+        "Replicaro-{version}-darwin_amd64.dmg"
+      ]
+    },
+    "darwin_arm64": {
+      "artifacts": [
+        "Replicaro-{version}-darwin_arm64-portable.zip",
+        "Replicaro-{version}-darwin_arm64.dmg"
+      ]
+    }
+  }
+}

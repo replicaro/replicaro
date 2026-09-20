@@ -1,0 +1,40 @@
+{
+  "version": "1.9.1",
+  "reviewedAt": "2026-07-22",
+  "source": "https://github.com/AppImage/appimagetool/releases/tag/1.9.1",
+  "license": "MIT",
+  "artifacts": {
+    "linux_amd64": {
+      "filename": "appimagetool-x86_64.AppImage",
+      "url": "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage",
+      "sha256": "ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+    },
+    "linux_arm64": {
+      "filename": "appimagetool-aarch64.AppImage",
+      "url": "https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-aarch64.AppImage",
+      "sha256": "f0837e7448a0c1e4e650a93bb3e85802546e60654ef287576f46c71c126a9158"
+    }
+  },
+  "runtime": {
+    "releaseTag": "continuous",
+    "releaseId": 343809378,
+    "releaseCommit": "75849dce7cc37e4319b633df1f116ca895c71a12",
+    "reviewedAt": "2026-07-22",
+    "source": "https://github.com/AppImage/type2-runtime/releases/tag/continuous",
+    "license": "https://github.com/AppImage/type2-runtime/blob/75849dce7cc37e4319b633df1f116ca895c71a12/LICENSE",
+    "artifacts": {
+      "linux_amd64": {
+        "filename": "runtime-x86_64",
+        "assetId": 456065460,
+        "url": "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/456065460",
+        "sha256": "1cc49bcf1e2ccd593c379adb17c9f85a36d619088296504de95b1d06215aebbf"
+      },
+      "linux_arm64": {
+        "filename": "runtime-aarch64",
+        "assetId": 456064894,
+        "url": "https://api.github.com/repos/AppImage/type2-runtime/releases/assets/456064894",
+        "sha256": "7d5d772b7c32f0c84caf0a452a3072a5709027d7eac5856feb89a7a7a8881372"
+      }
+    }
+  }
+}

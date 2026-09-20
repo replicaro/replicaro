@@ -1,0 +1,23 @@
+* text=auto eol=lf
+
+*.ico -text
+*.png -text
+*.syso -text
+
+engines/assets/licenses/kopia-LICENSE.txt -text
+
+engines/assets/darwin_amd64/kopia filter=lfs diff=lfs merge=lfs -text
+engines/assets/darwin_amd64/restic filter=lfs diff=lfs merge=lfs -text
+engines/assets/darwin_arm64/kopia filter=lfs diff=lfs merge=lfs -text
+engines/assets/darwin_arm64/restic filter=lfs diff=lfs merge=lfs -text
+engines/assets/kopia.exe filter=lfs diff=lfs merge=lfs -text
+engines/assets/linux_amd64/kopia filter=lfs diff=lfs merge=lfs -text
+engines/assets/linux_amd64/restic filter=lfs diff=lfs merge=lfs -text
+engines/assets/linux_arm64/kopia filter=lfs diff=lfs merge=lfs -text
+engines/assets/linux_arm64/restic filter=lfs diff=lfs merge=lfs -text
+engines/assets/restic.exe filter=lfs diff=lfs merge=lfs -text
+rclone/assets/darwin_amd64/rclone filter=lfs diff=lfs merge=lfs -text
+rclone/assets/darwin_arm64/rclone filter=lfs diff=lfs merge=lfs -text
+rclone/assets/linux_amd64/rclone filter=lfs diff=lfs merge=lfs -text
+rclone/assets/linux_arm64/rclone filter=lfs diff=lfs merge=lfs -text
+rclone/assets/rclone.exe filter=lfs diff=lfs merge=lfs -text

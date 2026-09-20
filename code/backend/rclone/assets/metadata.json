@@ -1,0 +1,50 @@
+{
+  "version": "1.75.1",
+  "reviewedAt": "2026-09-19",
+  "latestStableObserved": "1.75.1",
+  "source": "https://github.com/rclone/rclone/releases/tag/v1.75.1",
+  "archive": "https://github.com/rclone/rclone/releases/download/v1.75.1/rclone-v1.75.1-windows-amd64.zip",
+  "archiveSha256": "200eb602c126d82aa38b51e0f6b9ae837473ff99b51278d3f6f837574c494d6e",
+  "binary": "assets/rclone.exe",
+  "binarySha256": "033eee51c9ad47c2de2624b6674d355274bcd6cf0027a5f85db4437ba24ae81c",
+  "license": "MIT",
+  "licensePath": "assets/licenses/rclone-LICENSE.txt",
+  "licenseUrl": "https://github.com/rclone/rclone/blob/v1.75.1/COPYING",
+  "artifacts": {
+    "windows_amd64": {
+      "target": "windows_amd64",
+      "archive": "https://github.com/rclone/rclone/releases/download/v1.75.1/rclone-v1.75.1-windows-amd64.zip",
+      "archiveSha256": "200eb602c126d82aa38b51e0f6b9ae837473ff99b51278d3f6f837574c494d6e",
+      "binary": "assets/rclone.exe",
+      "binarySha256": "033eee51c9ad47c2de2624b6674d355274bcd6cf0027a5f85db4437ba24ae81c"
+    },
+    "linux_amd64": {
+      "target": "linux_amd64",
+      "archive": "https://github.com/rclone/rclone/releases/download/v1.75.1/rclone-v1.75.1-linux-amd64.zip",
+      "archiveSha256": "982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab",
+      "binary": "assets/linux_amd64/rclone",
+      "binarySha256": "f66d8c1d552ad90296a11bc8b46d56a7fa5da1a7fa05e7ca522d95df92c4a4c0"
+    },
+    "linux_arm64": {
+      "target": "linux_arm64",
+      "archive": "https://github.com/rclone/rclone/releases/download/v1.75.1/rclone-v1.75.1-linux-arm64.zip",
+      "archiveSha256": "03f2504174034b6d004152ed7369251c9a9ec1f7e0836eda420f5c7a5ec0dff9",
+      "binary": "assets/linux_arm64/rclone",
+      "binarySha256": "d7ecfc17726b34f95c5f7ea9470862c2aef53dce1bb0677b83142ca38503f489"
+    },
+    "darwin_amd64": {
+      "target": "darwin_amd64",
+      "archive": "https://github.com/rclone/rclone/releases/download/v1.75.1/rclone-v1.75.1-osx-amd64.zip",
+      "archiveSha256": "29253d0288b8fbbac46baad6e5f6add6cb01d462c79f10805bbd4631c4cdf82c",
+      "binary": "assets/darwin_amd64/rclone",
+      "binarySha256": "67286994be6b150c8f33d70dbafb4256897b008714bc39f3727585a598ec0d31"
+    },
+    "darwin_arm64": {
+      "target": "darwin_arm64",
+      "archive": "https://github.com/rclone/rclone/releases/download/v1.75.1/rclone-v1.75.1-osx-arm64.zip",
+      "archiveSha256": "c61d7a371c62bcbbe882c3423aa4b8bf63485c248dd0f692997b8f0c3f6d0c6f",
+      "binary": "assets/darwin_arm64/rclone",
+      "binarySha256": "bfe4a146980f07de56e7dc0115cf562aaad5c81fd10ef9b0f36f777eba0ab031"
+    }
+  }
+}

@@ -1,0 +1,320 @@
+{
+  "reviewedAt": "2026-07-29",
+  "integrations": [
+    {
+      "id": "fs",
+      "reviewedAt": "2026-07-18",
+      "label": "Local Folder or Network Directory",
+      "description": "A local path, mounted share, mapped drive, or network path. External, portable, and flash drives are supported.",
+      "placeholder": "D:\\Backups\\vault, \\\\server\\share\\vault, or /var/backups",
+      "capabilities": [
+        "storage",
+        "source",
+        "destination"
+      ],
+      "localBrowser": true,
+      "options": []
+    },
+    {
+      "id": "s3",
+      "reviewedAt": "2026-08-03",
+      "label": "Any S3-Compatible Object Storage",
+      "description": "Supports all S3-compatible object storage, including but not limited to AWS, Backblaze B2, Wasabi, Cloudflare R2, IDrive e2, and MinIO.",
+      "placeholder": "s3://endpoint/bucket/path",
+      "capabilities": [
+        "storage",
+        "source",
+        "destination"
+      ],
+      "options": [
+        {
+          "key": "access_key",
+          "label": "Access key",
+          "required": true,
+          "credential": true
+        },
+        {
+          "key": "secret_access_key",
+          "label": "Secret access key",
+          "required": true,
+          "secret": true,
+          "credential": true
+        },
+        {
+          "key": "use_tls",
+          "label": "Use TLS",
+          "kind": "boolean",
+          "default": "true",
+          "advanced": true
+        },
+        {
+          "key": "tls_insecure_no_verify",
+          "label": "Skip TLS certificate verification",
+          "kind": "boolean",
+          "default": "false",
+          "advanced": true
+        },
+        {
+          "key": "endpoint",
+          "label": "Endpoint"
+        },
+        {
+          "key": "region",
+          "label": "Region (optional)",
+          "placeholder": "us-east-2"
+        },
+        {
+          "key": "port",
+          "label": "Port (optional)",
+          "advanced": true
+        },
+        {
+          "key": "root",
+          "label": "Bucket and path override",
+          "placeholder": "/bucket/path",
+          "advanced": true
+        },
+        {
+          "key": "storage_class",
+          "label": "Storage class (optional)",
+          "help": "For GLACIER or DEEP_ARCHIVE, use the cold storage option instead.",
+          "advanced": true
+        },
+        {
+          "key": "sse_customer_key",
+          "label": "SSE customer key",
+          "secret": true,
+          "credential": true,
+          "advanced": true
+        }
+      ]
+    },
+    {
+      "id": "sftp",
+      "reviewedAt": "2026-08-03",
+      "label": "SFTP / SSH",
+      "description": "Supports any server or remote location that is accessible over SSH or SFTP. Also works for local network locations that are accessible over SSH or SFTP, but it is recommended to use the Network Folder storage type for local network locations.",
+      "placeholder": "sftp://user@host/path/to/vault",
+      "capabilities": [
+        "storage",
+        "source",
+        "destination"
+      ],
+      "options": [
+        {
+          "key": "path_mode",
+          "label": "Vault location on server",
+          "default": "home"
+        },
+        {
+          "key": "username",
+          "label": "Username"
+        },
+        {
+          "key": "port",
+          "label": "Port",
+          "default": "22"
+        },
+        {
+          "key": "password",
+          "label": "SFTP/SSH password",
+          "secret": true,
+          "credential": true
+        },
+        {
+          "key": "identity",
+          "label": "SSH identity/key file",
+          "placeholder": "C:\\Users\\me\\.ssh\\id_ed25519",
+          "help": "Use an OpenSSH private key without passphrase. OpenSSH key with passphrase is not supported. PuTTY .ppk files are not supported.",
+          "credential": true
+        },
+        {
+          "key": "insecure_ignore_host_key",
+          "label": "Disable host-key/known_hosts verification",
+          "kind": "boolean",
+          "default": "true"
+        },
+        {
+          "key": "ssh_auth_sock",
+          "label": "SSH agent socket",
+          "credential": true,
+          "advanced": true
+        },
+        {
+          "key": "ssh_private_key",
+          "label": "SSH private key material",
+          "kind": "textarea",
+          "secret": true,
+          "credential": true,
+          "advanced": true
+        },
+        {
+          "key": "ssh_private_key_ttl",
+          "label": "Temporary key lifetime",
+          "advanced": true
+        }
+      ]
+    },
+    {
+      "id": "azblob",
+      "reviewedAt": "2026-08-03",
+      "label": "Azure Object Storage",
+      "description": "Also known as Azure Blob Storage.",
+      "placeholder": "azblob://container/path",
+      "capabilities": [
+        "storage",
+        "source",
+        "destination"
+      ],
+      "options": [
+        {
+          "key": "account_name",
+          "label": "Account name"
+        },
+        {
+          "key": "account_key",
+          "label": "Account key",
+          "secret": true,
+          "credential": true
+        },
+        {
+          "key": "endpoint",
+          "label": "Custom endpoint (optional)",
+          "advanced": true
+        }
+      ]
+    },
+    {
+      "id": "gcs",
+      "reviewedAt": "2026-07-26",
+      "label": "Google Cloud Object Storage",
+      "description": "This is not Google Drive. This is Google Cloud Storage. Use the Google Drive storage type if you want that.",
+      "placeholder": "gs://bucket/path",
+      "capabilities": [
+        "storage",
+        "source",
+        "destination"
+      ],
+      "options": [
+        {
+          "key": "credentials_file",
+          "label": "Credentials JSON file",
+          "placeholder": "C:\\secure\\service-account.json",
+          "credential": true
+        },
+        {
+          "key": "credentials_json",
+          "label": "Credentials JSON",
+          "kind": "textarea",
+          "secret": true,
+          "credential": true,
+          "advanced": true
+        },
+        {
+          "key": "endpoint",
+          "label": "Custom endpoint (optional)",
+          "advanced": true
+        }
+      ]
+    },
+    {
+      "id": "google_drive",
+      "reviewedAt": "2026-07-29",
+      "label": "Google Drive",
+      "description": "Supports all Google Drive accounts. This is not Google Cloud Storage. Use the Google Cloud Object Storage storage type if you want that.",
+      "placeholder": "Vault folder name",
+      "capabilities": [
+        "storage"
+      ],
+      "options": [
+        {
+          "key": "token",
+          "label": "Native rclone token",
+          "secret": true,
+          "credential": true
+        },
+        {
+          "key": "scope",
+          "label": "Scope",
+          "advanced": true
+        },
+        {
+          "key": "root_folder_id",
+          "label": "Root folder ID",
+          "advanced": true
+        },
+        {
+          "key": "team_drive",
+          "label": "Shared drive ID",
+          "advanced": true
+        }
+      ]
+    },
+    {
+      "id": "dropbox",
+      "reviewedAt": "2026-07-29",
+      "label": "Dropbox",
+      "description": "Supports all Dropbox accounts.",
+      "placeholder": "Vault folder name",
+      "capabilities": [
+        "storage"
+      ],
+      "options": [
+        {
+          "key": "token",
+          "label": "Native rclone token",
+          "secret": true,
+          "credential": true
+        },
+        {
+          "key": "root_namespace",
+          "label": "Root namespace",
+          "advanced": true
+        }
+      ]
+    },
+    {
+      "id": "onedrive",
+      "reviewedAt": "2026-07-29",
+      "label": "OneDrive",
+      "description": "Supports all OneDrive accounts.",
+      "placeholder": "Vault folder name",
+      "capabilities": [
+        "storage"
+      ],
+      "options": [
+        {
+          "key": "token",
+          "label": "Native rclone token",
+          "secret": true,
+          "credential": true
+        },
+        {
+          "key": "region",
+          "label": "Region",
+          "advanced": true
+        },
+        {
+          "key": "drive_id",
+          "label": "Drive ID",
+          "advanced": true
+        },
+        {
+          "key": "drive_type",
+          "label": "Drive type",
+          "advanced": true
+        },
+        {
+          "key": "root_folder_id",
+          "label": "Root folder ID",
+          "advanced": true
+        },
+        {
+          "key": "tenant",
+          "label": "Tenant",
+          "advanced": true
+        }
+      ]
+    }
+  ]
+}

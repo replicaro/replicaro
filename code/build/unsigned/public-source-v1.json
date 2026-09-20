@@ -1,0 +1,1504 @@
+{
+  "schema": "replicaro-public-source-v1",
+  "files": [
+    {
+      "path": "LICENSE",
+      "mode": "100644"
+    },
+    {
+      "path": "README.md",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/.gitattributes",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/app_update.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/cors.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/directories.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/directory_roots_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/directory_roots_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/file_history.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/job_request.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/macos_permission.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/notifications.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/operation_finalization.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/rclone_auth.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/rclone_auth_relay.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/repository_create.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/repository_recovery.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/repository_request.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/security.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/server.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/settings_request.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/storage_admission.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/support_report.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/vault_ownership.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/vault_progress.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/webui.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/webui_dist/.gitkeep",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/webui_source_embedded.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/webui_source_external.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appdata/atomic.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appdata/atomic_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appdata/atomic_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appdata/path_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appdata/path_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appdata/root.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appdata/secure_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appdata/secure_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appdata/security_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appdata/security_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/appupdate/service.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/artifactrecovery/recovery.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/cmd/storage-helper/main.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/captured_output.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/captured_output_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/captured_output_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_cleanup_darwin.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_cleanup_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_pipe_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_pipe_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_reap_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_reap_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_session_darwin.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_session_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_wait_darwin.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_wait_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/command_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/native_process_fence.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/native_process_fence_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/command/native_process_fence_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/componentmanifest/verify.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/activity.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/app_update.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/availability.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/dashboard.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/database.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/jobs.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/kopia_filesystem_reconnect.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/kopia_policy.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/metadata_blocks.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/metadata_cache.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/metadata_rebuild.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/metadata_replace_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/metadata_replace_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/metadata_store.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/migrations.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/names.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/operation_steps.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/operations.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/owner_transfer.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/password_change.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/profile_sync.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/rclone_config_owners.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/recovery.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/recovery_definitions.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/repositories.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/repository_connection.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/repository_creation.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/repository_network.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/repository_network_darwin.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/repository_network_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/repository_network_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/secretcodec.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/settings.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/settings_helpers.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/storage_binding.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/support_privacy.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/timestamps.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/assets/godbus-LICENSE.txt",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/assets/packaging/inno-wizard-teal-on-white.png",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/assets/packaging/replicaro-app-icon-teal-on-white-1024.png",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/assets/packaging/replicaro-mark-teal-256.png",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/assets/replicaro-favicon.ico",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/assets/replicaro-favicon.png",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/desktop.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/icon_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/native_darwin.h",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/native_darwin.m",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/native_tray_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/notification_icon.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/run_darwin.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/run_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/run_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/settings.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/startup_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/startup_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/desktop/windows_toast.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/artifact_sync_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/artifact_sync_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/assets.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/assets/darwin_amd64/kopia",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/engines/assets/darwin_amd64/restic",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/engines/assets/darwin_arm64/kopia",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/engines/assets/darwin_arm64/restic",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/engines/assets/kopia.exe",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/engines/assets/licenses/kopia-LICENSE.txt",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/assets/licenses/restic-LICENSE.txt",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/assets/linux_amd64/kopia",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/engines/assets/linux_amd64/restic",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/engines/assets/linux_arm64/kopia",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/engines/assets/linux_arm64/restic",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/engines/assets/restic.exe",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/engines/assets_darwin_amd64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/assets_darwin_arm64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/assets_linux_amd64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/assets_linux_arm64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/assets_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/assets_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/backup_issues.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/concurrency.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/external_ssh.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/kopia.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/kopia_destination.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/kopia_directory.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/kopia_policy.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/kopia_reconnect.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/metadata.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/metadata_runtime.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/missing.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/mount_boundary_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/mount_boundary_mountpoint_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/mount_boundary_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/mount_boundary_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/mount_boundary_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/options.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/presentation_tags.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/process.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/public.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_auth.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_authorization_browser_environment_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_authorization_browser_environment_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_config_activation.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_config_activation_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_config_activation_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_native.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_providers.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_session_case.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_session_path.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_session_path_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_session_remove.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_session_remove_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_session_remove_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_vault_config.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_vault_config_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_vault_config_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/registry.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/reparse_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/reparse_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/repository_identity.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/repository_task_cache.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/requested_operation.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/restic.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/restic_rclone.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/restore.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/storage.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/types.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/version.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/go.mod",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/go.sum",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/instanceguard/guard_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/instanceguard/guard_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/integrations/catalog.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/integrations/catalog.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/jobscript/jobscript.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/kopiapolicy/reconciler.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/licenses/robfig-cron-LICENSE.txt",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/main.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/metadata/cache.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/models/activity.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/models/archive_path.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/models/backupjob.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/models/concurrency.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/models/dashboard.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/models/operation.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/models/repository.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/models/retention.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/models/settings.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/models/snapshot.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/models/version.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/notifications/webhook.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/operationlog/file_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/operationlog/file_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/operationlog/operationlog.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/operationruntime/manager.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/platforms/platforms.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/profilebinding/repair.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/profilesync/sync.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rclone/assets/darwin_amd64/rclone",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/rclone/assets/darwin_arm64/rclone",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/rclone/assets/licenses/rclone-LICENSE.txt",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rclone/assets/linux_amd64/rclone",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/rclone/assets/linux_arm64/rclone",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/rclone/assets/metadata.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rclone/assets/rclone.exe",
+      "mode": "100644",
+      "lfs": true
+    },
+    {
+      "path": "code/backend/rclone/embed_darwin_amd64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rclone/embed_darwin_arm64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rclone/embed_linux_amd64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rclone/embed_linux_arm64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rclone/embed_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rclone/embed_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rclone/materialize.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rendezvous/rendezvous.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rendezvous/security_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/rendezvous/security_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/replicaro_icon_windows_amd64.syso",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/repositoryadmission/admission.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/repositoryadmission/kopia_reconnect.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/runner/password_change.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/runner/repository_relocation.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/runner/runner.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/runtimeendpoint/address_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/runtimeendpoint/address_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/runtimeendpoint/client_uuid.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/runtimeendpoint/endpoint.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/scheduler/check.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/scheduler/manager.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/scheduler/repository_tasks.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/schedulevalue/schedule.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageavailability/observer.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storagehelper/embed.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storagehelper/embed_darwin_amd64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storagehelper/embed_darwin_arm64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storagehelper/embed_linux_amd64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storagehelper/embed_linux_arm64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storagehelper/embed_windows_amd64.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storagehelper/materialize.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storagehelper/runner.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storagehelper/security_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storagehelper/security_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/darwin_facts.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/descriptor.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/helper.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/helper_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/helper_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/inspection.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/linux_mountinfo.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/path.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/platform_darwin.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/platform_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/platform_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/spelling.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/windows_facts.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/tools/targetverify/main.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/tools/webuiembed/helper.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/tools/webuiembed/main.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/tools/webuiembed/pathlink_other.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/tools/webuiembed/pathlink_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultidentity/identity.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultlock/lock.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultprofile/password_rotation.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultprofile/password_rotation_fs_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultprofile/password_rotation_fs_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultprofile/profile.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultprofile/staging_space_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultprofile/staging_space_windows.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultprofile/store.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultprofile/timing.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultstatistics/statistics.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/.gitignore",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/acquire-appimage-runtime.sh",
+      "mode": "100755"
+    },
+    {
+      "path": "code/build/unsigned/acquire-appimagetool.sh",
+      "mode": "100755"
+    },
+    {
+      "path": "code/build/unsigned/appimage-runtime-LICENSE.txt",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/appimagetool-metadata.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/build-linux.sh",
+      "mode": "100755"
+    },
+    {
+      "path": "code/build/unsigned/build-macos.sh",
+      "mode": "100755"
+    },
+    {
+      "path": "code/build/unsigned/build-windows.bat",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/build-windows.ps1",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/cmd/contract/main.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/compile-linux.sh",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/compile-macos.sh",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/compile-windows.ps1",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/go.mod",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/inno-setup-metadata.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/inputs.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/install-inno-setup.ps1",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/install-linux.sh",
+      "mode": "100755"
+    },
+    {
+      "path": "code/build/unsigned/package-linux-formats.sh",
+      "mode": "100755"
+    },
+    {
+      "path": "code/build/unsigned/package-windows.ps1",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/public-source-v1.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/release_assets.py",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/replicaro.iss",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/sbom.sh",
+      "mode": "100755"
+    },
+    {
+      "path": "code/build/unsigned/uninstall-linux.sh",
+      "mode": "100755"
+    },
+    {
+      "path": "code/build/unsigned/verify-toolchains.sh",
+      "mode": "100755"
+    },
+    {
+      "path": "code/build/unsigned/verify_macos_dmg.py",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/verify_macos_dmg_test.py",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/write-licenses.py",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/.gitattributes",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/.gitignore",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/cacheBust.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/index.html",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/package-lock.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/package.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/favicon-teal-64.png",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/favicon.ico",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/replicaro-wordmark-teal.png",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/replicaro-wordmark-white.png",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/App.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/components/BackupRunPicker.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/components/DirectoryPicker.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/components/JobScriptFields.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/components/ListControls.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/components/MetadataIndexNotice.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/components/RcloneAuthorization.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/components/numberInput.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/components/ui.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/index.css",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/layouts/MainLayout.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/main.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/nativePathDisplay.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/pages/FindFile.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/pages/Overview.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/pages/Protect.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/pages/Restore.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/pages/System.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/pages/dashboardIssue.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/pages/nativeLogFormat.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/pages/nativeLogPaging.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/restoreCapabilities.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/services/api.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/services/backupJobs.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/services/vaultPassword.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/theme.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/types.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/tsconfig.app.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/tsconfig.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/tsconfig.node.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/vite.config.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "readme-assets/badge-docker.svg",
+      "mode": "100644"
+    },
+    {
+      "path": "readme-assets/badge-linux.svg",
+      "mode": "100644"
+    },
+    {
+      "path": "readme-assets/badge-macos.svg",
+      "mode": "100644"
+    },
+    {
+      "path": "readme-assets/badge-windows.svg",
+      "mode": "100644"
+    },
+    {
+      "path": "readme-assets/dashboard-dark-short.png",
+      "mode": "100644"
+    },
+    {
+      "path": "readme-assets/dashboard-dark.png",
+      "mode": "100644"
+    },
+    {
+      "path": "readme-assets/dashboard-light.png",
+      "mode": "100644"
+    },
+    {
+      "path": "readme-assets/dashboard-neutral.png",
+      "mode": "100644"
+    },
+    {
+      "path": "readme-assets/file-history-browse-dark.png",
+      "mode": "100644"
+    },
+    {
+      "path": "readme-assets/file-history-dark.png",
+      "mode": "100644"
+    },
+    {
+      "path": "readme-assets/protect-dark.png",
+      "mode": "100644"
+    },
+    {
+      "path": "readme-assets/restore-dark.png",
+      "mode": "100644"
+    }
+  ]
+}

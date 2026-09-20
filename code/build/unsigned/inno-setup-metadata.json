@@ -1,0 +1,15 @@
+{
+  "schema": "replicaro-inno-setup-v3",
+  "version": "7.1.0",
+  "architecture": "x64",
+  "compiler": "ISCC.exe",
+  "repository": "https://github.com/jrsoftware/issrc",
+  "release": "https://github.com/jrsoftware/issrc/releases/tag/is-7_1_0",
+  "installer": {
+    "url": "https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe",
+    "sha256": "0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f",
+    "size": 14304168,
+    "redirectHost": "release-assets.githubusercontent.com"
+  },
+  "license": "https://github.com/jrsoftware/issrc/blob/is-7_1_0/license.txt"
+}
