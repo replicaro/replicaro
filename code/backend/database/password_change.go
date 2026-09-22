@@ -13,23 +13,24 @@ import (
 var ErrVaultPasswordChangeRecoveryRequired = errors.New("vault-password change recovery is required before this vault can be used")
 
 type VaultPasswordChangeOperation struct {
-	RepositoryID  string `json:"repositoryId"`
-	OperationUUID string `json:"operationUUID"`
-	Phase         string `json:"phase"`
-	NativeStatus  string `json:"nativeStatus"`
-	NativeOutput  string `json:"nativeOutput,omitempty"`
-	LastError     string `json:"lastError,omitempty"`
-	CreatedAt     string `json:"createdAt"`
-	UpdatedAt     string `json:"updatedAt"`
+	RepositoryID              string `json:"repositoryId"`
+	OperationUUID             string `json:"operationUUID"`
+	Phase                     string `json:"phase"`
+	NativeStatus              string `json:"nativeStatus"`
+	NativeMutationDisposition string `json:"nativeMutationDisposition"`
+	NativeOutput              string `json:"nativeOutput,omitempty"`
+	LastError                 string `json:"lastError,omitempty"`
+	CreatedAt                 string `json:"createdAt"`
+	UpdatedAt                 string `json:"updatedAt"`
 }
 
 const passwordChangeColumns = `repository_id, operation_uuid, phase,
-	native_status, native_output, last_error, created_at, updated_at`
+	native_status, native_mutation_disposition, native_output, last_error, created_at, updated_at`
 
 func scanVaultPasswordChange(scan func(...any) error) (VaultPasswordChangeOperation, error) {
 	var value VaultPasswordChangeOperation
 	err := scan(&value.RepositoryID, &value.OperationUUID, &value.Phase,
-		&value.NativeStatus, &value.NativeOutput, &value.LastError, &value.CreatedAt, &value.UpdatedAt)
+		&value.NativeStatus, &value.NativeMutationDisposition, &value.NativeOutput, &value.LastError, &value.CreatedAt, &value.UpdatedAt)
 	return value, err
 }
 
@@ -146,12 +147,27 @@ func AdvanceVaultPasswordChangeAfterCandidateVerification(db *sql.DB, repository
 	return nil
 }
 
-func RecordVaultPasswordNativeResult(db *sql.DB, repositoryID, status, output, safeError string) error {
+func RecordVaultPasswordNativeResult(db *sql.DB, repositoryID, status, disposition, output, safeError string) error {
 	if status != "not_started" && status != "succeeded" && status != "failed" && status != "interrupted" {
 		return fmt.Errorf("invalid native password-change result")
 	}
-	result, err := db.Exec(`UPDATE vault_password_change_operations SET native_status=?,native_output=?,last_error=?,updated_at=?
-		WHERE repository_id=? AND phase='native_started'`, status, output, safeError,
+	if disposition != "unknown" && disposition != "rejected_before_mutation" {
+		return fmt.Errorf("invalid native password-change mutation disposition")
+	}
+	if disposition == "rejected_before_mutation" && status != "failed" {
+		return fmt.Errorf("pre-mutation rejection requires a failed native password-change result")
+	}
+	if disposition == "rejected_before_mutation" {
+		var engine string
+		if err := db.QueryRow(`SELECT engine FROM repositories WHERE id=?`, repositoryID).Scan(&engine); err != nil {
+			return err
+		}
+		if engine != "restic" {
+			return fmt.Errorf("pre-mutation rejection is not supported for this engine")
+		}
+	}
+	result, err := db.Exec(`UPDATE vault_password_change_operations SET native_status=?,native_mutation_disposition=?,native_output=?,last_error=?,updated_at=?
+		WHERE repository_id=? AND phase='native_started'`, status, disposition, output, safeError,
 		time.Now().UTC().Format(time.RFC3339Nano), repositoryID)
 	if err != nil {
 		return err
@@ -227,18 +243,27 @@ func AbandonPreparedVaultPasswordChange(db *sql.DB, repositoryID string) error {
 }
 
 func AbandonConclusiveUnstartedVaultPasswordChange(db *sql.DB, repositoryID string) error {
+	return abandonConclusivePreMutationVaultPasswordChange(db, repositoryID, "not_started", "unknown")
+}
+
+func AbandonRejectedBeforeMutationVaultPasswordChange(db *sql.DB, repositoryID string) error {
+	return abandonConclusivePreMutationVaultPasswordChange(db, repositoryID, "failed", "rejected_before_mutation")
+}
+
+func abandonConclusivePreMutationVaultPasswordChange(db *sql.DB, repositoryID, nativeStatus, disposition string) error {
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 	result, err := tx.Exec(`DELETE FROM vault_password_change_operations
-		WHERE repository_id=? AND phase='native_started' AND native_status='not_started'`, repositoryID)
+		WHERE repository_id=? AND phase='native_started' AND native_status=? AND native_mutation_disposition=?`,
+		repositoryID, nativeStatus, disposition)
 	if err != nil {
 		return err
 	}
 	if count, _ := result.RowsAffected(); count != 1 {
-		return fmt.Errorf("native password change is not conclusively unstarted")
+		return fmt.Errorf("native password change lacks conclusive pre-mutation evidence")
 	}
 	if _, err := tx.Exec(`UPDATE repositories SET pending_passphrase='' WHERE id=?`, repositoryID); err != nil {
 		return err

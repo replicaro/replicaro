@@ -2,13 +2,15 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { useLocation, useNavigate, useOutletContext } from "react-router-dom";
 
 import { preventNumberInputWheel } from "../components/numberInput";
-import { Loading, Modal, SaveChangesDialog, useToast } from "../components/ui";
+import { ConfirmDialog, Loading, Modal, SaveChangesDialog, useToast } from "../components/ui";
 import { checkForAppUpdate, getEngines, getPlatform, getSettings, getSupportReport, openAppUpdateDownload, saveSettings } from "../services/api";
 import type { AppUpdateStatus, EngineDescriptor, PlatformInfo, Settings as SettingsType } from "../types";
 import type { AppUpdateOutletContext } from "../layouts/MainLayout";
 import { applyThemePreference } from "../theme";
 
 const supportReportByteLimit = 256 * 1024;
+const highBackupAdmissionConfirmation = "More than 5 simultaneous backup runs may fail if your computer does not have enough RAM or CPU. Are you sure you want to set the limit above 5?";
+type PendingSaveAction = "save" | "save-and-leave";
 let supportClipboardTail: Promise<void> = Promise.resolve();
 
 function writeSupportReportToClipboard(report: string): Promise<void> {
@@ -62,6 +64,7 @@ export default function System() {
     const [version, setVersion] = useState("");
     const [saving, setSaving] = useState(false);
     const [pendingNavigation, setPendingNavigation] = useState<string | null>(null);
+    const [pendingSaveAction, setPendingSaveAction] = useState<PendingSaveAction | null>(null);
     const [manualUpdateStatus, setManualUpdateStatus] = useState<AppUpdateStatus | null>(null);
     const [checkingForUpdate, setCheckingForUpdate] = useState(false);
     const [supportOpen, setSupportOpen] = useState(false);
@@ -264,12 +267,33 @@ export default function System() {
         if (target) navigate(target);
     };
 
-    const saveAndLeave = async () => {
+    const performSaveAction = async (action: PendingSaveAction) => {
         const target = pendingNavigation;
         if (await save()) {
-            setPendingNavigation(null);
-            if (target) navigate(target);
+            if (action === "save-and-leave") {
+                setPendingNavigation(null);
+                if (target) navigate(target);
+            }
         }
+    };
+
+    const requestSave = (action: PendingSaveAction) => {
+        if (!settings) return;
+        // Confirmation is tied to a changed high value, not merely a high
+        // persisted value. Keeping the pending action transient prevents a
+        // cancel from committing settings or changing navigation state.
+        if (settings.maxConcurrentJobRuns > 5 &&
+                settings.maxConcurrentJobRuns !== savedSettings?.maxConcurrentJobRuns) {
+            setPendingSaveAction(action);
+            return;
+        }
+        void performSaveAction(action);
+    };
+
+    const confirmHighConcurrencySave = () => {
+        const action = pendingSaveAction;
+        setPendingSaveAction(null);
+        if (action) void performSaveAction(action);
     };
 
     if (!settings) return <div className="page"><Loading /></div>;
@@ -306,7 +330,7 @@ export default function System() {
             {(platform?.capabilities.startAtLogin ?? true) && <><div className="system-label">Startup</div><section className="system-section"><label className="check"><input type="checkbox" checked={settings.startAtLogin ?? settings.startWithWindows} onChange={(event) => setSettings({ ...settings, startAtLogin: event.target.checked, startWithWindows: event.target.checked })} />Start Replicaro at login</label></section></>}
             <div className="system-label">Housekeeping</div><section className="system-section"><label className="field compact-field"><span>Keep logs for (days)</span><input type="number" min={1} value={settings.logRetentionDays} onWheel={preventNumberInputWheel} onChange={(event) => setSettings({ ...settings, logRetentionDays: parseInt(event.target.value, 10) || 30 })} /></label></section>
             <div className="system-label">Backup admission</div><section className="system-section"><label className="field system-control-field"><span>Maximum simultaneous backup runs</span><input type="number" min={1} max={32} value={settings.maxConcurrentJobRuns} onWheel={preventNumberInputWheel} onChange={(event) => setSettings({ ...settings, maxConcurrentJobRuns: Math.min(32, Math.max(1, parseInt(event.target.value, 10) || 2)) })} /></label></section>
-            <div className="system-label">Notifications</div><section className="system-section notifications-section">{(platform?.capabilities.nativeNotifications ?? true) && <div className="notification-channel"><div className="notification-channel-title">Desktop</div><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnFailure ?? settings.notifyWindowsOnFailure} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnFailure: event.target.checked, notifyWindowsOnFailure: event.target.checked })} />Notify on failures</label><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnSuccess ?? settings.notifyWindowsOnSuccess} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnSuccess: event.target.checked, notifyWindowsOnSuccess: event.target.checked })} />Notify on success</label></div>}<div className="notification-channel"><div className="notification-channel-title">Webhooks</div><label className="field system-wide-field"><span>Webhook URL</span><input type="url" value={settings.webhookUrl} onChange={(event) => setSettings({ ...settings, webhookUrl: event.target.value })} /><small>Leave blank if not using webhooks</small></label><label className="check"><input type="checkbox" checked={settings.notifyWebhookOnFailure} onChange={(event) => setSettings({ ...settings, notifyWebhookOnFailure: event.target.checked })} />Notify on failures</label><label className="check"><input type="checkbox" checked={settings.notifyWebhookOnSuccess} onChange={(event) => setSettings({ ...settings, notifyWebhookOnSuccess: event.target.checked })} />Notify on success</label></div><button className="btn primary save-settings" disabled={saving} onClick={() => void save()}>{saving ? "Saving…" : "Save settings"}</button></section>
+            <div className="system-label">Notifications</div><section className="system-section notifications-section">{(platform?.capabilities.nativeNotifications ?? true) && <div className="notification-channel"><div className="notification-channel-title">Desktop</div><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnFailure ?? settings.notifyWindowsOnFailure} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnFailure: event.target.checked, notifyWindowsOnFailure: event.target.checked })} />Notify on failures</label><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnSuccess ?? settings.notifyWindowsOnSuccess} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnSuccess: event.target.checked, notifyWindowsOnSuccess: event.target.checked })} />Notify on success</label></div>}<div className="notification-channel"><div className="notification-channel-title">Webhooks</div><label className="field system-wide-field"><span>Webhook URL</span><input type="url" value={settings.webhookUrl} onChange={(event) => setSettings({ ...settings, webhookUrl: event.target.value })} /><small>Leave blank if not using webhooks</small></label><label className="check"><input type="checkbox" checked={settings.notifyWebhookOnFailure} onChange={(event) => setSettings({ ...settings, notifyWebhookOnFailure: event.target.checked })} />Notify on failures</label><label className="check"><input type="checkbox" checked={settings.notifyWebhookOnSuccess} onChange={(event) => setSettings({ ...settings, notifyWebhookOnSuccess: event.target.checked })} />Notify on success</label></div><button className="btn primary save-settings" disabled={saving} onClick={() => requestSave("save")}>{saving ? "Saving…" : "Save settings"}</button></section>
         </div>
         {supportOpen && <Modal title="Report bugs or errors" onClose={closeSupportReport} wide><div className="support-report-modal">
             <p className="modal-intro">Submit an issue on GitHub to report a Replicaro bug/error. You will need to copy/paste the error log below into the GitHub issue. Replicaro never uploads or submits this log automatically.</p>
@@ -320,6 +344,7 @@ export default function System() {
                 <a className="btn" href={supportReport && !supportLoading ? "https://github.com/replicaro/replicaro/issues/new" : undefined} target="_blank" rel="noreferrer" role="link" aria-disabled={!supportReport || supportLoading} tabIndex={supportReport && !supportLoading ? 0 : -1} onClick={() => { if (supportReport && !supportLoading) void copySupportReport(); }}>Open GitHub issue</a>
             </div>
         </div></Modal>}
-        {pendingNavigation && <SaveChangesDialog onSave={() => void saveAndLeave()} onDiscard={discardAndLeave} onCancel={() => setPendingNavigation(null)} busy={saving} />}
+        {pendingSaveAction && <ConfirmDialog title="Confirm backup admission limit" message={highBackupAdmissionConfirmation} confirmLabel="Save limit" busy={saving} onConfirm={confirmHighConcurrencySave} onCancel={() => setPendingSaveAction(null)} />}
+        {pendingNavigation && !pendingSaveAction && <SaveChangesDialog onSave={() => requestSave("save-and-leave")} onDiscard={discardAndLeave} onCancel={() => setPendingNavigation(null)} busy={saving} />}
     </div>;
 }

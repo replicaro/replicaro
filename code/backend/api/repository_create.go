@@ -33,7 +33,7 @@ func normalizeCreateRepositoryDefaults(req *CreateRepositoryRequest) error {
 		req.CheckSchedule = "manual"
 	}
 	var err error
-	req.ConcurrencyMode, err = models.NormalizeConcurrencyMode(req.ConcurrencyMode)
+	req.ConcurrencyMode, err = models.NormalizeConcurrencyModeForConnector(req.Connector, req.ConcurrencyMode)
 	if err != nil {
 		return err
 	}

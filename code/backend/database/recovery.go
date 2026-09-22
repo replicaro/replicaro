@@ -617,7 +617,7 @@ func AttachRecoveredRepository(
 	if maintenance == "" {
 		maintenance = "daily"
 	}
-	concurrencyMode, err := models.NormalizeConcurrencyMode(repo.ConcurrencyMode)
+	concurrencyMode, err := models.NormalizeConcurrencyModeForConnector(repo.Connector, repo.ConcurrencyMode)
 	if err != nil {
 		return "", nil, err
 	}
@@ -930,7 +930,7 @@ func ReconnectRecoveredRepository(db *sql.DB, repo models.Repository, jobs []mod
 	if maintenance == "" {
 		maintenance = "daily"
 	}
-	concurrencyMode, err := models.NormalizeConcurrencyMode(repo.ConcurrencyMode)
+	concurrencyMode, err := models.NormalizeConcurrencyModeForConnector(repo.Connector, repo.ConcurrencyMode)
 	if err != nil {
 		return "", nil, err
 	}

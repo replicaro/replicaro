@@ -116,9 +116,27 @@ type rcloneAuthStatus struct {
 }
 
 type rcloneApplicationOutcome struct {
-	Activation engines.RcloneConfigActivation `json:"activation"`
-	Attached   bool                           `json:"attached"`
-	Usable     *bool                          `json:"usable,omitempty"`
+	Activation   engines.RcloneConfigActivation `json:"activation"`
+	Attached     bool                           `json:"attached"`
+	Usable       *bool                          `json:"usable,omitempty"`
+	FailureStage rcloneApplicationFailureStage  `json:"failureStage,omitempty"`
+}
+
+type rcloneApplicationFailureStage string
+
+const (
+	rcloneFailureAdmission                 rcloneApplicationFailureStage = "admission"
+	rcloneFailureSavedVaultValidation      rcloneApplicationFailureStage = "saved_vault_validation"
+	rcloneFailureNativeValidation          rcloneApplicationFailureStage = "native_validation"
+	rcloneFailureProtectedRecordValidation rcloneApplicationFailureStage = "protected_record_validation"
+	rcloneFailureConfigActivation          rcloneApplicationFailureStage = "config_activation"
+	rcloneFailureArtifactWork              rcloneApplicationFailureStage = "artifact_work"
+	rcloneFailureDatabaseCredentialUpdate  rcloneApplicationFailureStage = "database_credential_update"
+)
+
+func failRcloneApplication(outcome rcloneApplicationOutcome, stage rcloneApplicationFailureStage, err error) (rcloneApplicationOutcome, error) {
+	outcome.FailureStage = stage
+	return outcome, err
 }
 
 func assessedUsability(value bool) *bool { return &value }
@@ -134,6 +152,9 @@ func addRcloneOutcome(response map[string]any, outcome rcloneApplicationOutcome)
 	response["attached"] = outcome.Attached
 	if outcome.Usable != nil {
 		response["usable"] = *outcome.Usable
+	}
+	if outcome.FailureStage != "" {
+		response["failureStage"] = outcome.FailureStage
 	}
 }
 
@@ -1224,6 +1245,7 @@ func registerRcloneAuthHandlers(
 			return
 		}
 		if finishErr != nil {
+			outcome.FailureStage = rcloneFailureArtifactWork
 			writeRcloneApplicationError(w, http.StatusInternalServerError, outcome, fmt.Errorf(
 				"rclone login was saved, but its temporary authorization session needs cleanup: %w",
 				finishErr,
@@ -1246,12 +1268,17 @@ func applyRcloneAuthorizedCredentials(
 		Activation: engines.RcloneConfigActivation{Disposition: engines.RcloneConfigRetained},
 		Attached:   true,
 	}
-	unlock, lockOK, lockErr := vaultlock.YieldLowPriorityAndTryExclusiveContext(ctx, repo.ID)
+	// A native-login apply is an attended foreground transaction. In particular,
+	// OneDrive and Google Drive can still be completing an ordinary protected
+	// profile publication when the browser flow returns. Wait for that exact
+	// in-process vault owner, then revalidate every admission and saved-vault
+	// precondition below while holding the lock. A one-shot try here made slower
+	// providers report a spurious busy failure; cancellation still leaves the
+	// retained authorization retryable. This wait neither unlocks native work
+	// nor masks remote multi-computer races.
+	unlock, lockErr := vaultlock.AcquireExclusiveContext(ctx, repo.ID)
 	if lockErr != nil {
-		return outcome, lockErr
-	}
-	if !lockOK {
-		return outcome, fmt.Errorf("vault is busy with another operation")
+		return failRcloneApplication(outcome, rcloneFailureAdmission, lockErr)
 	}
 	defer unlock()
 	// Authorization may outlive the saved-row review. A pending reconnect or
@@ -1259,19 +1286,28 @@ func applyRcloneAuthorizedCredentials(
 	// validation, artifact staging, or canonical rclone config publication.
 	// Publication used to precede the database reservation check at commit.
 	if err := database.ValidateRepositoryMutationAdmission(db, repo.ID); err != nil {
-		return outcome, err
+		// The handler loaded repo before waiting for the vault owner. Removal may
+		// have committed under that owner in the meantime, so only conclusive
+		// under-lock absence replaces the pre-wait attachment truth.
+		if errors.Is(err, sql.ErrNoRows) {
+			outcome.Attached = false
+		}
+		return failRcloneApplication(outcome, rcloneFailureAdmission, err)
 	}
 	current, err := database.GetRepository(db, repo.ID)
 	if err != nil {
-		return outcome, err
+		if errors.Is(err, sql.ErrNoRows) {
+			outcome.Attached = false
+		}
+		return failRcloneApplication(outcome, rcloneFailureSavedVaultValidation, err)
 	}
 	if current.Engine != repo.Engine || current.Connector != repo.Connector {
-		return outcome, fmt.Errorf("vault changed during rclone authorization")
+		return failRcloneApplication(outcome, rcloneFailureSavedVaultValidation, fmt.Errorf("vault changed during rclone authorization"))
 	}
 	repo = current
 	integration, ok := integrations.Find(repo.Connector)
 	if !ok {
-		return outcome, fmt.Errorf("rclone provider definition is unavailable")
+		return failRcloneApplication(outcome, rcloneFailureSavedVaultValidation, fmt.Errorf("rclone provider definition is unavailable"))
 	}
 	merged := make(map[string]string, len(providerOptions)+2)
 	for key, value := range providerOptions {
@@ -1279,7 +1315,7 @@ func applyRcloneAuthorizedCredentials(
 	}
 	normalized, err := engines.NormalizeConnectorOptions(repo.Engine, integration, merged)
 	if err != nil {
-		return outcome, err
+		return failRcloneApplication(outcome, rcloneFailureSavedVaultValidation, err)
 	}
 	oldIdentity, oldErr := vaultidentity.PhysicalIdentityWithOptions(
 		repo.Connector, repo.Location, repo.ConnectorOptions,
@@ -1288,7 +1324,7 @@ func applyRcloneAuthorizedCredentials(
 		repo.Connector, repo.Location, normalized,
 	)
 	if oldErr != nil || newErr != nil || oldIdentity != newIdentity {
-		return outcome, fmt.Errorf("rclone login addresses a different physical vault")
+		return failRcloneApplication(outcome, rcloneFailureSavedVaultValidation, fmt.Errorf("rclone login addresses a different physical vault"))
 	}
 	candidate := repo
 	candidate.ConnectorOptions = normalized
@@ -1300,50 +1336,56 @@ func applyRcloneAuthorizedCredentials(
 	// case described at validateRotatedCredentials: it would add a remote round
 	// trip without a demonstrated backup-integrity benefit.
 	if err := validateRotatedCredentials(ctx, candidate); err != nil {
-		return outcome, fmt.Errorf("rclone login could not access the native vault")
+		return failRcloneApplication(outcome, rcloneFailureNativeValidation, fmt.Errorf("rclone login could not access the native vault"))
 	}
 	rootData, err := readRootWithRotatedCredentials(ctx, candidate)
 	if err != nil {
-		return outcome, fmt.Errorf("rclone login could not access the vault root")
+		return failRcloneApplication(outcome, rcloneFailureProtectedRecordValidation, fmt.Errorf("rclone login could not access the vault root"))
 	}
 	root, err := vaultprofile.ParseRoot(rootData, repo.Connector)
-	if err != nil || root.VaultUUID != repo.ID || root.Repository.Engine != repo.Engine ||
+	if err != nil {
+		return failRcloneApplication(outcome, rcloneFailureProtectedRecordValidation, fmt.Errorf("rclone login returned an invalid vault root"))
+	}
+	if root.VaultUUID != repo.ID || root.Repository.Engine != repo.Engine ||
 		root.Repository.NativeRepositoryID != repo.NativeRepositoryID {
-		return outcome, fmt.Errorf("rclone login addresses a different vault")
+		return failRcloneApplication(outcome, rcloneFailureProtectedRecordValidation, fmt.Errorf("rclone login addresses a different vault"))
 	}
 	profileData, err := readProfileWithRotatedCredentials(ctx, candidate)
 	if err != nil {
-		return outcome, fmt.Errorf("rclone login could not access the recovery profile")
+		return failRcloneApplication(outcome, rcloneFailureProtectedRecordValidation, fmt.Errorf("rclone login could not access the recovery profile"))
 	}
 	profile, err := vaultprofile.Parse(profileData)
-	if err != nil || profile.VaultUUID != repo.ID || profile.ProfileUUID != repo.ProfileUUID ||
+	if err != nil {
+		return failRcloneApplication(outcome, rcloneFailureProtectedRecordValidation, fmt.Errorf("rclone login returned an invalid recovery profile"))
+	}
+	if profile.VaultUUID != repo.ID || profile.ProfileUUID != repo.ProfileUUID ||
 		profile.Attachment.ClientUUID != repo.ClientUUID || profile.Attachment.Generation != repo.AttachmentGeneration {
-		return outcome, fmt.Errorf("rclone login addresses a different vault")
+		return failRcloneApplication(outcome, rcloneFailureProtectedRecordValidation, fmt.Errorf("rclone login addresses a different vault"))
 	}
 	if publishConfig == nil {
-		return outcome, fmt.Errorf("rclone vault config publication is unavailable")
+		return failRcloneApplication(outcome, rcloneFailureConfigActivation, fmt.Errorf("rclone vault config publication is unavailable"))
 	}
 	activation, publishErr := publishConfig()
 	outcome.Activation = activation
 	if publishErr != nil {
-		return outcome, fmt.Errorf("rclone login could not activate the native vault config")
+		return failRcloneApplication(outcome, rcloneFailureConfigActivation, fmt.Errorf("rclone login could not activate the native vault config"))
 	}
 	stage, err := stageRepositoryArtifacts(
 		repo, engines.RepositoryArtifactCredentialRotation,
 	)
 	if err != nil {
-		return outcome, fmt.Errorf("stale local engine credentials could not be staged: %w", err)
+		return failRcloneApplication(outcome, rcloneFailureArtifactWork, fmt.Errorf("stale local engine credentials could not be staged: %w", err))
 	}
 	if err := updateRepositoryCredentials(db, repo.ID, normalized); err != nil {
 		if restoreErr := restoreRepositoryArtifacts(stage); restoreErr != nil {
-			return outcome, fmt.Errorf("credential update failed and old local engine artifacts could not be restored: %v; restore error: %w", err, restoreErr)
+			return failRcloneApplication(outcome, rcloneFailureDatabaseCredentialUpdate, fmt.Errorf("credential update failed and old local engine artifacts could not be restored: %v; restore error: %w", err, restoreErr))
 		}
-		return outcome, err
+		return failRcloneApplication(outcome, rcloneFailureDatabaseCredentialUpdate, err)
 	}
 	outcome.Attached = true
 	outcome.Usable = assessedUsability(true)
 	if err := finalizeRepositoryArtifacts(stage); err != nil {
-		return outcome, fmt.Errorf("credentials were updated but quarantined old engine artifacts require manual cleanup: %w", err)
+		return failRcloneApplication(outcome, rcloneFailureArtifactWork, fmt.Errorf("credentials were updated but quarantined old engine artifacts require manual cleanup: %w", err))
 	}
 	_ = database.LogActivity(db, "Repository rclone account reconnected: "+repo.Name)
 	return outcome, nil

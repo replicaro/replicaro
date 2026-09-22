@@ -39,6 +39,7 @@ export class APIError extends Error {
 	readonly activation?: RcloneConfigActivation;
 	readonly attached?: boolean;
 	readonly usable?: boolean;
+	readonly failureStage?: RcloneApplicationFailureStage;
 	readonly passwordChangeResult?: VaultPasswordChangeResult;
 
 	constructor(message: string, status: number, code?: string, lifecycle?: RcloneLifecycleOutcome, passwordChangeResult?: VaultPasswordChangeResult) {
@@ -49,6 +50,7 @@ export class APIError extends Error {
 		this.activation = lifecycle?.activation;
 		this.attached = lifecycle?.attached;
 		this.usable = lifecycle?.usable;
+		this.failureStage = lifecycle?.failureStage;
 		this.passwordChangeResult = passwordChangeResult;
 	}
 }
@@ -96,6 +98,7 @@ async function request<T>(
 					activation: body.activation,
 					attached: Boolean(body.attached),
 					...(typeof body.usable === "boolean" ? { usable: body.usable } : {}),
+					...(typeof body.failureStage === "string" ? { failureStage: body.failureStage as RcloneApplicationFailureStage } : {}),
 				};
 			}
 			if (body && body.result && typeof body.result.repositoryId === "string" && typeof body.result.phase === "string") {
@@ -200,6 +203,7 @@ function vaultProgressError(status: number, payload: unknown): APIError {
 			activation: body.activation as RcloneConfigActivation,
 			attached: Boolean(body.attached),
 			...(typeof body.usable === "boolean" ? { usable: body.usable } : {}),
+			...(typeof body.failureStage === "string" ? { failureStage: body.failureStage as RcloneApplicationFailureStage } : {}),
 		} : undefined);
 }
 
@@ -466,7 +470,17 @@ export interface RcloneLifecycleOutcome {
 	activation: RcloneConfigActivation;
 	attached: boolean;
 	usable?: boolean;
+	failureStage?: RcloneApplicationFailureStage;
 }
+
+export type RcloneApplicationFailureStage =
+	| "admission"
+	| "saved_vault_validation"
+	| "native_validation"
+	| "protected_record_validation"
+	| "config_activation"
+	| "artifact_work"
+	| "database_credential_update";
 
 export const startRcloneAuthorization = (provider: string) =>
 	post<RcloneAuthStatus>("/api/rclone/auth/start", { provider });
@@ -583,7 +597,7 @@ export interface VaultPasswordChangeResult {
 	repositoryId: string;
 	operationUUID: string;
 	phase: string;
-	native: { engine: string; status: string; processStarted?: boolean; output?: string };
+	native: { engine: string; status: string; processStarted?: boolean; output?: string; mutationDisposition?: "unknown" | "rejected_before_mutation" };
 	sidecarStatus: string;
 	cleanupPending: boolean;
 	message: string;

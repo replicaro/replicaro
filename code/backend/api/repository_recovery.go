@@ -581,7 +581,7 @@ func expectedExistingVaultUpdateConfirmation(preview ExistingVaultPreview, candi
 	if preview.ExistingRepository == nil {
 		return ExistingVaultUpdateConfirmation{}, fmt.Errorf("the reviewed vault is not an existing registration")
 	}
-	concurrencyMode, err := models.NormalizeConcurrencyMode(req.ConcurrencyMode)
+	concurrencyMode, err := models.NormalizeConcurrencyModeForConnector(preview.ExistingRepository.Connector, req.ConcurrencyMode)
 	if err != nil {
 		return ExistingVaultUpdateConfirmation{}, err
 	}
@@ -705,7 +705,7 @@ func finalNewJoinAtCapacity(preview ExistingVaultPreview, repo models.Repository
 
 func prepareConnectionProfile(preview ExistingVaultPreview, repo models.Repository, req ConnectExistingVaultRequest,
 	clientUUID string, now time.Time) (connectionProfileTransition, error) {
-	concurrencyMode, err := models.NormalizeConcurrencyMode(repo.ConcurrencyMode)
+	concurrencyMode, err := models.NormalizeConcurrencyModeForConnector(repo.Connector, repo.ConcurrencyMode)
 	if err != nil {
 		return connectionProfileTransition{}, err
 	}
@@ -2688,7 +2688,18 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 				writeError(w, http.StatusBadRequest, confirmationErr)
 				return
 			}
-			if req.UpdateExistingVaultReview == nil || *req.UpdateExistingVaultReview != expectedConfirmation {
+			var submittedConfirmation ExistingVaultUpdateConfirmation
+			if req.UpdateExistingVaultReview != nil {
+				submittedConfirmation = *req.UpdateExistingVaultReview
+				submittedConfirmation.ConcurrencyMode, confirmationErr = models.NormalizeConcurrencyModeForConnector(
+					preview.ExistingRepository.Connector, submittedConfirmation.ConcurrencyMode,
+				)
+				if confirmationErr != nil {
+					writeError(w, http.StatusBadRequest, confirmationErr)
+					return
+				}
+			}
+			if req.UpdateExistingVaultReview == nil || submittedConfirmation != expectedConfirmation {
 				writeError(w, http.StatusConflict, fmt.Errorf("confirm Update existing vault after reviewing the exact saved-vault changes"))
 				return
 			}
@@ -2783,7 +2794,7 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 		// Imported profile values initialize the client form, but every editable
 		// reviewed field is authoritative at initial local attachment.
 		applyReviewedConnectionVaultFields(&repo, req)
-		repo.ConcurrencyMode, err = models.NormalizeConcurrencyMode(repo.ConcurrencyMode)
+		repo.ConcurrencyMode, err = models.NormalizeConcurrencyModeForConnector(repo.Connector, repo.ConcurrencyMode)
 		if err != nil {
 			badRequest(w, err.Error())
 			return

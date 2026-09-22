@@ -322,6 +322,10 @@ func validateRepositoryUpdateReservation(tx *sql.Tx, expected models.Repository)
 	); err != nil {
 		return err
 	}
+	concurrencyMode, err = models.NormalizeConcurrencyModeForConnector(connector, concurrencyMode)
+	if err != nil {
+		return fmt.Errorf("invalid saved concurrency mode: %w", err)
+	}
 	// The reservation is the last no-mutation boundary. Once it succeeds,
 	// ordinary row and job mutations are fenced by the existing connection
 	// reservation until exact retry completes or a prepared review is cancelled.

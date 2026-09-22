@@ -1245,6 +1245,22 @@
       "mode": "100755"
     },
     {
+      "path": "code/build/unsigned/macos-dmg-layout/FinderLayout.dsstore",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/macos-dmg-layout/installer-background-source.txt",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/macos-dmg-layout/installer-background.png",
+      "mode": "100644"
+    },
+    {
+      "path": "code/build/unsigned/macos-dmg-layout/render-installer-background.py",
+      "mode": "100755"
+    },
+    {
       "path": "code/build/unsigned/package-linux-formats.sh",
       "mode": "100755"
     },
@@ -1266,6 +1282,10 @@
     },
     {
       "path": "code/build/unsigned/sbom.sh",
+      "mode": "100755"
+    },
+    {
+      "path": "code/build/unsigned/stage-macos-dmg.sh",
       "mode": "100755"
     },
     {

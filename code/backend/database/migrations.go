@@ -264,6 +264,8 @@ func Migrate(db *sql.DB) error {
 		phase TEXT NOT NULL CHECK (phase IN ('preparing','native_started','publishing','cleanup_pending')),
 		native_status TEXT NOT NULL DEFAULT ''
 			CHECK (native_status = '' OR native_status IN ('not_started','succeeded','failed','interrupted')),
+		native_mutation_disposition TEXT NOT NULL DEFAULT 'unknown'
+			CHECK (native_mutation_disposition IN ('unknown','rejected_before_mutation')),
 		native_output TEXT NOT NULL DEFAULT '',
 		last_error TEXT NOT NULL DEFAULT '',
 		created_at TEXT NOT NULL,
@@ -396,6 +398,21 @@ func Migrate(db *sql.DB) error {
 	`
 	if _, err := tx.Exec(schema); err != nil {
 		return err
+	}
+	// Schema 70 predates the optional password-mutation disposition. Adding the
+	// conservative default in place keeps existing current-schema operations
+	// fail-closed without admitting any older schema version.
+	var dispositionColumns int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('vault_password_change_operations')
+		WHERE name='native_mutation_disposition'`).Scan(&dispositionColumns); err != nil {
+		return err
+	}
+	if dispositionColumns == 0 {
+		if _, err := tx.Exec(`ALTER TABLE vault_password_change_operations
+			ADD COLUMN native_mutation_disposition TEXT NOT NULL DEFAULT 'unknown'
+			CHECK (native_mutation_disposition IN ('unknown','rejected_before_mutation'))`); err != nil {
+			return err
+		}
 	}
 	if _, err := tx.Exec(`INSERT INTO settings (key,value) VALUES ('installationId',?)
 		ON CONFLICT(key) DO NOTHING`, uuid.NewString()); err != nil {

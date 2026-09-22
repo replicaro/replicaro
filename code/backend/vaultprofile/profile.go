@@ -178,7 +178,7 @@ func BuildRoot(repo models.Repository, nativeRepositoryID, ownerProfileUUID stri
 }
 
 func BuildProfile(repo models.Repository, jobs []models.BackupJob, dormant []BackupJob, profileUUID, clientUUID string, generation, revision int64, display AttachmentDisplay, previousUpdatedAt, now time.Time) (Profile, error) {
-	concurrencyMode, err := models.NormalizeConcurrencyMode(repo.ConcurrencyMode)
+	concurrencyMode, err := models.NormalizeConcurrencyModeForConnector(repo.Connector, repo.ConcurrencyMode)
 	if err != nil {
 		return Profile{}, err
 	}

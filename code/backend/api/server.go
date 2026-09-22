@@ -1320,6 +1320,11 @@ func handlerForExecutionInstanceWithReader(
 			writeError(w, http.StatusNotFound, err)
 			return
 		}
+		req.ConcurrencyMode, err = models.NormalizeConcurrencyModeForConnector(repo.Connector, req.ConcurrencyMode)
+		if err != nil {
+			badRequest(w, err.Error())
+			return
+		}
 		if err := database.ValidateRepositoryMutationAdmission(db, repo.ID); err != nil {
 			if errors.Is(err, database.ErrRepositoryConnectionReserved) {
 				writeError(w, http.StatusConflict, err)

@@ -13,6 +13,9 @@ import shutil
 TARGETS = ("windows_amd64", "linux_amd64", "linux_arm64", "darwin_amd64", "darwin_arm64")
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+")
 CHECKSUM = "sha256sums"
+UNSIGNED_EVIDENCE = "unsigned-release-evidence-v1.json"
+UNSIGNED_EVIDENCE_SCHEMA = "replicaro-unsigned-release-evidence-v1"
+UNSIGNED_EVIDENCE_LIMIT = 4096
 LINUX_KEY = "replicaro-linux-release-key.asc"
 INPUTS = pathlib.Path(__file__).resolve().parent / "inputs.json"
 
@@ -68,7 +71,9 @@ def asset_names(release_version, kind):
         names.append(LINUX_KEY)
         names += [new + ".sig" for target in TARGETS if target.startswith("linux_")
                   for _, new in pairs(target, release_version)]
-    elif kind != "unsigned":
+    elif kind == "unsigned":
+        names.append(UNSIGNED_EVIDENCE)
+    else:
         raise ValueError("release kind is invalid")
     if len(names) != len(set(names)):
         raise ValueError("public release asset name collision")
@@ -95,7 +100,90 @@ def checksums(root, release_version, signed=False):
     return "".join(f"{digest(root / name)}  {name}\n" for name in names)
 
 
-def stage_unsigned(source_root, output, release_version):
+def canonical_timestamp(value):
+    if not isinstance(value, str):
+        raise ValueError("unsigned release timestamp is invalid")
+    try:
+        parsed = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        raise ValueError("unsigned release timestamp is invalid") from None
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != value:
+        raise ValueError("unsigned release timestamp is invalid")
+    return value
+
+
+def evidence_bytes(release_version, revision, identity, timestamp):
+    if not re.fullmatch(r"[0-9a-f]{40}", revision) or not re.fullmatch(r"sha256:[0-9a-f]{64}", identity):
+        raise ValueError("unsigned release identity is invalid")
+    value = {
+        "schema": UNSIGNED_EVIDENCE_SCHEMA,
+        "version": version(release_version),
+        "publicRevision": revision,
+        "sourceIdentity": identity,
+        "buildTimestamp": canonical_timestamp(timestamp),
+    }
+    return (json.dumps(value, ensure_ascii=True, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def parse_evidence(path, release_version, revision, identity):
+    path = regular(path)
+    if path.stat().st_size > UNSIGNED_EVIDENCE_LIMIT:
+        raise ValueError("unsigned release evidence is oversized")
+    raw = path.read_bytes()
+
+    def exact_object(pairs):
+        names = [name for name, _ in pairs]
+        if len(names) != len(set(names)):
+            raise ValueError("unsigned release evidence contains a duplicate field")
+        return dict(pairs)
+
+    try:
+        value = json.loads(raw, object_pairs_hook=exact_object)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("unsigned release evidence is malformed") from None
+    expected_fields = {"schema", "version", "publicRevision", "sourceIdentity", "buildTimestamp"}
+    if not isinstance(value, dict) or set(value) != expected_fields:
+        raise ValueError("unsigned release evidence fields differ")
+    if (value["schema"] != UNSIGNED_EVIDENCE_SCHEMA or value["version"] != version(release_version) or
+            value["publicRevision"] != revision or value["sourceIdentity"] != identity):
+        raise ValueError("unsigned release evidence differs from the selected source")
+    timestamp = canonical_timestamp(value["buildTimestamp"])
+    if raw != evidence_bytes(release_version, revision, identity, timestamp):
+        raise ValueError("unsigned release evidence is not canonical")
+    return timestamp
+
+
+def checksum_entries(path, release_version, kind):
+    names = [name for name in asset_names(release_version, kind) if name != CHECKSUM]
+    lines = regular(path).read_text(encoding="ascii").splitlines(keepends=True)
+    if len(lines) != len(names):
+        raise ValueError("public checksum inventory has the wrong size")
+    values = {}
+    for line, name in zip(lines, names):
+        match = re.fullmatch(r"([0-9a-f]{64})  " + re.escape(name) + r"\n", line)
+        if not match:
+            raise ValueError("public checksum inventory is malformed or unordered")
+        values[name] = match.group(1)
+    return values
+
+
+def evidence_timestamp(download, release_version, revision, identity):
+    if not download.is_dir() or download.is_symlink():
+        raise ValueError("unsigned release evidence download is unavailable")
+    expected = {CHECKSUM, UNSIGNED_EVIDENCE}
+    if {entry.name for entry in download.iterdir()} != expected:
+        raise ValueError("unsigned release evidence inventory differs")
+    values = checksum_entries(download / CHECKSUM, release_version, "unsigned")
+    evidence = download / UNSIGNED_EVIDENCE
+    # The checksum is authenticated before any timestamp is consumed. This
+    # ordering is the trust boundary between public release bytes and a
+    # reproducible Workflow 2 build campaign.
+    if digest(evidence) != values[UNSIGNED_EVIDENCE]:
+        raise ValueError("unsigned release evidence differs from its checksum")
+    return parse_evidence(evidence, release_version, revision, identity)
+
+
+def stage_unsigned(source_root, output, release_version, revision, identity, timestamp):
     if not output.is_dir() or output.is_symlink() or any(output.iterdir()):
         raise ValueError("public release staging directory must be empty")
     for target in TARGETS:
@@ -104,6 +192,8 @@ def stage_unsigned(source_root, output, release_version):
             raise ValueError("verified target release is missing")
         for old, new in pairs(target, release_version):
             shutil.copyfile(regular(release / old), output / new)
+    (output / UNSIGNED_EVIDENCE).write_bytes(
+        evidence_bytes(release_version, revision, identity, timestamp))
     (output / CHECKSUM).write_text(checksums(output, release_version), encoding="ascii")
 
 
@@ -114,17 +204,7 @@ def restore_target(download, output, release_version, target):
     expected_local = {CHECKSUM, *(new for _, new in mapping)}
     if {entry.name for entry in download.iterdir()} != expected_local:
         raise ValueError("downloaded target inventory differs from the public release")
-    actual = regular(download / CHECKSUM).read_text(encoding="ascii")
-    lines = actual.splitlines(keepends=True)
-    names = payload_names(release_version)
-    if len(lines) != len(names):
-        raise ValueError("public checksum inventory has the wrong size")
-    values = {}
-    for line, name in zip(lines, names):
-        match = re.fullmatch(r"([0-9a-f]{64})  " + re.escape(name) + "\n", line)
-        if not match:
-            raise ValueError("public checksum inventory is malformed or unordered")
-        values[name] = match.group(1)
+    values = checksum_entries(download / CHECKSUM, release_version, "unsigned")
     for old, new in mapping:
         if digest(download / new) != values[new]:
             raise ValueError("public release asset differs from its checksum: " + new)
@@ -143,40 +223,14 @@ def check_release_assets(release_json, release_version, kind):
         raise ValueError("public release asset inventory differs from the exact expected set")
 
 
-def unsigned_notes(release_version, revision, identity, timestamp):
-    if not re.fullmatch(r"[0-9a-f]{40}", revision) or not re.fullmatch(r"sha256:[0-9a-f]{64}", identity):
-        raise ValueError("unsigned release identity is invalid")
-    datetime.datetime.strptime(timestamp, "%Y-%m-%dT%H:%M:%SZ")
-    return (f"Unsigned Replicaro {version(release_version)} builds from verified public source. "
-            "macOS DMG app contents match their app ZIPs; DMG container bytes may differ between builds. "
-            "These artifacts are not code-signed.\n"
-            f"Public revision: {revision}\nSource identity: {identity}\nBuild timestamp: {timestamp}\n")
-
-
-def notes_timestamp(release_json, release_version, revision, identity):
-    value = json.loads(regular(release_json).read_text(encoding="utf-8"))
-    body = value.get("body")
-    if not isinstance(body, str):
-        raise ValueError("unsigned release description is missing")
-    body = body.replace("\r\n", "\n").rstrip("\n") + "\n"
-    match = re.fullmatch(
-        re.escape(f"Unsigned Replicaro {version(release_version)} builds from verified public source. ")
-        + r"macOS DMG app contents match their app ZIPs; DMG container bytes may differ between builds\. "
-        + r"These artifacts are not code-signed\.\n"
-        + re.escape(f"Public revision: {revision}\nSource identity: {identity}\n")
-        + r"Build timestamp: ([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z)\n", body)
-    if not match:
-        raise ValueError("unsigned release description differs from the selected source")
-    parsed = datetime.datetime.strptime(match.group(1), "%Y-%m-%dT%H:%M:%SZ")
-    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != match.group(1):
-        raise ValueError("unsigned release timestamp is invalid")
-    return match.group(1)
+def unsigned_notes(release_version):
+    return f"Unsigned Replicaro {version(release_version)} builds"
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("pairs", "names", "stage-unsigned", "restore-target",
-                                            "check-release", "unsigned-notes", "notes-timestamp", "checksums"))
+                                            "check-release", "unsigned-notes", "evidence-timestamp", "checksums"))
     parser.add_argument("--version", required=True)
     parser.add_argument("--target")
     parser.add_argument("--kind", choices=("unsigned", "signed"))
@@ -195,15 +249,16 @@ def main():
     elif args.command == "names":
         print("\n".join(asset_names(release_version, args.kind)))
     elif args.command == "stage-unsigned":
-        stage_unsigned(args.source_root, args.output, release_version)
+        stage_unsigned(args.source_root, args.output, release_version,
+                       args.revision, args.identity, args.timestamp)
     elif args.command == "restore-target":
         restore_target(args.download, args.output, release_version, args.target)
     elif args.command == "check-release":
         check_release_assets(args.release_json, release_version, args.kind)
     elif args.command == "unsigned-notes":
-        print(unsigned_notes(release_version, args.revision, args.identity, args.timestamp), end="")
-    elif args.command == "notes-timestamp":
-        print(notes_timestamp(args.release_json, release_version, args.revision, args.identity))
+        print(unsigned_notes(release_version))
+    elif args.command == "evidence-timestamp":
+        print(evidence_timestamp(args.download, release_version, args.revision, args.identity))
     elif args.command == "checksums":
         print(checksums(args.output, release_version, args.kind == "signed"), end="")
 

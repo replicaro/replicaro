@@ -4664,32 +4664,110 @@ input, select, textarea { font-size: 14.5px; }
     gap: 8px;
 }
 
-/* Create and Connect keep the existing modal layout. This compact view shows
-   request-scoped stages and the selected engine's ordinary native output. */
-.protect-page .vault-work-log {
-    position: fixed;
-    z-index: 80;
-    right: 16px;
-    bottom: 16px;
-    width: min(420px, calc(100vw - 32px));
+/* Settings and password requests remain synchronous; this card-local layer
+   only releases the rest of the UI while the unchanged endpoint finishes. */
+.protect-page .vault-mutation-overlay {
+	position: absolute;
+	inset: 0;
+	z-index: 3;
+	display: flex;
+	min-height: 0;
+	flex-direction: column;
+	align-items: center;
+	/* Centering a flex column whose content exceeds the card can place its
+	   beginning above scrollTop=0. Start alignment keeps every detail reachable. */
+	justify-content: flex-start;
+	gap: 8px;
+	padding: 16px;
+	overflow-y: auto;
+	border-radius: inherit;
+	background: var(--panel);
+	text-align: center;
+}
+
+.protect-page .vault-mutation-overlay > span,
+.protect-page .vault-password-result {
+	color: var(--text-muted);
+	font-size: 12px;
+	line-height: 1.45;
+}
+
+.protect-page .vault-mutation-error {
+	color: var(--danger) !important;
+	overflow-wrap: anywhere;
+}
+
+.protect-page .vault-mutation-uncertain {
+	color: var(--warn) !important;
+	overflow-wrap: anywhere;
+}
+
+.protect-page .vault-password-result {
+	display: flex;
+	min-width: 0;
+	flex-direction: column;
+	gap: 4px;
+	overflow-wrap: anywhere;
+}
+
+.protect-page .vault-mutation-actions {
+	display: flex;
+	flex-wrap: wrap;
+	justify-content: center;
+	gap: 8px;
+}
+
+.protect-page .vault-retained-password-recovery {
+	display: flex;
+	min-width: 0;
+	width: 100%;
+	flex-direction: column;
+	gap: 6px;
+	padding-top: 10px;
+	border-top: 1px solid var(--hairline);
+}
+
+/* cleanup_pending has already committed the credential and permits ordinary
+   work. Keep its recovery details visible without covering or inerting the
+   card; starting Continue returns the same presentation to blocking mode. */
+.protect-page .vault-mutation-overlay.is-nonblocking {
+	position: static;
+	inset: auto;
+	grid-column: 1 / -1;
+	align-items: flex-start;
+	padding: 12px;
+	border: 1px solid color-mix(in srgb, var(--warn) 35%, var(--hairline));
+	background: var(--surface-subtle);
+	text-align: left;
+}
+
+.protect-page .vault-mutation-overlay.is-nonblocking .vault-mutation-actions {
+	justify-content: flex-start;
+}
+
+/* Modal portals are mounted beside the page root, so these unique activity-log
+   classes deliberately carry their own scope. The fixed 14em/1.4 ratio is the
+   ten-line viewport; the request buffer remains independently bounded. */
+.vault-work-log {
+    margin-top: 14px;
+    width: 100%;
     padding: 10px 12px;
     border: 1px solid var(--hairline);
     border-radius: 10px;
     background: var(--modal);
-    box-shadow: var(--elevation-raised);
-    pointer-events: none;
     font-size: 12px;
 }
 
-.protect-page .vault-work-log-lines {
-    max-height: 118px;
+.vault-work-log-lines {
+    height: 14em;
+    line-height: 1.4;
     overflow-y: auto;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
 }
 
-.protect-page .vault-work-stage { color: var(--text-muted); }
-.protect-page .vault-work-native { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+.vault-work-stage { color: var(--text-muted); }
+.vault-work-native { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 
 .protect-page .vault-row:hover {
     border-color: var(--hairline);

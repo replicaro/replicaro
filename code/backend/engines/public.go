@@ -2,9 +2,11 @@ package engines
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -14,11 +16,19 @@ import (
 	"github.com/local/replicaro/models"
 )
 
+type PasswordMutationDisposition string
+
+const (
+	PasswordMutationUnknown                PasswordMutationDisposition = "unknown"
+	PasswordMutationRejectedBeforeMutation PasswordMutationDisposition = "rejected_before_mutation"
+)
+
 type PasswordChangeResult struct {
-	Engine         string                   `json:"engine"`
-	Status         RequestedOperationStatus `json:"status"`
-	ProcessStarted bool                     `json:"processStarted,omitempty"`
-	Output         string                   `json:"output,omitempty"`
+	Engine              string                      `json:"engine"`
+	Status              RequestedOperationStatus    `json:"status"`
+	ProcessStarted      bool                        `json:"processStarted,omitempty"`
+	Output              string                      `json:"output,omitempty"`
+	MutationDisposition PasswordMutationDisposition `json:"mutationDisposition,omitempty"`
 }
 
 type repositoryPasswordChanger interface {
@@ -116,14 +126,26 @@ func ChangeRepositoryPassword(ctx context.Context, engine Engine, repo models.Re
 		return PasswordChangeResult{}, fmt.Errorf("%w: native vault-password change is unavailable", ErrUnsupported)
 	}
 	output, err := changer.changeRepositoryPassword(ctx, repo, newPassword, operationUUID, nativeInputPath)
-	status, started, _, _, _, known := RequestedOperationOutcome(err)
+	status, started, _, nativeErr, _, known := RequestedOperationOutcome(err)
 	if err == nil {
 		status, started, known = RequestedOperationSucceeded, true, true
 	}
 	if !known {
 		return PasswordChangeResult{Engine: repo.Engine, Output: output}, err
 	}
-	return PasswordChangeResult{Engine: repo.Engine, Status: status, ProcessStarted: started, Output: output}, err
+	disposition := PasswordMutationUnknown
+	if repo.Engine == ResticID && TestedVersion(ResticID) == "0.19.1" &&
+		status == RequestedOperationFailed && started {
+		var exit *exec.ExitError
+		if errors.As(nativeErr, &exit) && exit.ExitCode() == 11 {
+			// Pinned Restic 0.19.1 defines exit 11 for key passwd as a lock
+			// rejection before its key mutation. Keep the native failure intact;
+			// this structured exit status only narrows recovery cleanup authority.
+			disposition = PasswordMutationRejectedBeforeMutation
+		}
+	}
+	return PasswordChangeResult{Engine: repo.Engine, Status: status, ProcessStarted: started,
+		Output: output, MutationDisposition: disposition}, err
 }
 
 // ProbeRepositoryPassword validates one candidate against the exact stored

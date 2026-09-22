@@ -16,7 +16,7 @@ type kopiaConcurrencySettings struct {
 }
 
 func normalizedConcurrencyMode(repo models.Repository) (string, error) {
-	return models.NormalizeConcurrencyMode(repo.ConcurrencyMode)
+	return models.NormalizeConcurrencyModeForConnector(repo.Connector, repo.ConcurrencyMode)
 }
 
 func resticConcurrency(repo models.Repository) (backend string, connections, readConcurrency int, err error) {

@@ -21,6 +21,7 @@ import (
 
 var vaultPasswordQuietPeriod = 30 * time.Second
 var recordVaultPasswordNativeResult = database.RecordVaultPasswordNativeResult
+var loadVaultPasswordChangeAfterNativeResult = database.VaultPasswordChange
 var recoverVaultPasswordChange = RecoverVaultPasswordChange
 var vaultPasswordChangeFault = func(string) error { return nil }
 var prepareVaultPasswordChange = preparePasswordChange
@@ -32,11 +33,28 @@ var publishVaultPasswordTree = func(ctx context.Context, store vaultprofile.Stor
 }
 var cleanupVaultPasswordStage = vaultprofile.CleanupPasswordRotationStage
 var loadVaultPasswordStage = vaultprofile.LoadPasswordRotationInventory
+var captureVaultPasswordRollbackInventory = func(ctx context.Context, store vaultprofile.Store, operationUUID string) (vaultprofile.PasswordRotationInventory, error) {
+	return store.CapturePasswordRotationInventory(ctx, operationUUID, false)
+}
+var deleteVaultPasswordRollbackPending = func(ctx context.Context, store vaultprofile.Store, inventory vaultprofile.PasswordRotationInventory) error {
+	return store.DeletePasswordChangeOperationPending(ctx, inventory)
+}
+var removeVaultPasswordChangeFence = func(ctx context.Context, repo models.Repository, inventory vaultprofile.PasswordRotationInventory) error {
+	store := (vaultprofile.Store{Repository: repo}).WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
+	return store.SetPasswordChangeFence(ctx, inventory, false)
+}
 var assertVaultPasswordChangeAuthority = func(ctx context.Context, store vaultprofile.Store, repo models.Repository,
 	operation database.VaultPasswordChangeOperation, allowUnfenced, requireProfileFence bool,
 ) error {
 	return store.AssertPasswordChangeAuthority(ctx, repo.ClientUUID, repo.ProfileUUID, repo.AttachmentGeneration,
 		operation.OperationUUID, allowUnfenced, requireProfileFence)
+}
+var admitPasswordChangeRecoveryUnderLock = repositoryadmission.AdmitPasswordChangeRecoveryUnderLock
+var abandonConclusivePreMutationPasswordChange = func(db *sql.DB, repo models.Repository, operation database.VaultPasswordChangeOperation) error {
+	if operation.NativeMutationDisposition == string(engines.PasswordMutationRejectedBeforeMutation) {
+		return database.AbandonRejectedBeforeMutationVaultPasswordChange(db, repo.ID)
+	}
+	return database.AbandonConclusiveUnstartedVaultPasswordChange(db, repo.ID)
 }
 
 type VaultPasswordChangeResult struct {
@@ -50,18 +68,30 @@ type VaultPasswordChangeResult struct {
 	ResticKeyTruth string                       `json:"resticKeyTruth,omitempty"`
 }
 
+func nativePasswordResultTruth(operation database.VaultPasswordChangeOperation) string {
+	if operation.NativeStatus == "" {
+		return "unresolved"
+	}
+	return operation.NativeStatus
+}
+
+func verifiedCandidateNativeSummary(operation database.VaultPasswordChangeOperation) string {
+	if operation.NativeMutationDisposition == string(engines.PasswordMutationRejectedBeforeMutation) {
+		return "Restic rejected the selected-key password change before mutation; the pending credential verified separately"
+	}
+	return fmt.Sprintf("the pending credential verified while native password-mutation truth remains %s", nativePasswordResultTruth(operation))
+}
+
 func passwordChangeResult(repo models.Repository, operation database.VaultPasswordChangeOperation) VaultPasswordChangeResult {
 	result := VaultPasswordChangeResult{RepositoryID: repo.ID, OperationUUID: operation.OperationUUID,
 		Phase: operation.Phase, SidecarStatus: "pending",
-		Native: engines.PasswordChangeResult{Engine: repo.Engine, Status: engines.RequestedOperationStatus(operation.NativeStatus), Output: operation.NativeOutput}}
+		Native: engines.PasswordChangeResult{Engine: repo.Engine, Status: engines.RequestedOperationStatus(operation.NativeStatus),
+			Output: operation.NativeOutput, MutationDisposition: engines.PasswordMutationDisposition(operation.NativeMutationDisposition)}}
 	if operation.NativeStatus == "succeeded" || operation.NativeStatus == "failed" || operation.NativeStatus == "interrupted" {
 		result.Native.ProcessStarted = true
 	}
 	nativeSucceeded := operation.NativeStatus == "succeeded"
-	nativeTruth := operation.NativeStatus
-	if nativeTruth == "" {
-		nativeTruth = "unresolved"
-	}
+	nativeTruth := nativePasswordResultTruth(operation)
 	if operation.Phase == "cleanup_pending" && nativeSucceeded {
 		result.SidecarStatus, result.CleanupPending = "succeeded", true
 		result.Message = "The native vault password and protected recovery metadata changed successfully; local residue cleanup is pending."
@@ -76,8 +106,25 @@ func passwordChangeResult(repo models.Repository, operation database.VaultPasswo
 		result.Message = "Vault-password change recovery is in progress."
 	}
 	if repo.Engine == engines.ResticID {
-		result.ResticKeyTruth = "Restic changed the selected key. Other Restic keys were not removed and may still accept an older password."
+		switch {
+		case operation.NativeMutationDisposition == string(engines.PasswordMutationRejectedBeforeMutation):
+			result.ResticKeyTruth = "Restic rejected the selected-key password change because the repository was locked before mutation. The selected key was not changed."
+		case operation.NativeStatus == "succeeded":
+			result.ResticKeyTruth = "Restic changed the selected key. Other Restic keys were not removed and may still accept an older password."
+		default:
+			result.ResticKeyTruth = "Whether Restic changed the selected key is unresolved. Other Restic keys may still accept an older password."
+		}
 	}
+	return result
+}
+
+func runLocalNativePasswordChangeResult(repo models.Repository, operation database.VaultPasswordChangeOperation, native engines.PasswordChangeResult, disposition string) VaultPasswordChangeResult {
+	runLocal := operation
+	runLocal.NativeStatus = string(native.Status)
+	runLocal.NativeMutationDisposition = disposition
+	runLocal.NativeOutput = native.Output
+	result := passwordChangeResult(repo, runLocal)
+	result.Native = native
 	return result
 }
 
@@ -90,14 +137,16 @@ func persistRunLocalNativePasswordResult(db *sql.DB, repo models.Repository, ope
 	if nativeErr != nil {
 		safeError = nativeErr.Error()
 	}
-	if err := recordVaultPasswordNativeResult(db, repo.ID, status, native.Output, safeError); err != nil {
-		result := passwordChangeResult(repo, operation)
-		result.Native = native
-		return operation, result, fmt.Errorf("persist native vault-password result: %w", err)
+	disposition := string(native.MutationDisposition)
+	if disposition == "" {
+		disposition = string(engines.PasswordMutationUnknown)
 	}
-	updated, err := database.VaultPasswordChange(db, repo.ID)
+	if err := recordVaultPasswordNativeResult(db, repo.ID, status, disposition, native.Output, safeError); err != nil {
+		return operation, runLocalNativePasswordChangeResult(repo, operation, native, disposition), fmt.Errorf("persist native vault-password result: %w", err)
+	}
+	updated, err := loadVaultPasswordChangeAfterNativeResult(db, repo.ID)
 	if err != nil {
-		return operation, passwordChangeResult(repo, operation), err
+		return operation, runLocalNativePasswordChangeResult(repo, operation, native, disposition), err
 	}
 	return updated, passwordChangeResult(repo, updated), nil
 }
@@ -218,6 +267,9 @@ func admitVaultPasswordRecoveryUnderLock(ctx context.Context, db *sql.DB, repo m
 		case "preparing":
 			return assertVaultPasswordChangeAuthority(ctx, oldStore, frozen, operation, true, false)
 		case "native_started":
+			if conclusivePreMutationRollback(repo.Engine, operation) {
+				return assertVaultPasswordChangeAuthority(ctx, oldStore, frozen, operation, true, false)
+			}
 			return assertVaultPasswordChangeAuthority(ctx, oldStore, frozen, operation, false, true)
 		case "publishing":
 			if err := oldStore.AssertPasswordChangeRootState(ctx, frozen.ProfileUUID, operation.OperationUUID, true); err == nil {
@@ -249,7 +301,7 @@ func admitVaultPasswordRecoveryUnderLock(ctx context.Context, db *sql.DB, repo m
 			return "", fmt.Errorf("vault-password recovery phase is invalid")
 		}
 	}
-	return repositoryadmission.AdmitPasswordChangeRecoveryUnderLock(ctx, db, repo,
+	return admitPasswordChangeRecoveryUnderLock(ctx, db, repo,
 		repositoryadmission.PasswordChangeRecoveryOptions{
 			OperationUUID: operation.OperationUUID, Phase: operation.Phase,
 			AssertControlPlane: assertControlPlane, SelectPassword: selectPassword,
@@ -383,14 +435,120 @@ const (
 	nativePasswordRecoveryAbandon
 )
 
-func decideNativePasswordRecovery(nativeStatus string, candidateWorks, committedWorks bool) nativePasswordRecoveryDecision {
+func decideNativePasswordRecovery(engine, nativeStatus, disposition string, candidateWorks, committedWorks bool) nativePasswordRecoveryDecision {
 	if candidateWorks {
 		return nativePasswordRecoveryForward
 	}
-	if committedWorks && nativeStatus == "not_started" {
+	if committedWorks && (nativeStatus == "not_started" ||
+		(engine == engines.ResticID && nativeStatus == "failed" &&
+			disposition == string(engines.PasswordMutationRejectedBeforeMutation))) {
 		return nativePasswordRecoveryAbandon
 	}
 	return nativePasswordRecoveryAmbiguous
+}
+
+func conclusivePreMutationRollback(engine string, operation database.VaultPasswordChangeOperation) bool {
+	if operation.NativeStatus == "not_started" {
+		return operation.NativeMutationDisposition == string(engines.PasswordMutationUnknown)
+	}
+	return engine == engines.ResticID && operation.NativeStatus == "failed" &&
+		operation.NativeMutationDisposition == string(engines.PasswordMutationRejectedBeforeMutation)
+}
+
+// validatePreMutationRollbackInventory accepts the exact partial states that
+// profile-first/root-last cleanup can leave behind. Capture already bounds the
+// protected inventory; this check keeps a foreign fence or root-first residue
+// from becoming valid cleanup input.
+func validatePreMutationRollbackInventory(repo models.Repository, operation database.VaultPasswordChangeOperation, inventory vaultprofile.PasswordRotationInventory) (bool, error) {
+	rootFound, rootFenced, profileFenced := false, false, false
+	for _, object := range inventory.Objects {
+		switch object.Role {
+		case "root_canonical":
+			rootFound = true
+			root, err := vaultprofile.ParseRoot(object.Data, repo.Connector)
+			if err != nil {
+				return false, fmt.Errorf("validate password-change rollback root: %w", err)
+			}
+			if root.PasswordChange != nil {
+				if root.PasswordChange.OperationUUID != operation.OperationUUID {
+					return false, fmt.Errorf("protected vault root has a foreign password-change fence")
+				}
+				rootFenced = true
+			}
+		case "profile_canonical":
+			profile, err := vaultprofile.Parse(object.Data)
+			if err != nil {
+				return false, fmt.Errorf("validate password-change rollback profile: %w", err)
+			}
+			if profile.PasswordChange != nil {
+				if profile.PasswordChange.OperationUUID != operation.OperationUUID {
+					return false, fmt.Errorf("protected profile has a foreign password-change fence")
+				}
+				profileFenced = true
+			}
+		}
+	}
+	if !rootFound {
+		return false, fmt.Errorf("canonical protected vault root is required")
+	}
+	if !rootFenced && profileFenced {
+		return false, fmt.Errorf("password-change rollback fence order is invalid")
+	}
+	return rootFenced || profileFenced, nil
+}
+
+func rollbackConclusivePreMutationPasswordChange(ctx context.Context, db *sql.DB, repo models.Repository, operation database.VaultPasswordChangeOperation) error {
+	if !conclusivePreMutationRollback(repo.Engine, operation) {
+		return fmt.Errorf("native password change lacks conclusive pre-mutation evidence")
+	}
+	store := (vaultprofile.Store{Repository: repo}).WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
+	if err := assertVaultPasswordChangeAuthority(ctx, store, repo, operation, true, false); err != nil {
+		return err
+	}
+	inventory, err := captureVaultPasswordRollbackInventory(ctx, store, operation.OperationUUID)
+	if err != nil {
+		return err
+	}
+	if _, err := validatePreMutationRollbackInventory(repo, operation, inventory); err != nil {
+		return err
+	}
+	if err := deleteVaultPasswordRollbackPending(ctx, store, inventory); err != nil {
+		return err
+	}
+	inventory, err = captureVaultPasswordRollbackInventory(ctx, store, operation.OperationUUID)
+	if err != nil {
+		return err
+	}
+	hasFence, err := validatePreMutationRollbackInventory(repo, operation, inventory)
+	if err != nil {
+		return err
+	}
+	if err := assertVaultPasswordChangeAuthority(ctx, store, repo, operation, true, false); err != nil {
+		return err
+	}
+	if hasFence {
+		if err := removeVaultPasswordChangeFence(ctx, repo, inventory); err != nil {
+			return err
+		}
+	}
+	final, err := captureVaultPasswordRollbackInventory(ctx, store, operation.OperationUUID)
+	if err != nil {
+		return err
+	}
+	finalFenced, err := validatePreMutationRollbackInventory(repo, operation, final)
+	if err != nil {
+		return err
+	}
+	if finalFenced || len(final.Pending) != 0 {
+		return fmt.Errorf("password-change rollback remote cleanup is incomplete")
+	}
+	if err := assertVaultPasswordChangeAuthority(ctx, store, repo, operation, true, false); err != nil {
+		return err
+	}
+	if err := cleanupVaultPasswordStage(repo.ID, operation.OperationUUID); err != nil {
+		return err
+	}
+	return abandonConclusivePreMutationPasswordChange(db, repo, operation)
 }
 
 func recoverNativeTruth(ctx context.Context, db *sql.DB, repo models.Repository, operation database.VaultPasswordChangeOperation) (bool, error) {
@@ -399,22 +557,11 @@ func recoverNativeTruth(ctx context.Context, db *sql.DB, repo models.Repository,
 	if !candidateWorks {
 		committedWorks = probeVaultPassword(ctx, repo, repo.Passphrase) == nil
 	}
-	switch decideNativePasswordRecovery(operation.NativeStatus, candidateWorks, committedWorks) {
+	switch decideNativePasswordRecovery(repo.Engine, operation.NativeStatus, operation.NativeMutationDisposition, candidateWorks, committedWorks) {
 	case nativePasswordRecoveryForward:
 		return true, nil
 	case nativePasswordRecoveryAbandon:
-		staged, err := loadVaultPasswordStage(repo.ID, operation.OperationUUID)
-		if err != nil {
-			return false, err
-		}
-		store := (vaultprofile.Store{Repository: repo}).WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
-		if err := store.SetPasswordChangeFence(ctx, staged, false); err != nil {
-			return false, err
-		}
-		if err := vaultprofile.CleanupPasswordRotationStage(repo.ID, operation.OperationUUID); err != nil {
-			return false, err
-		}
-		return false, database.AbandonConclusiveUnstartedVaultPasswordChange(db, repo.ID)
+		return false, rollbackConclusivePreMutationPasswordChange(ctx, db, repo, operation)
 	default:
 		return false, fmt.Errorf("native vault-password outcome is ambiguous; manual recovery is required")
 	}
@@ -453,7 +600,7 @@ func resumeVaultPasswordChangeUnderLock(ctx context.Context, db *sql.DB, repo mo
 		}
 		engine, err := resolveVaultPasswordEngine(repo, storageavailability.RequireRepositoryAvailable)
 		if err != nil {
-			if persistErr := database.RecordVaultPasswordNativeResult(db, repo.ID, "not_started", "", err.Error()); persistErr != nil {
+			if persistErr := database.RecordVaultPasswordNativeResult(db, repo.ID, "not_started", string(engines.PasswordMutationUnknown), "", err.Error()); persistErr != nil {
 				return passwordChangeResult(repo, operation), fmt.Errorf("persist native not-started result: %w", persistErr)
 			}
 			operation, _ = database.VaultPasswordChange(db, repo.ID)
@@ -462,7 +609,7 @@ func resumeVaultPasswordChangeUnderLock(ctx context.Context, db *sql.DB, repo mo
 			if repo.Engine == engines.ResticID {
 				nativeInputPath, err = vaultprofile.WritePasswordRotationNativeInput(repo.ID, operation.OperationUUID, repo.PendingPassphrase)
 				if err != nil {
-					if persistErr := database.RecordVaultPasswordNativeResult(db, repo.ID, "not_started", "", err.Error()); persistErr != nil {
+					if persistErr := database.RecordVaultPasswordNativeResult(db, repo.ID, "not_started", string(engines.PasswordMutationUnknown), "", err.Error()); persistErr != nil {
 						return passwordChangeResult(repo, operation), fmt.Errorf("prepare native password input: %v; persist native not-started result: %w", err, persistErr)
 					}
 					operation, _ = database.VaultPasswordChange(db, repo.ID)
@@ -487,11 +634,27 @@ func resumeVaultPasswordChangeUnderLock(ctx context.Context, db *sql.DB, repo mo
 	if operation.Phase == "native_started" {
 		forward, err := recoverNativeTruth(ctx, db, repo, operation)
 		if err != nil {
-			_ = database.RecordVaultPasswordChangeError(db, repo.ID, err.Error())
+			if operation.NativeMutationDisposition != string(engines.PasswordMutationRejectedBeforeMutation) {
+				_ = database.RecordVaultPasswordChangeError(db, repo.ID, err.Error())
+			}
 			return passwordChangeResult(repo, operation), err
 		}
 		if !forward {
-			return VaultPasswordChangeResult{RepositoryID: repo.ID, Message: "Vault-password change did not start and its remote fence was removed."}, nil
+			result := passwordChangeResult(repo, operation)
+			result.CleanupPending = false
+			if operation.NativeMutationDisposition == string(engines.PasswordMutationRejectedBeforeMutation) {
+				result.Phase = "failed"
+				result.SidecarStatus = "not_changed"
+				result.Message = "Restic rejected the password change because the repository was locked before mutation. The protected recovery metadata and committed password were left unchanged, and this operation's fence and staging were removed."
+				if operation.LastError != "" {
+					return result, errors.New(operation.LastError)
+				}
+				return result, fmt.Errorf("native Restic password change was rejected before mutation")
+			}
+			result.Phase = "not_started"
+			result.SidecarStatus = "not_changed"
+			result.Message = "Vault-password change did not start and its remote fence was removed."
+			return result, nil
 		}
 		if err := database.AdvanceVaultPasswordChangeAfterCandidateVerification(db, repo.ID, operation.OperationUUID); err != nil {
 			return passwordChangeResult(repo, operation), err
@@ -511,7 +674,10 @@ func resumeVaultPasswordChangeUnderLock(ctx context.Context, db *sql.DB, repo mo
 		store := (vaultprofile.Store{Repository: candidate}).WithRepositoryAvailabilityCheck(storageavailability.RequireRepositoryAvailable)
 		if err := publishVaultPasswordTree(ctx, store, staged); err != nil {
 			_ = database.RecordVaultPasswordChangeError(db, repo.ID, err.Error())
-			return passwordChangeResult(repo, operation), fmt.Errorf("native vault password changed but protected recovery metadata publication is incomplete: %w", err)
+			if operation.NativeStatus == "succeeded" {
+				return passwordChangeResult(repo, operation), fmt.Errorf("native vault password changed but protected recovery metadata publication is incomplete: %w", err)
+			}
+			return passwordChangeResult(repo, operation), fmt.Errorf("%s, but protected recovery metadata publication is incomplete: %w", verifiedCandidateNativeSummary(operation), err)
 		}
 		if err := vaultPasswordChangeFault("sidecar_tree_published"); err != nil {
 			return passwordChangeResult(repo, operation), err
@@ -528,7 +694,10 @@ func resumeVaultPasswordChangeUnderLock(ctx context.Context, db *sql.DB, repo mo
 	if operation.Phase == "cleanup_pending" {
 		if err := cleanupVaultPasswordStage(repo.ID, operation.OperationUUID); err != nil {
 			_ = database.RecordVaultPasswordChangeError(db, repo.ID, err.Error())
-			return passwordChangeResult(repo, operation), fmt.Errorf("vault password changed successfully but local staging cleanup is pending: %w", err)
+			if operation.NativeStatus == "succeeded" {
+				return passwordChangeResult(repo, operation), fmt.Errorf("vault password changed successfully but local staging cleanup is pending: %w", err)
+			}
+			return passwordChangeResult(repo, operation), fmt.Errorf("%s and protected recovery metadata was updated, but local staging cleanup is pending: %w", verifiedCandidateNativeSummary(operation), err)
 		}
 		if err := vaultPasswordChangeFault("local_cleanup_deleted"); err != nil {
 			return passwordChangeResult(repo, operation), err
@@ -541,11 +710,7 @@ func resumeVaultPasswordChangeUnderLock(ctx context.Context, db *sql.DB, repo mo
 		if operation.NativeStatus == "succeeded" {
 			result.Message = "Vault password changed successfully. Other computers must reconnect and enter the current password."
 		} else {
-			nativeTruth := operation.NativeStatus
-			if nativeTruth == "" {
-				nativeTruth = "unresolved"
-			}
-			result.Message = fmt.Sprintf("The pending vault password verified and protected recovery metadata was updated. The recorded native result remains %s. Other computers must reconnect and enter the current password.", nativeTruth)
+			result.Message = fmt.Sprintf("The pending vault password verified and protected recovery metadata was updated. The recorded native result remains %s. Other computers must reconnect and enter the current password.", nativePasswordResultTruth(operation))
 		}
 		return result, nil
 	}

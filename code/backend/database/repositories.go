@@ -142,6 +142,12 @@ func scanRepo(scan func(dest ...any) error) (models.Repository, error) {
 	if !models.ValidConcurrencyMode(r.ConcurrencyMode) {
 		return r, fmt.Errorf("invalid stored concurrency mode")
 	}
+	// Old local rows may retain a formerly accepted high mode. Expose the
+	// connector-compatible effective value without a startup rewrite campaign.
+	r.ConcurrencyMode, err = models.NormalizeConcurrencyModeForConnector(r.Connector, r.ConcurrencyMode)
+	if err != nil {
+		return r, fmt.Errorf("invalid stored concurrency mode: %w", err)
+	}
 	if normalized, normalizeErr := models.NormalizeColdStorage(r.Engine, r.Connector, r.ColdStorage, r.ArchiveWriteClass); normalizeErr != nil || normalized != r.ArchiveWriteClass {
 		if normalizeErr != nil {
 			return r, fmt.Errorf("invalid stored cold-storage settings: %w", normalizeErr)
@@ -746,16 +752,20 @@ func UpdateRepositorySettingsWithObjectLockAndConcurrency(db *sql.DB, id, checkS
 // particular, it must not echo schedules from an earlier API read: an owner
 // loss may have disabled integrity between that read and this write.
 func UpdateRepositoryLocalPreferences(db *sql.DB, id, concurrencyMode string, autoUnlock bool) error {
-	concurrencyMode, err := models.NormalizeConcurrencyMode(concurrencyMode)
-	if err != nil {
-		return err
-	}
 	tx, err := db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 	if err := requireRepositoryMutationUnreserved(tx, id); err != nil {
+		return err
+	}
+	var connector string
+	if err := tx.QueryRow(`SELECT connector FROM repositories WHERE id=?`, id).Scan(&connector); err != nil {
+		return err
+	}
+	concurrencyMode, err = models.NormalizeConcurrencyModeForConnector(connector, concurrencyMode)
+	if err != nil {
 		return err
 	}
 	result, err := tx.Exec(`UPDATE repositories SET concurrency_mode=?,auto_unlock=? WHERE id=?`, concurrencyMode, autoUnlock, id)
@@ -847,10 +857,6 @@ func updateRepositorySettings(db *sql.DB, id, checkSchedule, maintenanceSchedule
 	if !ValidSchedule(checkSchedule) || !ValidSchedule(maintenanceSchedule) {
 		return fmt.Errorf("invalid repository task schedule")
 	}
-	concurrencyMode, err := models.NormalizeConcurrencyMode(concurrencyMode)
-	if err != nil {
-		return err
-	}
 	tx, err := db.Begin()
 	if err != nil {
 		return err
@@ -863,6 +869,10 @@ func updateRepositorySettings(db *sql.DB, id, checkSchedule, maintenanceSchedule
 	var engine, connector, storedObjectLockJSON string
 	if err := tx.QueryRow(`SELECT cold_storage,engine,connector,object_lock_json FROM repositories WHERE id=?`, id).
 		Scan(&coldStorage, &engine, &connector, &storedObjectLockJSON); err != nil {
+		return err
+	}
+	concurrencyMode, err = models.NormalizeConcurrencyModeForConnector(connector, concurrencyMode)
+	if err != nil {
 		return err
 	}
 	if coldStorage && checkSchedule != "manual" {

@@ -91,6 +91,288 @@ const vaultPasswordChangeNotice = (result: VaultPasswordChangeResult) => [
 const vaultPasswordChangeNoticeKind = (result: VaultPasswordChangeResult) =>
 	result.native.status === "succeeded" && !result.cleanupPending ? "ok" as const : "info" as const;
 
+const vaultPasswordChangeNeedsRecovery = (result: VaultPasswordChangeResult) =>
+	["preparing", "native_started", "publishing", "cleanup_pending"].includes(result.phase);
+
+const vaultPasswordChangeErrorNotice = (error: unknown) => {
+	const result = error instanceof APIError ? error.passwordChangeResult : undefined;
+	return [(error as Error).message, result?.resticKeyTruth].filter(Boolean).join(" ");
+};
+
+type VaultSettingsPayload = Parameters<typeof updateRepositorySchedules>[0];
+type VaultSettingsResponse = Awaited<ReturnType<typeof updateRepositorySchedules>>;
+type VaultMutationBase = {
+	repositoryId: string;
+	repositoryName: string;
+	generation: number;
+	uncertainResolved?: boolean;
+};
+type VaultPasswordMutation = VaultMutationBase & {
+	kind: "password";
+	status: "running" | "checking" | "succeeded" | "recovery" | "error" | "uncertain";
+	result?: VaultPasswordChangeResult;
+	error?: string;
+};
+type VaultSettingsMutation = VaultMutationBase & {
+	kind: "settings";
+	status: "running" | "succeeded" | "error";
+	payload: Readonly<VaultSettingsPayload>;
+	response?: VaultSettingsResponse;
+	error?: string;
+	retainedPasswordRecovery?: VaultPasswordMutation;
+};
+type VaultMutation = VaultSettingsMutation | VaultPasswordMutation;
+
+let vaultMutationGeneration = 0;
+let vaultMutationSnapshot: Record<string, VaultMutation> = {};
+const vaultMutationListeners = new Set<(snapshot: Record<string, VaultMutation>) => void>();
+const activeVaultMutationRequests = new Set<string>();
+let vaultPasswordStatusObservationGeneration = 0;
+let vaultPasswordStatusLifecycle = 0;
+const vaultPasswordStatusObservationOwners: Record<string, number> = {};
+
+type VaultPasswordStatusObservation = {
+	repositoryId: string;
+	generation: number;
+	lifecycle: number;
+};
+
+const beginVaultPasswordStatusObservation = (repositoryId: string): VaultPasswordStatusObservation => {
+	const generation = ++vaultPasswordStatusObservationGeneration;
+	vaultPasswordStatusObservationOwners[repositoryId] = generation;
+	return { repositoryId, generation, lifecycle: vaultPasswordStatusLifecycle };
+};
+
+const ownsVaultPasswordStatusObservation = (observation: VaultPasswordStatusObservation) =>
+	observation.lifecycle === vaultPasswordStatusLifecycle &&
+	vaultPasswordStatusObservationOwners[observation.repositoryId] === observation.generation;
+
+const invalidateVaultPasswordStatusObservation = (repositoryId: string) => {
+	vaultPasswordStatusObservationOwners[repositoryId] = ++vaultPasswordStatusObservationGeneration;
+};
+
+const publishVaultMutationSnapshot = (next: Record<string, VaultMutation>) => {
+	vaultMutationSnapshot = next;
+	for (const listener of vaultMutationListeners) listener(vaultMutationSnapshot);
+};
+
+const setVaultMutation = (mutation: VaultMutation) => publishVaultMutationSnapshot({
+	...vaultMutationSnapshot,
+	[mutation.repositoryId]: mutation,
+});
+
+const setAuthoritativeVaultPasswordMutation = (mutation: VaultPasswordMutation) => {
+	// A POST or its exact reconciliation is newer than passive reads that began
+	// before this truth settled. Active reconciliation has separate ownership.
+	invalidateVaultPasswordStatusObservation(mutation.repositoryId);
+	setVaultMutation(mutation);
+};
+
+// Every completion must still own this exact vault and generation. That keeps
+// a late result from changing a newer session or another vault's card.
+const ownsVaultMutation = (repositoryId: string, generation: number) =>
+	vaultMutationSnapshot[repositoryId]?.generation === generation;
+
+const beforeVaultMutationUnload = (event: BeforeUnloadEvent) => {
+	// This browser-owned prompt only reduces accidental page/process loss. It
+	// cannot guarantee completion after the user confirms leaving, and internal
+	// React navigation does not fire beforeunload.
+	event.preventDefault();
+	event.returnValue = "";
+};
+
+const holdVaultMutationUnloadGuard = (repositoryId: string, generation: number) => {
+	const requestKey = `${repositoryId}:${generation}`;
+	if (activeVaultMutationRequests.size === 0) window.addEventListener("beforeunload", beforeVaultMutationUnload);
+	activeVaultMutationRequests.add(requestKey);
+	return () => {
+		activeVaultMutationRequests.delete(requestKey);
+		// Each request removes only its own ownership. A second vault still in
+		// flight keeps the shared browser safeguard installed.
+		if (activeVaultMutationRequests.size === 0) window.removeEventListener("beforeunload", beforeVaultMutationUnload);
+	};
+};
+
+const subscribeVaultMutations = (listener: (snapshot: Record<string, VaultMutation>) => void) => {
+	vaultMutationListeners.add(listener);
+	listener(vaultMutationSnapshot);
+	return () => { vaultMutationListeners.delete(listener); };
+};
+
+const clearVaultMutation = (repositoryId: string, generation?: number) => {
+	if (generation !== undefined && !ownsVaultMutation(repositoryId, generation)) return;
+	// A dismissed or completed presentation is newer truth than any status GET
+	// that was already pending for this vault.
+	invalidateVaultPasswordStatusObservation(repositoryId);
+	const next = { ...vaultMutationSnapshot };
+	delete next[repositoryId];
+	publishVaultMutationSnapshot(next);
+};
+
+const freezeVaultSettingsPayload = (payload: VaultSettingsPayload): Readonly<VaultSettingsPayload> => Object.freeze({
+	...payload,
+	objectLock: Object.freeze({ ...payload.objectLock }),
+});
+
+const isCleanupPendingRecovery = (mutation: VaultMutation | undefined): mutation is VaultPasswordMutation =>
+	mutation?.kind === "password" && mutation.status === "recovery" && mutation.result?.phase === "cleanup_pending";
+
+const runVaultSettingsMutation = (
+	repositoryId: string,
+	repositoryName: string,
+	payload: Readonly<VaultSettingsPayload>,
+	replaceGeneration?: number,
+) => {
+	const current = vaultMutationSnapshot[repositoryId];
+	if (replaceGeneration !== undefined) {
+		if (!current || current.kind !== "settings" || current.generation !== replaceGeneration) return false;
+	} else if (current && !isCleanupPendingRecovery(current)) {
+		return false;
+	}
+	const retainedPasswordRecovery = isCleanupPendingRecovery(current)
+		? current
+		: current?.kind === "settings" ? current.retainedPasswordRecovery : undefined;
+	invalidateVaultPasswordStatusObservation(repositoryId);
+	const generation = ++vaultMutationGeneration;
+	// Closing the dialog changes presentation only. The same synchronous request
+	// still owns root publication/local commit, or the profile-local commit plus
+	// its existing profile.replicaro queue response, before this overlay ends.
+	setVaultMutation({ kind: "settings", status: "running", repositoryId, repositoryName, generation, payload, retainedPasswordRecovery });
+	const releaseUnloadGuard = holdVaultMutationUnloadGuard(repositoryId, generation);
+	void updateRepositorySchedules(payload as VaultSettingsPayload).then((response) => {
+		if (!ownsVaultMutation(repositoryId, generation)) return;
+		setVaultMutation({ kind: "settings", status: "succeeded", repositoryId, repositoryName, generation, payload, response, retainedPasswordRecovery });
+	}).catch((error: Error) => {
+		if (!ownsVaultMutation(repositoryId, generation)) return;
+		setVaultMutation({ kind: "settings", status: "error", repositoryId, repositoryName, generation, payload, error: error.message, retainedPasswordRecovery });
+	}).finally(releaseUnloadGuard);
+	return true;
+};
+
+const startVaultSettingsMutation = (repositoryName: string, payload: VaultSettingsPayload) =>
+	runVaultSettingsMutation(payload.repositoryId, repositoryName, freezeVaultSettingsPayload(payload));
+
+const retryVaultSettingsMutation = (repositoryId: string) => {
+	const current = vaultMutationSnapshot[repositoryId];
+	if (!current || current.kind !== "settings" || current.status !== "error") return false;
+	return runVaultSettingsMutation(repositoryId, current.repositoryName, current.payload, current.generation);
+};
+
+const settleVaultSettingsPresentation = (repositoryId: string, generation: number) => {
+	const current = vaultMutationSnapshot[repositoryId];
+	if (!current || current.kind !== "settings" || current.generation !== generation) return;
+	if (current.retainedPasswordRecovery) {
+		// cleanup_pending is separate committed-password recovery truth. A settings
+		// presentation may temporarily cover it, but must not dismiss it.
+		setVaultMutation({ ...current.retainedPasswordRecovery, generation: ++vaultMutationGeneration });
+		return;
+	}
+	clearVaultMutation(repositoryId, generation);
+};
+
+const passwordMutationFromResult = (
+	repositoryName: string,
+	generation: number,
+	result: VaultPasswordChangeResult,
+	error?: string,
+	uncertainResolved?: boolean,
+): VaultPasswordMutation => {
+	const base = { kind: "password" as const, repositoryId: result.repositoryId, repositoryName, generation, result, uncertainResolved };
+	if (vaultPasswordChangeNeedsRecovery(result)) return { ...base, status: "recovery", error };
+	// Orchestration completion means the candidate credential and sidecars were
+	// committed. Preserve a failed/interrupted native result as informational
+	// native truth, but never turn the completed password change into a failure.
+	if (result.phase === "completed" && !result.cleanupPending) return { ...base, status: "succeeded" };
+	return { ...base, status: "error", error };
+};
+
+const runVaultPasswordMutation = (
+	repositoryId: string,
+	repositoryName: string,
+	request: () => Promise<VaultPasswordChangeResult>,
+	replaceGeneration?: number,
+) => {
+	const current = vaultMutationSnapshot[repositoryId];
+	if (current && current.generation !== replaceGeneration) return false;
+	const generation = ++vaultMutationGeneration;
+	setAuthoritativeVaultPasswordMutation({ kind: "password", status: "running", repositoryId, repositoryName, generation });
+	const releaseUnloadGuard = holdVaultMutationUnloadGuard(repositoryId, generation);
+	void request().then((result) => {
+		if (!ownsVaultMutation(repositoryId, generation)) return;
+		if (result.repositoryId !== repositoryId) throw new Error("Password-change response did not match the selected vault.");
+		setAuthoritativeVaultPasswordMutation(passwordMutationFromResult(repositoryName, generation, result));
+	}).catch(async (error: unknown) => {
+		if (!ownsVaultMutation(repositoryId, generation)) return;
+		const structured = error instanceof APIError && error.passwordChangeResult?.repositoryId === repositoryId
+			? error.passwordChangeResult : undefined;
+		if (structured) {
+			setAuthoritativeVaultPasswordMutation(passwordMutationFromResult(repositoryName, generation, structured, vaultPasswordChangeErrorNotice(error)));
+			return;
+		}
+		// Any response without a structured password-change result can have lost
+		// its body after mutation, including an APIError produced from truncated
+		// JSON. Resolve it from durable status and never replay the candidate.
+		setAuthoritativeVaultPasswordMutation({ kind: "password", status: "checking", repositoryId, repositoryName, generation, error: (error as Error).message });
+		try {
+			const result = await getVaultPasswordChangeStatus(repositoryId);
+			// This read belongs to the exact mutation request, not to a Protect page
+			// observation. Route changes and overlapping passive reads cannot cancel it.
+			if (!ownsVaultMutation(repositoryId, generation)) return;
+			if (result.repositoryId !== repositoryId) throw new Error("Password-change status did not match the selected vault.");
+			setAuthoritativeVaultPasswordMutation(passwordMutationFromResult(repositoryName, generation, result));
+		} catch {
+			if (!ownsVaultMutation(repositoryId, generation)) return;
+			setAuthoritativeVaultPasswordMutation({
+				kind: "password", status: "uncertain", repositoryId, repositoryName, generation,
+				error: (error as Error).message, uncertainResolved: true,
+			});
+		}
+	}).finally(releaseUnloadGuard);
+	return true;
+};
+
+const startVaultPasswordMutation = (repositoryId: string, repositoryName: string, password: string, confirmation: string) =>
+	runVaultPasswordMutation(repositoryId, repositoryName, () => changeVaultPassword(repositoryId, password, confirmation));
+
+const continueVaultPasswordMutation = (repositoryId: string) => {
+	const current = vaultMutationSnapshot[repositoryId];
+	if (!current || current.kind !== "password" || current.status !== "recovery") return false;
+	return runVaultPasswordMutation(repositoryId, current.repositoryName, () => retryVaultPasswordChange(repositoryId), current.generation);
+};
+
+const recordObservedVaultPasswordMutation = (repositoryId: string, repositoryName: string, result: VaultPasswordChangeResult) => {
+	if (result.repositoryId !== repositoryId) return;
+	const current = vaultMutationSnapshot[repositoryId];
+	// Status observations may replace inactive recovery/uncertainty, but never
+	// steal ownership from a synchronous request that is still unresolved.
+	if (current?.kind === "password" && (current.status === "running" || current.status === "checking")) return;
+	// A settings failure owns its immutable retry too. Its retained cleanup
+	// recovery remains visible until settings presentation settles.
+	if (current?.kind === "settings") return;
+	if (!vaultPasswordChangeNeedsRecovery(result) && result.phase !== "completed") return;
+	setVaultMutation(passwordMutationFromResult(repositoryName, ++vaultMutationGeneration, result));
+};
+
+const recordMissingVaultPasswordMutation = (repositoryId: string) => {
+	const current = vaultMutationSnapshot[repositoryId];
+	// Absence cannot resolve a live request whose response was lost: the durable
+	// record may have been absent before start or removed after cleanup.
+	if (current?.kind === "password" && current.status === "uncertain" && current.uncertainResolved) return;
+	if (!current || current.kind !== "password" || current.status === "running" || current.status === "checking") return;
+	clearVaultMutation(repositoryId, current.generation);
+};
+
+// Test isolation needs an explicit reset because this presentation state is
+// intentionally module-owned so an internal route unmount cannot cancel work.
+// eslint-disable-next-line react-refresh/only-export-components
+export const resetVaultMutationPresentationForTests = () => {
+	activeVaultMutationRequests.clear();
+	window.removeEventListener("beforeunload", beforeVaultMutationUnload);
+	vaultPasswordStatusLifecycle++;
+	for (const repositoryId of Object.keys(vaultPasswordStatusObservationOwners)) delete vaultPasswordStatusObservationOwners[repositoryId];
+	publishVaultMutationSnapshot({});
+};
+
 type RunSubmissionOwner = {
 	session: number;
 	generation: number;
@@ -103,6 +385,85 @@ type VaultWorkState = "checking" | "idle" | "running" | "unavailable";
 type ActiveBackupTarget = { jobId: string; repositoryId: string; operationId: string; status: string };
 type ObservedBackupOperation = { jobId: string; repositoryId: string };
 type ObservedOperationReadOwner = { generation: number; repositoryId: string; repositoryEpoch: number };
+
+function VaultActivityLog({ records }: { records: VaultProgressRecord[] }) {
+	const container = useRef<HTMLElement | null>(null);
+	const lines = useRef<HTMLDivElement | null>(null);
+	const dialogWasScrolled = useRef(false);
+	useEffect(() => {
+		if (!records.length) return;
+		if (lines.current) lines.current.scrollTop = lines.current.scrollHeight;
+		if (!dialogWasScrolled.current) {
+			const dialog = container.current?.closest<HTMLElement>('[role="dialog"]');
+			if (dialog) {
+				// Bring the newly appeared request log into view once. Subsequent
+				// records move only the ten-line viewport so a long request never
+				// keeps dragging the user's dialog position.
+				dialog.scrollTop = dialog.scrollHeight;
+				dialogWasScrolled.current = true;
+			}
+		}
+	}, [records]);
+	return <aside ref={container} className="vault-work-log" role="log" aria-label="Vault activity">
+		<strong>Vault activity</strong>
+		<div ref={lines} className="vault-work-log-lines">{records.map((record, index) => <div key={index} className={record.type === "stage" ? "vault-work-stage" : "vault-work-native"}>{record.text}</div>)}</div>
+	</aside>;
+}
+
+const vaultMutationBlocksCard = (mutation: VaultMutation) =>
+	mutation.kind === "settings" ||
+	mutation.status !== "recovery" ||
+	mutation.result?.phase !== "cleanup_pending";
+
+function VaultPasswordResult({ result }: { result: VaultPasswordChangeResult }) {
+	return <div className="vault-password-result">
+		<span><b>Phase:</b> {result.phase.replaceAll("_", " ")}</span>
+		<span><b>Native {result.native.engine} result:</b> {result.native.status || "unresolved"}{result.native.output ? ` — ${formatNativeLogText(result.native.engine, "password_change", result.native.output)}` : ""}</span>
+		<span><b>Protected recovery metadata:</b> {result.sidecarStatus}</span>
+		<span><b>Local cleanup:</b> {result.cleanupPending ? "pending" : "not pending"}</span>
+		<span>{result.message}</span>
+		{result.resticKeyTruth && <span>{result.resticKeyTruth}</span>}
+		{result.native.mutationDisposition === "rejected_before_mutation" && !result.resticKeyTruth && <span>The selected password was not changed.</span>}
+	</div>;
+}
+
+function VaultMutationOverlay({ mutation, onReopenSettings }: { mutation: VaultMutation; onReopenSettings: (repositoryId: string, generation: number) => void }) {
+	const active = mutation.status === "running" || mutation.status === "checking";
+	const result = mutation.kind === "password" ? mutation.result : undefined;
+	const retainedPasswordRecovery = mutation.kind === "settings" ? mutation.retainedPasswordRecovery : undefined;
+	const cleanupNotice = mutation.kind === "password" && mutation.status === "recovery" && result?.phase === "cleanup_pending";
+	return <div className={`vault-mutation-overlay${cleanupNotice ? " is-nonblocking" : ""}`} role={mutation.status === "error" ? "alert" : "status"} aria-live="polite">
+		{active && <span className="spinner" aria-hidden="true" />}
+		<strong>{mutation.kind === "settings"
+			? mutation.status === "running" ? "Saving vault settings…"
+				: mutation.status === "succeeded" ? "Vault settings saved."
+					: "Vault settings could not be saved."
+			: mutation.status === "running" ? "Changing vault password…"
+				: mutation.status === "checking" ? "Checking password-change status…"
+					: mutation.status === "recovery" ? "Password change needs attention."
+						: mutation.status === "uncertain" ? "Password change outcome is uncertain."
+							: mutation.status === "succeeded" ? "Vault password change completed."
+								: "Vault password change did not finish."}</strong>
+		{mutation.error && <span className={mutation.status === "uncertain" ? "vault-mutation-uncertain" : "vault-mutation-error"}>{mutation.error}</span>}
+		{result && <VaultPasswordResult result={result} />}
+		{!active && <div className="vault-mutation-actions">
+			{(mutation.status === "error" || mutation.status === "uncertain") && <button className="btn sm" onClick={() => mutation.kind === "settings" ? settleVaultSettingsPresentation(mutation.repositoryId, mutation.generation) : clearVaultMutation(mutation.repositoryId, mutation.generation)}>Dismiss</button>}
+			{mutation.kind === "settings" && mutation.status === "error" && <button className="btn sm" onClick={() => retryVaultSettingsMutation(mutation.repositoryId)}>Retry save</button>}
+			{mutation.kind === "settings" && mutation.status === "error" && <button className="btn sm" onClick={() => onReopenSettings(mutation.repositoryId, mutation.generation)}>Reopen settings</button>}
+			{mutation.kind === "password" && mutation.status === "recovery" && <button className="btn sm" onClick={() => continueVaultPasswordMutation(mutation.repositoryId)}>Continue password change</button>}
+		</div>}
+		{mutation.kind === "settings" && mutation.status !== "running" && retainedPasswordRecovery?.result && <div className="vault-retained-password-recovery">
+			<strong>Password change still needs attention.</strong>
+			<VaultPasswordResult result={retainedPasswordRecovery.result} />
+			<div className="vault-mutation-actions"><button className="btn sm" onClick={() => runVaultPasswordMutation(
+				mutation.repositoryId,
+				retainedPasswordRecovery.repositoryName,
+				() => retryVaultPasswordChange(mutation.repositoryId),
+				mutation.generation,
+			)}>Continue password change</button></div>
+		</div>}
+	</div>;
+}
 
 const JOB_PAGE_SIZE = 5;
 const VAULT_PAGE_SIZE = 6;
@@ -141,16 +502,18 @@ function rcloneLifecycleFailure(error: unknown, pendingConnection = false) {
 		activation?: { disposition?: string };
 		attached?: boolean;
 		usable?: boolean;
+		failureStage?: string;
 	};
 	const disposition = failure.activation?.disposition;
+	const failureStage = failure.failureStage ? ` Failure stage: ${failure.failureStage}.` : "";
 	if (disposition !== "activated" && disposition !== "indeterminate") {
-		return { consumed: false, completed: false, message: failure.message };
+		return { consumed: false, completed: false, message: `${failure.message}${failureStage}` };
 	}
 	if (failure.attached === true && failure.usable === true) {
 		return {
 			consumed: true,
 			completed: true,
-			message: `${failure.message} The vault is saved and usable; only a local follow-up or temporary authorization cleanup failed. Refresh to review its current state.`,
+			message: `${failure.message}${failureStage} The vault is saved and usable; only a local follow-up or temporary authorization cleanup failed. Refresh to review its current state.`,
 		};
 	}
 	return {
@@ -158,7 +521,7 @@ function rcloneLifecycleFailure(error: unknown, pendingConnection = false) {
 		completed: false,
 		// Activation consumes the login session but keeps the vault-owned config.
 		// A pending connection can retry that config before another login.
-		message: `${failure.message} Native authorization was ${disposition}; attached=${Boolean(failure.attached)}, usable=${failure.usable === undefined ? "not assessed" : String(failure.usable)}. ${pendingConnection ? "Retry the pending connection. Replicaro will request rclone authorization if the saved configuration is unavailable." : "Reauthorize before retrying."}`,
+		message: `${failure.message}${failureStage} Native authorization was ${disposition}; attached=${Boolean(failure.attached)}, usable=${failure.usable === undefined ? "not assessed" : String(failure.usable)}. ${pendingConnection ? "Retry the pending connection. Replicaro will request rclone authorization if the saved configuration is unavailable." : "Reauthorize before retrying."}`,
 	};
 }
 
@@ -879,6 +1242,23 @@ const emptyVault = (integration?: StorageIntegration, engine: VaultForm["engine"
 	objectLock: emptyObjectLock(),
 });
 
+const limitedSpeedProviders: Record<string, string> = {
+	dropbox: "Dropbox",
+	google_drive: "Google Drive",
+	onedrive: "OneDrive",
+};
+
+// Keep old/imported high-speed values usable while making provider changes
+// synchronous with form state so a save cannot race a later correction.
+function compatibleConcurrencyMode(connector: string, mode: VaultForm["concurrencyMode"]): VaultForm["concurrencyMode"] {
+	return limitedSpeedProviders[connector] && (mode === "increased" || mode === "maximum") ? "native" : mode;
+}
+
+function compatibleVaultForm(form: VaultForm): VaultForm {
+	const concurrencyMode = compatibleConcurrencyMode(form.connector, form.concurrencyMode);
+	return concurrencyMode === form.concurrencyMode ? form : { ...form, concurrencyMode };
+}
+
 function IntegrationField({
     option,
     value,
@@ -1281,12 +1661,35 @@ function VaultCareFields({
 				<small>{form.objectLock.enrolled ? (form.objectLock.paused ? pausedObjectLockMaintenanceHelp : objectLockMaintenanceHelp) : maintenanceHelp}</small>
 				{maintenanceDisabled && maintenanceLockedHelp && <small>{maintenanceLockedHelp}</small>}
 			</label>
-			<label className="field vault-job-speed-field">
-				<span>Job speed</span>
-				<select disabled={disabled} value={form.concurrencyMode} onChange={(event) => onChange({ ...form, concurrencyMode: event.target.value as VaultForm["concurrencyMode"] })}><option value="reduced">Slower</option><option value="native">Normal</option><option value="increased">Faster</option><option value="maximum">Maximum</option></select>
-				<small>Controls how quickly Replicaro finishes backup, restore, integrity check, and space reclamation jobs. Higher speed means higher CPU, memory, disk, and network use. Set higher speeds with caution.</small>
-			</label>
+			<JobSpeedField connector={form.connector} value={form.concurrencyMode} disabled={disabled} onChange={(concurrencyMode) => onChange({ ...form, concurrencyMode })} />
 		</div>
+	);
+}
+
+function JobSpeedField({
+	connector,
+	value,
+	disabled = false,
+	onChange,
+}: {
+	connector: string;
+	value: VaultForm["concurrencyMode"];
+	disabled?: boolean;
+	onChange: (mode: VaultForm["concurrencyMode"]) => void;
+}) {
+	const provider = limitedSpeedProviders[connector];
+	return (
+		<label className="field vault-job-speed-field">
+			<span>Job speed</span>
+			<select disabled={disabled} value={compatibleConcurrencyMode(connector, value)} onChange={(event) => onChange(compatibleConcurrencyMode(connector, event.target.value as VaultForm["concurrencyMode"]))}>
+				<option value="reduced">Slower</option>
+				<option value="native">Normal</option>
+				<option value="increased" disabled={Boolean(provider)}>Faster</option>
+				<option value="maximum" disabled={Boolean(provider)}>Maximum</option>
+			</select>
+			<small>Controls how quickly Replicaro finishes backup, restore, integrity check, and space reclamation jobs. Higher speed means higher CPU, memory, disk, and network use. Set higher speeds with caution.</small>
+			{provider && <small>{provider} limits how fast you can connect to your cloud drive, so Faster and Maximum settings are not available for {provider}.</small>}
+		</label>
 	);
 }
 
@@ -1451,6 +1854,7 @@ export default function Protect() {
     const toast = useToast();
     const [jobs, setJobs] = useState<BackupJob[] | null>(null);
     const [repos, setRepos] = useState<Repository[] | null>(null);
+	const [vaultMutations, setVaultMutations] = useState<Record<string, VaultMutation>>(vaultMutationSnapshot);
 	const [vaultStats, setVaultStats] = useState<Record<string, VaultSizeStatus>>({});
     const [integrations, setIntegrations] = useState<StorageIntegration[]>([]);
     const [engineCatalog, setEngineCatalog] = useState<EngineDescriptor[]>([]);
@@ -1498,9 +1902,12 @@ export default function Protect() {
     const [vaultAdvanced, setVaultAdvanced] = useState(false);
 		const [vaultSaving, setVaultSaving] = useState(false);
 	const [retryCreationIntentId, setRetryCreationIntentId] = useState("");
-	const setVaultForm = (next: VaultForm) => setVaultFormState(next);
+	const setVaultForm = (next: VaultForm) => setVaultFormState(compatibleVaultForm(next));
 	const [vaultCreateError, setVaultCreateError] = useState("");
-	const [connectForm, setConnectForm] = useState<VaultForm>(emptyVault());
+	const [connectForm, setConnectFormState] = useState<VaultForm>(emptyVault());
+	const setConnectForm = (next: VaultForm | ((current: VaultForm) => VaultForm)) => {
+		setConnectFormState((current) => compatibleVaultForm(typeof next === "function" ? next(current) : next));
+	};
 	const [connectRcloneAuth, setConnectRcloneAuth] = useState<RcloneAuthStatus | null>(null);
 	const [connectAdvanced, setConnectAdvanced] = useState(false);
 	const [connectPreview, setConnectPreview] = useState<ExistingVaultPreview | null>(null);
@@ -1518,10 +1925,6 @@ export default function Protect() {
 	const [connectChecking, setConnectChecking] = useState(false);
 	const [connectSaving, setConnectSaving] = useState(false);
 	const [vaultProgress, setVaultProgress] = useState<VaultProgressRecord[]>([]);
-	const vaultProgressView = useRef<HTMLDivElement | null>(null);
-	useEffect(() => {
-		if (vaultProgressView.current) vaultProgressView.current.scrollTop = vaultProgressView.current.scrollHeight;
-	}, [vaultProgress]);
 	// A small bounded presentation buffer lets users see actual stages and native
 	// output while the existing request remains authoritative. No progress is
 	// invented, persisted, or used to decide whether creation/connection worked.
@@ -1539,8 +1942,7 @@ export default function Protect() {
 	const [vaultOwnershipPresentation, setVaultOwnershipPresentation] = useState<VaultOwnershipPresentation>("unverified");
 	const [vaultOwnershipBusy, setVaultOwnershipBusy] = useState(false);
 	const [vaultPasswordForm, setVaultPasswordForm] = useState({ password: "", confirmation: "" });
-	const [vaultPasswordRecovery, setVaultPasswordRecovery] = useState<VaultPasswordChangeResult | null>(null);
-	const [vaultPasswordChangeBusy, setVaultPasswordChangeBusy] = useState(false);
+	const [vaultOneAtATimeChoice, setVaultOneAtATimeChoice] = useState<{ kind: "reconnect" | "password"; repository: Repository } | null>(null);
 	const rcloneAuthSessionsOnUnmount = useRef<string[]>([]);
 	const [dormantJobs, setDormantJobs] = useState<DormantRecoveryJob[]>([]);
 	const [dormantBusy, setDormantBusy] = useState("");
@@ -1550,7 +1952,6 @@ export default function Protect() {
 	const [concurrencyMode, setConcurrencyMode] = useState<VaultForm["concurrencyMode"]>("native");
 	const [autoUnlock, setAutoUnlock] = useState(true);
 	const [objectLock, setObjectLock] = useState<ObjectLockSettings>(emptyObjectLock());
-    const [careSaving, setCareSaving] = useState(false);
     const [toolBusy, setToolBusy] = useState("");
 	const [toolOutput, setToolOutput] = useState("");
     const [showRawToolLog, setShowRawToolLog] = useState(false);
@@ -1558,7 +1959,6 @@ export default function Protect() {
 	const [vaultDelete, setVaultDelete] = useState<Repository | null>(null);
 	const [vaultRemoval, setVaultRemoval] = useState<Record<string, { phase: "removing" | "profile_error" | "error"; message?: string }>>({});
 	const [closePrompt, setClosePrompt] = useState<"job" | "vault" | null>(null);
-	const [vaultReconnectAfterClose, setVaultReconnectAfterClose] = useState<Repository | null>(null);
 	const jobModalSession = useRef(0);
 	const jobSubmissionGeneration = useRef(0);
 	const jobSubmissionOwner = useRef<{ session: number; generation: number } | null>(null);
@@ -1583,6 +1983,7 @@ export default function Protect() {
 	const vaultSettingsSession = useRef(0);
 	const vaultSettingsOwner = useRef("");
 	const vaultOwnershipRequest = useRef(0);
+	const protectPageActive = useRef(false);
 	// Reconnect presentation is derived only from operations observed in this
 	// frontend session; it never probes or recreates persistent vault health.
 	const observedBackupOperations = useRef<Record<string, ObservedBackupOperation>>({});
@@ -1600,10 +2001,31 @@ export default function Protect() {
 	const vaultRemovalInFlight = useRef(new Set<string>());
 	const refreshGenerations = useRef({ jobs: 0, repositories: 0, profileSync: 0, running: 0, creations: 0 });
 	const runningState = useRef<Record<string, boolean>>({});
+	const handledVaultMutationCompletions = useRef(new Set<string>());
+	const handledVaultMutationReloads = useRef(new Set<string>());
 
 	const commitRunning = useCallback((next: Record<string, boolean>) => {
 		runningState.current = next;
 		setRunning(next);
+	}, []);
+
+	useEffect(() => subscribeVaultMutations(setVaultMutations), []);
+
+	useEffect(() => {
+		protectPageActive.current = true;
+		return () => {
+			protectPageActive.current = false;
+			// Late dialog reads may not mutate module-owned retry presentation after
+			// their initiating Protect page is gone.
+		};
+	}, []);
+
+	useEffect(() => {
+		// Status reads are presentation observations, unlike the module-owned
+		// synchronous mutations. Crossing a page lifetime invalidates only those
+		// reads so an old Protect instance cannot resurrect stale recovery state.
+		vaultPasswordStatusLifecycle++;
+		return () => { vaultPasswordStatusLifecycle++; };
 	}, []);
 
 	const clearReconnectObservation = useCallback((repositoryId: string) => {
@@ -1794,6 +2216,20 @@ export default function Protect() {
 					fresh: false, running: false, pending: false, paused: false,
 				}];
 			})));
+			// Password recovery is already durable in the backend. Rebuild only its
+			// unfinished card presentation for this authoritative vault list; an
+			// ordinary 404 means there is no operation and is intentionally silent.
+			for (const repository of nextRepos) {
+				const observation = beginVaultPasswordStatusObservation(repository.id);
+				void getVaultPasswordChangeStatus(repository.id).then((status) => {
+					if (refreshGenerations.current.repositories !== request.repositories || !ownsVaultPasswordStatusObservation(observation)) return;
+					recordObservedVaultPasswordMutation(repository.id, repository.name, status);
+				}).catch((error: Error) => {
+					if (refreshGenerations.current.repositories !== request.repositories || !ownsVaultPasswordStatusObservation(observation)) return;
+					if (error instanceof APIError && error.status === 404) recordMissingVaultPasswordMutation(repository.id);
+					else toast("error", error.message);
+				});
+			}
 		}).catch((error: Error) => {
 			if (refreshGenerations.current.repositories === request.repositories) toast("error", error.message);
 		});
@@ -1819,7 +2255,7 @@ export default function Protect() {
                 const descriptor = engineInfo.engines.find((item) => item.id === settings.defaultEngine);
                 const provider = catalog.integrations.find((item) => descriptor?.providers.some((candidate) => candidate.id === item.id && candidate.supported));
                 setVaultFormState(emptyVault(provider, settings.defaultEngine));
-				setConnectForm(emptyVault(catalog.integrations.find((item) => item.id === "fs"), settings.defaultEngine));
+				setConnectFormState(emptyVault(catalog.integrations.find((item) => item.id === "fs"), settings.defaultEngine));
             })
             .catch((error: Error) => toast("error", error.message));
 	}, [load, toast]);
@@ -3216,9 +3652,6 @@ export default function Protect() {
 		setVaultOwnershipPresentation("unverified");
 		setVaultOwnershipBusy(false);
 		setVaultPasswordForm({ password: "", confirmation: "" });
-		setVaultPasswordRecovery(null);
-		setVaultPasswordChangeBusy(false);
-		setCareSaving(false);
 		setToolBusy("");
 		setToolOutput("");
 	};
@@ -3274,7 +3707,7 @@ export default function Protect() {
 		vaultOwnershipRequest.current++;
 		vaultSettingsSession.current++;
 		vaultSettingsOwner.current = "";
-		setVaultReconnectAfterClose(null);
+		setVaultOneAtATimeChoice(null);
 		setVaultSettings(null);
 		setVaultWorkState("idle");
 		setVaultSettingsAdvanced(false);
@@ -3282,7 +3715,7 @@ export default function Protect() {
 		clearVaultSettingsTransient();
 	};
 
-    const openVaultSettings = (repo: Repository) => {
+	const openVaultSettings = (repo: Repository) => {
 		const session = ++vaultSettingsSession.current;
 		vaultSettingsOwner.current = repo.id;
 		clearVaultSettingsTransient();
@@ -3298,7 +3731,7 @@ export default function Protect() {
         };
         setCheckSchedule(schedules.checkSchedule);
         setMaintenanceSchedule(schedules.maintenanceSchedule);
-		setConcurrencyMode(schedules.concurrencyMode);
+		setConcurrencyMode(compatibleConcurrencyMode(repo.connector, schedules.concurrencyMode));
 		setAutoUnlock(schedules.autoUnlock);
 		setObjectLock(schedules.objectLock);
         setVaultInitialSchedules(schedules);
@@ -3306,12 +3739,31 @@ export default function Protect() {
 			.then((jobs) => { if (vaultSettingsSessionIsCurrent(session, repo.id)) setDormantJobs(ownedDormantJobs(repo.id, jobs)); })
 			.catch((error: Error) => { if (vaultSettingsSessionIsCurrent(session, repo.id)) toast("error", error.message); });
 		detectVaultOwnership(repo, session);
-		void getVaultPasswordChangeStatus(repo.id)
-			.then((status) => { if (vaultSettingsSessionIsCurrent(session, repo.id)) setVaultPasswordRecovery(status); })
-			.catch((error: Error) => {
-				if (vaultSettingsSessionIsCurrent(session, repo.id) && (!(error instanceof APIError) || error.status !== 404)) toast("error", error.message);
-			});
     };
+
+	const reopenVaultSettings = async (repositoryId: string, generation: number) => {
+		// Reserve this page's next dialog intent before the authoritative read. A
+		// newer Edit click changes the session and wins without disabling cards.
+		const session = ++vaultSettingsSession.current;
+		vaultSettingsOwner.current = repositoryId;
+		try {
+			// The failed response may have been lost after commit. Read the current
+			// repository row directly before rebuilding the form; the retry payload
+			// remains frozen on the card until this explicit action succeeds.
+			const nextRepos = await getRepositories();
+			if (!protectPageActive.current || !vaultSettingsSessionIsCurrent(session, repositoryId) || !ownsVaultMutation(repositoryId, generation)) return;
+			const repository = nextRepos.find((candidate) => candidate.id === repositoryId);
+			if (!repository) throw new Error("The vault is no longer available.");
+			++refreshGenerations.current.repositories;
+			setRepos(nextRepos);
+			settleVaultSettingsPresentation(repositoryId, generation);
+			openVaultSettings(repository);
+		} catch (error) {
+			if (protectPageActive.current && vaultSettingsSessionIsCurrent(session, repositoryId) && ownsVaultMutation(repositoryId, generation)) {
+				toast("error", (error as Error).message);
+			}
+		}
+	};
 
 	const openSavedVaultReconnect = async (repository: Repository) => {
 		if (connectSaving) return;
@@ -3394,8 +3846,7 @@ export default function Protect() {
 	));
 	const requestSavedVaultReconnect = (repository: Repository) => {
 		if (vaultCareHasUnsavedChanges()) {
-			setVaultReconnectAfterClose(repository);
-			setClosePrompt("vault");
+			setVaultOneAtATimeChoice({ kind: "reconnect", repository });
 			return;
 		}
 		void openSavedVaultReconnect(repository);
@@ -3424,8 +3875,17 @@ export default function Protect() {
 		}
 	};
 
-	const submitVaultPasswordChange = async () => {
-		if (!vaultSettings || !vaultOwnership?.isOwner || vaultPasswordChangeBusy || vaultPasswordRecovery) return;
+	const beginVaultPasswordChange = (repository: Repository, submitted: { password: string; confirmation: string }) => {
+		if (vaultMutationSnapshot[repository.id]) return;
+		setVaultPasswordForm({ password: "", confirmation: "" });
+		// Dialog dismissal is presentation-only: this starts the existing
+		// synchronous endpoint and leaves its native/recovery semantics untouched.
+		dismissVaultSettings();
+		startVaultPasswordMutation(repository.id, repository.name, submitted.password, submitted.confirmation);
+	};
+
+	const submitVaultPasswordChange = () => {
+		if (!vaultSettings || !vaultOwnership?.isOwner || vaultMutationSnapshot[vaultSettings.id]) return;
 		if (!validVaultPassword(vaultPasswordForm.password)) {
 			toast("error", "Enter a vault password without leading or trailing whitespace, line breaks, or NUL characters.");
 			return;
@@ -3434,49 +3894,16 @@ export default function Protect() {
 			toast("error", "The vault passwords do not match.");
 			return;
 		}
-		const repositoryId = vaultSettings.id;
-		const session = vaultSettingsSession.current;
 		const submitted = { ...vaultPasswordForm };
-		setVaultPasswordChangeBusy(true);
-		try {
-			const result = await changeVaultPassword(repositoryId, submitted.password, submitted.confirmation);
-			if (!vaultSettingsSessionIsCurrent(session, repositoryId)) return;
-			if (result.repositoryId !== repositoryId) throw new Error("Password-change response did not match the open vault.");
-			setVaultPasswordForm({ password: "", confirmation: "" });
-			setVaultPasswordRecovery(result.phase === "completed" ? null : result);
-			toast(vaultPasswordChangeNoticeKind(result), vaultPasswordChangeNotice(result));
-		} catch (error) {
-			if (!vaultSettingsSessionIsCurrent(session, repositoryId)) return;
-			if (error instanceof APIError && error.passwordChangeResult?.repositoryId === repositoryId) setVaultPasswordRecovery(error.passwordChangeResult);
-			toast("error", (error as Error).message);
-		} finally {
-			if (vaultSettingsSessionIsCurrent(session, repositoryId)) setVaultPasswordChangeBusy(false);
+		if (vaultCareHasUnsavedChanges()) {
+			setVaultOneAtATimeChoice({ kind: "password", repository: vaultSettings });
+			return;
 		}
-	};
-
-	const retryPendingVaultPasswordChange = async () => {
-		if (!vaultSettings || !vaultPasswordRecovery || vaultPasswordChangeBusy) return;
-		const repositoryId = vaultSettings.id;
-		const session = vaultSettingsSession.current;
-		setVaultPasswordChangeBusy(true);
-		try {
-			const result = await retryVaultPasswordChange(repositoryId);
-			if (!vaultSettingsSessionIsCurrent(session, repositoryId)) return;
-			if (result.repositoryId !== repositoryId) throw new Error("Password-change response did not match the open vault.");
-			setVaultPasswordRecovery(result.phase === "completed" ? null : result);
-			toast(vaultPasswordChangeNoticeKind(result), vaultPasswordChangeNotice(result));
-		} catch (error) {
-			if (!vaultSettingsSessionIsCurrent(session, repositoryId)) return;
-			if (error instanceof APIError && error.passwordChangeResult?.repositoryId === repositoryId) setVaultPasswordRecovery(error.passwordChangeResult);
-			toast("error", (error as Error).message);
-		} finally {
-			if (vaultSettingsSessionIsCurrent(session, repositoryId)) setVaultPasswordChangeBusy(false);
-		}
+		beginVaultPasswordChange(vaultSettings, submitted);
 	};
 
 	const closeVault = () => {
 		if (vaultCareHasUnsavedChanges()) {
-			setVaultReconnectAfterClose(null);
 			setClosePrompt("vault");
 			return;
         }
@@ -3487,33 +3914,26 @@ export default function Protect() {
 		if (closePrompt === "job") {
 			dismissJob();
 		} else if (closePrompt === "vault") {
-			const reconnect = vaultReconnectAfterClose;
-			setVaultReconnectAfterClose(null);
 			dismissVaultSettings();
-			if (reconnect) void openSavedVaultReconnect(reconnect);
 		}
 		setClosePrompt(null);
 	};
 
 	const saveChangesBeforeClose = () => {
-		const reconnect = vaultReconnectAfterClose;
-		setVaultReconnectAfterClose(null);
 		setClosePrompt(null);
 		if (closePrompt === "job") {
 			void saveJob();
 		} else if (closePrompt === "vault") {
-			void saveCare(reconnect);
+			void saveCare();
 		}
 	};
 
-	const saveCare = async (reconnectAfterSave: Repository | null = null) => {
+	const saveCare = () => {
         if (!vaultSettings || vaultWorkState !== "idle") return;
 		const repositoryId = vaultSettings.id;
 		const repositoryName = vaultSettings.name;
-		const session = vaultSettingsSession.current;
-        setCareSaving(true);
-        try {
-			const result = await updateRepositorySchedules({
+		if (!validObjectLockSettings(objectLock, maintenanceSchedule, true, vaultSettings.objectLock)) return;
+		const payload: VaultSettingsPayload = {
 				repositoryId,
                 checkSchedule,
 				maintenanceSchedule,
@@ -3521,18 +3941,63 @@ export default function Protect() {
 				autoUnlock,
 				objectLock,
 				...(vaultOwnershipPresentation !== "owner" ? { profilePreferencesOnly: true } : {}),
-            });
-			if (!vaultSettingsSessionIsCurrent(session, repositoryId)) return;
-			toast(result?.warning ? "info" : "ok", result?.warning ?? `Vault "${repositoryName}" settings saved`);
-			dismissVaultSettings();
-			load();
-			if (reconnectAfterSave) void openSavedVaultReconnect(reconnectAfterSave);
-        } catch (error) {
-			if (vaultSettingsSessionIsCurrent(session, repositoryId)) toast("error", (error as Error).message);
-        } finally {
-			if (vaultSettingsSessionIsCurrent(session, repositoryId)) setCareSaving(false);
-        }
+		};
+		const currentMutation = vaultMutationSnapshot[repositoryId];
+		if (currentMutation && !isCleanupPendingRecovery(currentMutation)) return;
+		// Freeze all submitted values before closing so later form/session changes
+		// cannot alter this request or its run-local retry.
+		dismissVaultSettings();
+		startVaultSettingsMutation(repositoryName, payload);
     };
+
+	const chooseSaveVaultSettings = () => {
+		if (vaultOneAtATimeChoice?.kind === "password") setVaultPasswordForm({ password: "", confirmation: "" });
+		setVaultOneAtATimeChoice(null);
+		saveCare();
+	};
+
+	const chooseReconnect = () => {
+		if (!vaultOneAtATimeChoice || vaultOneAtATimeChoice.kind !== "reconnect") return;
+		const repository = vaultOneAtATimeChoice.repository;
+		setVaultOneAtATimeChoice(null);
+		dismissVaultSettings();
+		void openSavedVaultReconnect(repository);
+	};
+
+	const choosePasswordChange = () => {
+		if (!vaultOneAtATimeChoice || vaultOneAtATimeChoice.kind !== "password") return;
+		const repository = vaultOneAtATimeChoice.repository;
+		const submitted = { ...vaultPasswordForm };
+		setVaultOneAtATimeChoice(null);
+		beginVaultPasswordChange(repository, submitted);
+	};
+
+	useEffect(() => {
+		for (const mutation of Object.values(vaultMutations)) {
+			const completionKey = `${mutation.repositoryId}:${mutation.generation}`;
+			if (mutation.status === "succeeded" && !handledVaultMutationCompletions.current.has(completionKey)) {
+				handledVaultMutationCompletions.current.add(completionKey);
+				if (mutation.kind === "settings") {
+					toast(mutation.response?.warning ? "info" : "ok", mutation.response?.warning ?? `Vault "${mutation.repositoryName}" settings saved`);
+				} else if (mutation.result) {
+					toast(vaultPasswordChangeNoticeKind(mutation.result), vaultPasswordChangeNotice(mutation.result));
+				}
+				if (mutation.kind === "settings") settleVaultSettingsPresentation(mutation.repositoryId, mutation.generation);
+				else clearVaultMutation(mutation.repositoryId, mutation.generation);
+				load();
+				continue;
+			}
+			if ((mutation.uncertainResolved || (mutation.kind === "settings" && mutation.status === "error")) && !handledVaultMutationReloads.current.has(completionKey)) {
+				handledVaultMutationReloads.current.add(completionKey);
+				load();
+			}
+		}
+		if (vaultSettings && vaultMutations[vaultSettings.id] && vaultMutationBlocksCard(vaultMutations[vaultSettings.id])) dismissVaultSettings();
+		// dismissVaultSettings is intentionally not a dependency: this effect is
+		// driven by coordinator snapshots, while the dialog cleanup helper changes
+		// identity with ordinary form renders.
+		// eslint-disable-next-line react-hooks/exhaustive-deps
+	}, [load, toast, vaultMutations, vaultSettings]);
 
     const runTool = async (kind: "check" | "maintenance") => {
         if (!vaultSettings) return;
@@ -4058,6 +4523,8 @@ export default function Protect() {
 					))}
                     {pageVaults.map((repo) => {
 						const removal = vaultRemoval[repo.id];
+						const mutation = vaultMutations[repo.id];
+						const cardBlocked = Boolean(removal || (mutation && vaultMutationBlocksCard(mutation)));
 						const stats = vaultStats[repo.id] ?? { vaultSizeBytes: repo.vaultSizeBytes, vaultSizeMeasuredAt: repo.vaultSizeMeasuredAt, vaultSizeDirty: repo.vaultSizeDirty, fresh: false, running: false, pending: false, paused: false };
 						const sizePresentation = stats.vaultSizeBytes == null ? null : vaultSizePresentation(stats.vaultSizeBytes);
 						const pendingProfile = profileSync[repo.id];
@@ -4067,7 +4534,7 @@ export default function Protect() {
                         return (
 							<article key={repo.id} className="vault-row" data-vault-id={repo.id}>
 									{/* Covered controls must leave keyboard navigation while removal owns this card. */}
-									<div className="vault-identity" inert={Boolean(removal)}>
+									<div className="vault-identity" inert={cardBlocked || undefined}>
 										<div className="vault-card-head">
 										  <span className="vault-glyph"><Icon name="shield" size={18} /></span>
 									  <span className="vault-chips">
@@ -4080,24 +4547,24 @@ export default function Protect() {
 											<span className="vault-location"><span className="vault-location-text">{repositoryLocationLabel(repo)}</span></span>
 										</Tooltip>
 									{pendingProfile?.lastError && (
-									<span className="recovery-warning profile-sync-warning">Vault profile update pending: {pendingProfile.lastError} {pendingProfile.nextAttemptAt ? `· retry ${timeAgo(pendingProfile.nextAttemptAt)}` : ""} <button className="btn sm" disabled={Boolean(removal)} onClick={() => void retryProfile(repo.id)}>Retry now</button></span>
+									<span className="recovery-warning profile-sync-warning">Vault profile update pending: {pendingProfile.lastError} {pendingProfile.nextAttemptAt ? `· retry ${timeAgo(pendingProfile.nextAttemptAt)}` : ""} <button className="btn sm" disabled={cardBlocked} onClick={() => void retryProfile(repo.id)}>Retry now</button></span>
 									)}
 									{reconnectRequired && <span className="recovery-warning">Reconnect is required before this vault can run backups.</span>}
                                 </div>
-								<div className={`vault-stat vault-size-stat${statsActive ? " is-refreshing" : ""}`} inert={Boolean(removal)}>
+								<div className={`vault-stat vault-size-stat${statsActive ? " is-refreshing" : ""}`} inert={cardBlocked || undefined}>
 									<div className="vault-size-summary">{sizePresentation ? <Tooltip content={sizePresentation.tooltip}><span className="vault-size-value" aria-label={sizePresentation.display}><strong>{sizePresentation.display}</strong></span></Tooltip> : <strong>Not measured yet</strong>}<span>Vault Size</span></div>
-									<div className="vault-size-meta"><small>Size Stats Updated: {stats.vaultSizeMeasuredAt ? timeAgo(stats.vaultSizeMeasuredAt) : "Not measured yet"}.</small><Tooltip content="Replicaro periodically refreshes vault size stats. You can force a refresh immediately. Your backed up files are not changed. Forced refreshes read from the vault's destination and may take time to complete."><button className="vault-stats-refresh" aria-label="Refresh stats now" disabled={Boolean(removal)} onClick={() => refreshVaultSize(repo.id)}>Refresh stats now</button></Tooltip></div>
+									<div className="vault-size-meta"><small>Size Stats Updated: {stats.vaultSizeMeasuredAt ? timeAgo(stats.vaultSizeMeasuredAt) : "Not measured yet"}.</small><Tooltip content="Replicaro periodically refreshes vault size stats. You can force a refresh immediately. Your backed up files are not changed. Forced refreshes read from the vault's destination and may take time to complete."><button className="vault-stats-refresh" aria-label="Refresh stats now" disabled={cardBlocked} onClick={() => refreshVaultSize(repo.id)}>Refresh stats now</button></Tooltip></div>
 									{statsActive && <span className="vault-stats-refreshing">{!stats.paused && <span className="spinner" />}<span><strong>{statsStatus}</strong><span>You can safely close this page if you need to. Refreshing will resume in the background.</span></span></span>}
 									{stats.failure && <small className="recovery-warning">{stats.failure}</small>}
 								</div>
-								<div className="row-actions vault-actions" inert={Boolean(removal)}>
-									{reconnectRequired && <button className="btn sm danger" disabled={Boolean(removal)} onClick={() => void openSavedVaultReconnect(repo)}>Reconnect</button>}
-									<Link className="btn sm" to={`/restore/${repo.id}`} tabIndex={removal ? -1 : undefined} aria-disabled={Boolean(removal)} onClick={(event) => { if (removal) event.preventDefault(); }}>Browse</Link>
+								<div className="row-actions vault-actions" inert={cardBlocked || undefined}>
+									{reconnectRequired && <button className="btn sm danger" disabled={cardBlocked} onClick={() => void openSavedVaultReconnect(repo)}>Reconnect</button>}
+									<Link className="btn sm" to={`/restore/${repo.id}`} tabIndex={cardBlocked ? -1 : undefined} aria-disabled={cardBlocked} onClick={(event) => { if (cardBlocked) event.preventDefault(); }}>Browse</Link>
                                     <Tooltip content="Vault settings">
-										<button className="btn ghost-icon" aria-label={`Edit ${repo.name}`} disabled={Boolean(removal)} onClick={() => openVaultSettings(repo)}><Icon name="edit" size={14} /></button>
+										<button className="btn ghost-icon" aria-label={`Edit ${repo.name}`} disabled={cardBlocked} onClick={() => openVaultSettings(repo)}><Icon name="edit" size={14} /></button>
                                     </Tooltip>
                                     <Tooltip content="Delete vault">
-										<button className="btn ghost-icon danger-hover" aria-label={`Delete ${repo.name}`} disabled={Boolean(removal)} onClick={() => openVaultDelete(repo)}><Icon name="trash" size={14} /></button>
+										<button className="btn ghost-icon danger-hover" aria-label={`Delete ${repo.name}`} disabled={cardBlocked} onClick={() => openVaultDelete(repo)}><Icon name="trash" size={14} /></button>
                                     </Tooltip>
                                 </div>
 								{removal && <div className="vault-removal-overlay" role="status" aria-live="polite">
@@ -4108,6 +4575,7 @@ export default function Protect() {
 										<div className="vault-removal-actions"><button className="btn sm" onClick={() => setVaultRemoval((current) => { const next = { ...current }; delete next[repo.id]; return next; })}>Keep vault</button><button className="btn sm danger-outline" onClick={() => void removeVault(repo, removal.phase === "profile_error")}>{removal.phase === "profile_error" ? "Remove anyway" : "Retry removal"}</button></div>
 									</>}
 								</div>}
+								{mutation && !removal && <VaultMutationOverlay mutation={mutation} onReopenSettings={(repositoryId, generation) => { void reopenVaultSettings(repositoryId, generation); }} />}
                             </article>
                         );
                     })}
@@ -4386,6 +4854,7 @@ export default function Protect() {
 						</>}
 					</fieldset>
 					{connectPreview && <div className="modal-footer"><button className="btn" disabled={connectSaving} onClick={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>Cancel</button><button className="btn" disabled={connectSaving} onClick={resetConnectForNewAttempt}>Check another vault</button><button className="btn primary" disabled={connectSaving || connectChecking || connectRcloneNameConflict || !validVaultName(connectForm.name) || !connectProfileReady || !connectOwnerReady || Boolean(connectPreview.existingVault && connectUpdateConfirmedDigest !== connectUpdateReviewDigest) || !validObjectLockSettings(connectForm.objectLock, connectForm.maintenanceSchedule, connectPreview.mode === "profile")} onClick={() => void saveExistingVault()}>{connectSaving && <span className="spinner" />}{connectPreview.existingVault ? "Update existing vault" : "Connect vault"}</button></div>}
+					{(connectChecking || connectSaving) && vaultProgress.length > 0 && <VaultActivityLog records={vaultProgress} />}
 				</Modal>
 			)}
 
@@ -4402,6 +4871,7 @@ export default function Protect() {
 							else void checkExistingVault().then((succeeded) => { if (succeeded) setConnectRcloneAuthorizationAction(null); });
 						}}>{(connectChecking || connectSaving) && <span className="spinner" />}{connectRcloneAuthorizationAction === "retry" ? "Retry connection" : "Check existing vault"}</button>}
 					</div>
+					{(connectChecking || connectSaving) && vaultProgress.length > 0 && <VaultActivityLog records={vaultProgress} />}
 				</Modal>
 			)}
 
@@ -4434,6 +4904,7 @@ export default function Protect() {
                     </div>
 					<div className="modal-footer"><button className="btn" disabled={vaultSaving} onClick={closeVaultCreate}>Cancel</button><button className="btn primary" disabled={vaultSaving || !integration || !validVaultName(vaultForm.name) || !vaultLocation(vaultForm, true) || !validVaultPassword(vaultForm.password) || vaultForm.password !== vaultForm.passwordConfirmation || createMissingRequiredOptions.length > 0 || !validObjectLockSettings(vaultForm.objectLock, vaultForm.maintenanceSchedule)} onClick={() => { if (createUsesRcloneLogin && !createRcloneAuth && !retryCreationIntentId) setShowCreateRcloneAuthorization(true); else void saveVault(); }}>{vaultSaving && <span className="spinner" />}{vaultSaving ? "Creating…" : retryCreationIntentId ? "Retry creation" : "Create vault"}</button></div>
 					</fieldset>
+					{vaultSaving && vaultProgress.length > 0 && <VaultActivityLog records={vaultProgress} />}
                 </Modal>
             )}
 
@@ -4448,6 +4919,7 @@ export default function Protect() {
 						<button className="btn" disabled={vaultSaving} onClick={closeCreateRcloneAuthorization}>Back</button>
 						{createRcloneAuth?.status === "ready" && <button className="btn primary" disabled={vaultSaving} onClick={() => void saveVault()}>{vaultSaving && <span className="spinner" />}{vaultSaving ? "Creating…" : "Create vault"}</button>}
 					</div>
+					{vaultSaving && vaultProgress.length > 0 && <VaultActivityLog records={vaultProgress} />}
 				</Modal>
 			)}
 
@@ -4463,7 +4935,7 @@ export default function Protect() {
 				</Modal>
 			)}
 
-			{vaultSettings && (
+			{vaultSettings && !vaultOneAtATimeChoice && (
 				<Modal title={vaultSettings.name} onClose={closeVault}>
 					<div className="vault-settings-content" aria-busy={vaultWorkState !== "idle"}>
 						{vaultWorkState !== "idle" && <div className="vault-work-overlay" role="status" aria-live="polite">
@@ -4484,7 +4956,7 @@ export default function Protect() {
 						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <label className="field"><span>Integrity check</span><select value={vaultSettings.coldStorage ? "manual" : checkSchedule} disabled={vaultSettings.coldStorage || vaultOwnershipPresentation !== "owner"} onChange={(event) => setCheckSchedule(event.target.value)}>{(vaultSettings.coldStorage ? [["manual", "Disabled"]] as const : careSchedules).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small>{vaultSettings.coldStorage ? coldStorageIntegrityHelp : integrityCheckHelp}</small>{vaultOwnershipPresentation === "nonowner" && <small>Only the current vault owner can change or run integrity checks. Take over vault ownership above to enable it on this computer.</small>}<small>Last: {vaultSettings.lastCheck ? `${timeAgo(vaultSettings.lastCheck)} (${vaultSettings.lastCheckStatus})` : "never"}{vaultSettings.nextCheck ? ` · next ${timeAgo(vaultSettings.nextCheck)}` : ""}</small></label>}
 						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <label className="field"><span>Space reclamation</span><select value={maintenanceSchedule} disabled={vaultOwnershipPresentation !== "owner"} onChange={(event) => setMaintenanceSchedule(event.target.value)}>{careSchedules.map(([value, label]) => <option key={value} value={value} disabled={!objectLockScheduleEligible(objectLock, value)}>{label}</option>)}</select><small>{objectLock.enrolled ? (objectLock.paused ? pausedObjectLockMaintenanceHelp : objectLockMaintenanceHelp) : maintenanceHelp}</small>{vaultOwnershipPresentation === "nonowner" && <small>Only the current vault owner can change or run space reclamation. Take over vault ownership above to enable it on this computer.</small>}<small>Last: {vaultSettings.lastMaintenance ? `${timeAgo(vaultSettings.lastMaintenance)} (${vaultSettings.lastMaintenanceStatus})` : "never"}{vaultSettings.nextMaintenance ? ` · next ${timeAgo(vaultSettings.nextMaintenance)}` : ""}</small></label>}
 						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <div className="vault-care-actions"><div className="vault-care-action"><button className="btn" disabled={vaultSettings.coldStorage || vaultOwnershipPresentation !== "owner" || Boolean(toolBusy)} onClick={() => void runTool("check")}>{toolBusy === "check" && <span className="spinner" />}Run check now</button></div><div className="vault-care-action"><button className="btn" disabled={vaultOwnershipPresentation !== "owner" || Boolean(toolBusy)} onClick={() => void runTool("maintenance")}>{toolBusy === "maintenance" && <span className="spinner" />}Run reclamation now</button>{vaultSettings.coldStorage && toolBusy === "maintenance" && <button className="btn" onClick={cancelColdMaintenance}>Cancel reclamation</button>}</div></div>}
-						<label className="field vault-job-speed-field"><span>Job speed</span><select value={concurrencyMode} onChange={(event) => setConcurrencyMode(event.target.value as VaultForm["concurrencyMode"])}><option value="reduced">Slower</option><option value="native">Normal</option><option value="increased">Faster</option><option value="maximum">Maximum</option></select><small>Controls how quickly Replicaro finishes backup, restore, integrity check, and space reclamation jobs. Higher speed means higher CPU, memory, disk, and network use. Set higher speeds with caution.</small></label>
+						<JobSpeedField connector={vaultSettings.connector} value={concurrencyMode} onChange={(mode) => setConcurrencyMode(compatibleConcurrencyMode(vaultSettings.connector, mode))} />
 					</div>
 					<ObjectLockFields
 						form={{ ...emptyVault(vaultSettingsIntegration, vaultSettings.engine), engine: vaultSettings.engine, connector: vaultSettings.connector, maintenanceSchedule, objectLock }}
@@ -4505,30 +4977,22 @@ export default function Protect() {
 					</>}
 					<section className="advanced-panel vault-password-panel">
 						<div className="modal-section-label">Change vault password</div>
-						{vaultPasswordRecovery && <div className="recovery-warning" role="status">
-							<p><strong>Password-change recovery: {vaultPasswordRecovery.phase.replaceAll("_", " ")}</strong></p>
-							{vaultPasswordRecovery.native.status && <p>Native {vaultPasswordRecovery.native.engine} result: {vaultPasswordRecovery.native.status}{vaultPasswordRecovery.native.output ? ` — ${formatNativeLogText(vaultPasswordRecovery.native.engine, "password_change", vaultPasswordRecovery.native.output)}` : ""}</p>}
-							<p>Protected recovery metadata: {vaultPasswordRecovery.sidecarStatus}</p>
-							<p>Local cleanup: {vaultPasswordRecovery.cleanupPending ? "pending" : "not pending"}</p>
-							<p>{vaultPasswordRecovery.message}</p>
-							<button className="btn" disabled={vaultPasswordChangeBusy} onClick={() => void retryPendingVaultPasswordChange()}>{vaultPasswordChangeBusy && <span className="spinner" />}Retry password-change recovery</button>
-						</div>}
 						{vaultOwnershipPresentation === "owner" && <p className="vault-password-intro">If you are backing up other computers to this vault, you will need to reconnect those computers to the vault after a password change.</p>}
 						{vaultOwnershipPresentation === "nonowner" && <p>Only the current vault owner can change this vault password. {currentVaultOwner} is the current vault owner.</p>}
 						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <>
 							<div className="form-grid two vault-password-fields">
-								<label className="field"><span>New vault password</span><input type="password" autoComplete="new-password" disabled={vaultOwnershipPresentation !== "owner" || vaultPasswordChangeBusy || Boolean(vaultPasswordRecovery)} value={vaultPasswordForm.password} onChange={(event) => setVaultPasswordForm((current) => ({ ...current, password: event.target.value }))} /></label>
-								<label className="field"><span>Confirm new vault password</span><input type="password" autoComplete="new-password" disabled={vaultOwnershipPresentation !== "owner" || vaultPasswordChangeBusy || Boolean(vaultPasswordRecovery)} value={vaultPasswordForm.confirmation} onChange={(event) => setVaultPasswordForm((current) => ({ ...current, confirmation: event.target.value }))} /></label>
+								<label className="field"><span>New vault password</span><input type="password" autoComplete="new-password" disabled={vaultOwnershipPresentation !== "owner" || Boolean(vaultMutations[vaultSettings.id])} value={vaultPasswordForm.password} onChange={(event) => setVaultPasswordForm((current) => ({ ...current, password: event.target.value }))} /></label>
+								<label className="field"><span>Confirm new vault password</span><input type="password" autoComplete="new-password" disabled={vaultOwnershipPresentation !== "owner" || Boolean(vaultMutations[vaultSettings.id])} value={vaultPasswordForm.confirmation} onChange={(event) => setVaultPasswordForm((current) => ({ ...current, confirmation: event.target.value }))} /></label>
 							</div>
 							{vaultPasswordForm.password && vaultPasswordForm.confirmation && vaultPasswordForm.password !== vaultPasswordForm.confirmation && <small className="inline-error" role="alert">The vault passwords do not match.</small>}
-							<button className="btn" disabled={vaultOwnershipPresentation !== "owner" || vaultPasswordChangeBusy || Boolean(vaultPasswordRecovery)} onClick={() => void submitVaultPasswordChange()}>{vaultPasswordChangeBusy && <span className="spinner" />}Change vault password</button>
+							<button className="btn" disabled={vaultOwnershipPresentation !== "owner" || Boolean(vaultMutations[vaultSettings.id])} onClick={submitVaultPasswordChange}>Change vault password</button>
 						</>}
 					</section>
 					{dormantJobs.length > 0 && <section className="unowned-snapshots"><div className="modal-section-label">Dormant recovery jobs</div><p>These definitions remain protected in vault.replicaro but do not run or own snapshots locally.</p>{dormantJobs.map((item) => <div className="unowned-snapshot" key={item.jobId}><span><strong>{item.definition.name}</strong><small>{displayPath(item.definition.source)} · {scheduleLabel(item.definition.schedule)}</small><small>Before script: {item.definition.beforeScriptPath ? `${item.definition.beforeScriptPath} (${item.definition.beforeScriptMustSucceed ? "required" : "optional"})` : "none"} · After script: {item.definition.afterScriptPath ? `${item.definition.afterScriptPath} (${item.definition.afterScriptMustSucceed ? "required" : "optional"})` : "none"}</small></span><div className="tool-buttons"><button className="btn sm" disabled={Boolean(dormantBusy)} onClick={() => void changeDormant(item.repositoryId, item.jobId, "restore")}>{dormantBusy === `restore:${item.jobId}` && <span className="spinner" />}Restore disabled</button><button className="btn sm danger-outline" disabled={Boolean(dormantBusy)} onClick={() => void changeDormant(item.repositoryId, item.jobId, "discard")}>{dormantBusy === `discard:${item.jobId}` && <span className="spinner" />}Discard definition</button></div></div>)}</section>}
 					{vaultSettingsIntegration && (!usesRcloneNativeLogin(vaultSettings.connector) || (vaultSettings.engine === "restic" && vaultSettingsRcloneSupported)) && <section className="vault-connection-panel"><div className="modal-section-label">Vault connection</div><p>Use this to reconnect to the vault after disconnection for any reason.</p><button className="btn" onClick={() => requestSavedVaultReconnect(vaultSettings)}>Reconnect vault</button></section>}
 					<div className="danger-zone"><div className="modal-section-label">Danger zone</div><p>Removing this vault also removes it as a destination from matching backup jobs. Jobs with no other destination are deleted. Data saved in the vault is untouched, and you can easily add the vault again later.</p><button className="btn danger-outline" onClick={() => { const repository = vaultSettings; dismissVaultSettings(); openVaultDelete(repository); }}>Remove vault from Replicaro</button></div>
 						</div>
-						<div className="modal-footer"><button className="btn" onClick={closeVault}>Cancel</button><button className="btn primary" disabled={vaultWorkState !== "idle" || careSaving || !validObjectLockSettings(objectLock, maintenanceSchedule, true, vaultSettings.objectLock)} onClick={() => void saveCare()}>{careSaving && <span className="spinner" />}Save</button></div>
+						<div className="modal-footer"><button className="btn" onClick={closeVault}>Cancel</button><button className="btn primary" disabled={vaultWorkState !== "idle" || !validObjectLockSettings(objectLock, maintenanceSchedule, true, vaultSettings.objectLock)} onClick={saveCare}>Save</button></div>
 					</div>
                 </Modal>
             )}
@@ -4543,17 +5007,27 @@ export default function Protect() {
                 />
             )}
 
-			{(vaultSaving || connectChecking || connectSaving) && vaultProgress.length > 0 && <aside className="vault-work-log" role="log" aria-label="Vault activity">
-				<strong>Vault activity</strong>
-				<div ref={vaultProgressView} className="vault-work-log-lines">{vaultProgress.map((record, index) => <div key={index} className={record.type === "stage" ? "vault-work-stage" : "vault-work-native"}>{record.text}</div>)}</div>
-			</aside>}
+			{vaultOneAtATimeChoice && (
+				<Modal title="Pick one action" onClose={() => setVaultOneAtATimeChoice(null)}>
+					<p className="muted" style={{ marginTop: 0 }}>{vaultOneAtATimeChoice.kind === "reconnect"
+						? "You have changed vault settings and also selected to reconnect. You may only do one at a time. Pick one now and then come back to do the other."
+						: "You have changed vault settings and also selected to change the vault password. You may only do one at a time. Pick one now and then come back to do the other."}</p>
+					<div className="modal-footer">
+						<button className="btn" onClick={() => setVaultOneAtATimeChoice(null)}>Cancel</button>
+						<button className="btn" onClick={chooseSaveVaultSettings}>Save Vault Settings</button>
+						{vaultOneAtATimeChoice.kind === "reconnect"
+							? <button className="btn primary" onClick={chooseReconnect}>Go Reconnect</button>
+							: <button className="btn primary" onClick={choosePasswordChange}>Change Vault Password</button>}
+					</div>
+				</Modal>
+			)}
 
             {closePrompt && (
                 <SaveChangesDialog
                     onSave={saveChangesBeforeClose}
                     onDiscard={discardChanges}
-					onCancel={() => { setVaultReconnectAfterClose(null); setClosePrompt(null); }}
-                    busy={jobSaving || careSaving}
+                    onCancel={() => setClosePrompt(null)}
+                    busy={jobSaving}
                 />
             )}
         </div>

@@ -66,6 +66,10 @@ executable_sha256=$(shasum -a 256 "$build_root/Replicaro-$target" | awk '{print 
 printf '{"schema":"replicaro-product-provenance-v2","target":"%s","version":"%s","buildTimestamp":"%s","source":"https://github.com/replicaro/replicaro","sourceIdentity":"%s","standaloneExecutableSha256":"sha256:%s","signed":%s}\n' "$target" "$version" "$build_timestamp" "$source_identity" "$executable_sha256" "$signed_json" > "$build_root/provenance/product-provenance.json"
 printf '{"target":"%s","version":"%s","buildTimestamp":"%s","bundleIdentifier":"io.replicaro.desktop","nativeDesktop":true,"storageHelper":"embedded","storageHelperTarget":"%s","publicFormats":["dmg","app.zip"],"signed":%s,"notarized":%s,"frontend":"embedded","licenses":"Contents/Resources/LICENSES.txt"}\n' "$target" "$version" "$build_timestamp" "$target" "$signed_json" "$signed_json" > "$build_root/provenance/manifest.json"
 bash "$build_dir/sbom.sh" "$target" "$build_root/provenance/sbom.cdx.json"
+# Provenance is part of the installable app, not an adjacent build artifact.
+# Embed the complete canonical tree before packaging so ZIP and DMG carry the
+# same source/target/component evidence.
+ditto "$build_root/provenance" "$app/Contents/Resources/provenance"
 cat > "$app/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>CFBundleIdentifier</key><string>io.replicaro.desktop</string><key>CFBundleName</key><string>Replicaro</string><key>CFBundleDisplayName</key><string>Replicaro</string><key>CFBundleExecutable</key><string>Replicaro</string><key>CFBundlePackageType</key><string>APPL</string><key>CFBundleShortVersionString</key><string>$version</string><key>CFBundleVersion</key><string>$version</string><key>CFBundleIconFile</key><string>Replicaro.icns</string><key>CFBundleGetInfoString</key><string>Replicaro.com</string><key>LSMinimumSystemVersion</key><string>11.0</string><key>LSUIElement</key><true/><key>NSHighResolutionCapable</key><true/></dict></plist>
 PLIST
@@ -95,8 +99,7 @@ portable_stage="$distribution_stage/portable"
 dmg_stage="$distribution_stage/dmg"
 mkdir "$portable_stage" "$dmg_stage"
 ditto "$app" "$portable_stage/Replicaro.app"
-ditto "$app" "$dmg_stage/Replicaro.app"
-ln -s /Applications "$dmg_stage/Applications"
+bash "$build_dir/stage-macos-dmg.sh" create "$app" "$dmg_stage"
 (cd "$portable_stage" && find Replicaro.app -print | LC_ALL=C sort | TZ=UTC zip -X -y -q "$portable_archive" -@)
 create_dmg() {
   local attempt candidate status=1

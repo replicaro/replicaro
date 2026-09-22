@@ -194,6 +194,10 @@ func scanCreationIntent(scan func(...any) error) (RepositoryCreationIntent, erro
 	if !models.ValidConcurrencyMode(value.ConcurrencyMode) {
 		return value, fmt.Errorf("invalid pending creation concurrency mode")
 	}
+	value.ConcurrencyMode, err = models.NormalizeConcurrencyModeForConnector(value.Connector, value.ConcurrencyMode)
+	if err != nil {
+		return value, fmt.Errorf("invalid pending creation concurrency mode: %w", err)
+	}
 	if err := json.Unmarshal([]byte(value.ReviewedOptionsJSON), &value.ReviewedOptions); err != nil {
 		return value, fmt.Errorf("decode reviewed connector options: %w", err)
 	}
@@ -234,7 +238,7 @@ func normalizeCreation(repo models.Repository, reviewedOptions ...map[string]str
 	if maintenance == "" {
 		maintenance = "daily"
 	}
-	concurrencyMode, err := models.NormalizeConcurrencyMode(repo.ConcurrencyMode)
+	concurrencyMode, err := models.NormalizeConcurrencyModeForConnector(repo.Connector, repo.ConcurrencyMode)
 	if err != nil {
 		return normalizedCreation{}, err
 	}

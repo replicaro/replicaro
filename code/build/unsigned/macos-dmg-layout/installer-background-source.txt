@@ -1,0 +1,14 @@
+Canvas: exact 820 x 560 pixels, matching the Finder window bounds encoded in
+FinderLayout.dsstore.
+
+Finder icon targets: Replicaro.app at (180, 260) and Applications at (640,
+260). Those zones remain empty because Finder draws the real app and folder
+icons above this background. A teal left-to-right arrow occupies only the clear
+space from x=278 through x=562 around y=256. The exact instruction “Drag
+Replicaro to Applications” is centered in a quiet panel from y=356 through
+y=430, well above the bottom edge and below the icon targets.
+
+The palette is Replicaro teal (#0f9f9a), charcoal text, and warm gray. There
+are no app or folder substitutes, logos, watermarks, architecture labels, or
+other objects. render-installer-background.py is the byte-authoritative,
+host-font-independent source for installer-background.png.

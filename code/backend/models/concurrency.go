@@ -34,3 +34,20 @@ func NormalizeConcurrencyMode(value string) (string, error) {
 	}
 	return value, nil
 }
+
+// NormalizeConcurrencyModeForConnector preserves compatibility with saved or
+// recovered high-speed preferences that these native transports cannot use.
+// Validation happens first so an unknown value is never hidden by fallback.
+func NormalizeConcurrencyModeForConnector(connector, value string) (string, error) {
+	mode, err := NormalizeConcurrencyMode(value)
+	if err != nil {
+		return "", err
+	}
+	switch connector {
+	case "dropbox", "google_drive", "onedrive":
+		if mode == ConcurrencyIncreased || mode == ConcurrencyMaximum {
+			return ConcurrencyNative, nil
+		}
+	}
+	return mode, nil
+}
