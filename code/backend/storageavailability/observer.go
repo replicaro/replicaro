@@ -210,10 +210,10 @@ func SetObserverForTests(observer Observer, timeout time.Duration) func() {
 }
 
 func observe(ctx context.Context, path, objectType string) (storageidentity.HelperResponse, error) {
-	return observePath(ctx, path, objectType, false)
+	return observePath(ctx, path, objectType)
 }
 
-func observePath(ctx context.Context, path, objectType string, selectSpelling bool) (storageidentity.HelperResponse, error) {
+func observePath(ctx context.Context, path, objectType string) (storageidentity.HelperResponse, error) {
 	_, normalizeErr := storageidentity.NormalizeConfiguredPath(path)
 	if normalizeErr != nil {
 		return storageidentity.HelperResponse{}, ErrObserverUnavailable
@@ -231,7 +231,7 @@ func observePath(ctx context.Context, path, objectType string, selectSpelling bo
 	defer cancel()
 	request := storageidentity.HelperRequest{
 		Version: storageidentity.HelperVersion, Operation: "observe", Connector: "fs", Path: path,
-		ObjectType: objectType, SelectSpelling: selectSpelling,
+		ObjectType: objectType,
 	}
 	response, err := current.Observe(bounded, request)
 	if err != nil {
@@ -310,16 +310,28 @@ func bindParent(ctx context.Context, path string) (storageidentity.HelperRespons
 	defer cancel()
 	request := storageidentity.HelperRequest{
 		Version: storageidentity.HelperVersion, Operation: "bind_parent", Connector: "fs", Path: path,
-		SelectSpelling: true,
 	}
 	response, err := current.Observe(bounded, request)
-	if err != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) &&
-		bounded.Err() == nil && response.Version == storageidentity.HelperVersion &&
-		response.ErrorCode == storageidentity.HelperPermissionDeniedCode &&
-		response.Descriptor == nil && response.Key == "" && response.ConfiguredPath == "" &&
-		response.ObservedFilesystem == "" && len(response.Filesystems) == 0 {
-		return storageidentity.HelperResponse{}, &resolutionUnavailableError{
-			reason: database.AvailabilityReasonObservationFailed, permissionDenied: true,
+	if err != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
+			return storageidentity.HelperResponse{}, context.Canceled
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(bounded.Err(), context.DeadlineExceeded) {
+			return storageidentity.HelperResponse{}, context.DeadlineExceeded
+		}
+		// Only a complete, fact-free helper failure may supply a reason. Raw
+		// observer errors and contradictory response facts never leave this gate.
+		if response.Version == storageidentity.HelperVersion && response.Descriptor == nil &&
+			response.Key == "" && response.ConfiguredPath == "" &&
+			response.ObservedFilesystem == "" && len(response.Filesystems) == 0 {
+			switch response.ErrorCode {
+			case database.AvailabilityReasonStorageMissing, database.AvailabilityReasonObservationFailed:
+				return storageidentity.HelperResponse{}, &resolutionUnavailableError{reason: response.ErrorCode}
+			case storageidentity.HelperPermissionDeniedCode:
+				return storageidentity.HelperResponse{}, &resolutionUnavailableError{
+					reason: database.AvailabilityReasonObservationFailed, permissionDenied: true,
+				}
+			}
 		}
 	}
 	if err != nil || response.Version != storageidentity.HelperVersion || response.Descriptor == nil || response.Key == "" {
@@ -603,7 +615,7 @@ func resolveFilesystemBinding(ctx context.Context, path string, creation bool) (
 	if creation {
 		response, err = bindParent(ctx, path)
 	} else {
-		response, err = observePath(ctx, path, "directory", true)
+		response, err = observePath(ctx, path, "directory")
 	}
 	if err != nil {
 		return Binding{}, err
@@ -620,12 +632,10 @@ func resolveFilesystemBinding(ctx context.Context, path string, creation bool) (
 	if err != nil {
 		return Binding{}, ErrObserverUnavailable
 	}
-	configured := response.ConfiguredPath
-	if configured == "" {
-		configured = path
-	}
 	binding := Binding{
-		ConfiguredPath: configured,
+		// The descriptor describes the validated route, but its physical key
+		// is never an operational pathname or a source of spelling changes.
+		ConfiguredPath: path,
 		Version:        storageidentity.DescriptorVersion, Key: response.Key,
 		DescriptorJSON: string(descriptorJSON),
 	}
@@ -702,9 +712,9 @@ func BindJobSource(ctx context.Context, job models.BackupJob) (models.BackupJob,
 	if err != nil {
 		return models.BackupJob{}, err
 	}
-	// Select filesystem spelling only before binding. Once saved, this path is
-	// also native source scope (notably Kopia SourceInfo); availability must not
-	// rewrite it just because the filesystem now reports a different spelling.
+	// Keep the entered spelling after lexical validation. Once saved, this path
+	// is also native source scope (notably Kopia SourceInfo); physical identity
+	// facts and later availability checks must not rewrite that scope.
 	binding, err := ResolveFilesystemBinding(ctx, configured)
 	if err != nil {
 		return models.BackupJob{}, err

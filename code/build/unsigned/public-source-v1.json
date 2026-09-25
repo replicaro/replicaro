@@ -2,6 +2,10 @@
   "schema": "replicaro-public-source-v1",
   "files": [
     {
+      "path": ".github/workflows/locale-pr.yml",
+      "mode": "100644"
+    },
+    {
       "path": "LICENSE",
       "mode": "100644"
     },
@@ -800,6 +804,22 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/locale/locale.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/locale/system_darwin.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/locale/system_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/locale/system_windows.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/main.go",
       "mode": "100644"
     },
@@ -1341,11 +1361,123 @@
       "mode": "100644"
     },
     {
+      "path": "code/frontend/public/locales/ar.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/bn.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/de.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/el.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/en.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/es.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/fa.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/fr.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/ga.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/he.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/hi.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/id.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/it.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/ja.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/ko.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/ms.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/nl.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/pcm.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/pl.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/pt-BR.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/pt-PT.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/ru.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/tr.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/ur.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/vi.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/yue-Hant.json",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/public/locales/zh-Hans.json",
+      "mode": "100644"
+    },
+    {
       "path": "code/frontend/public/replicaro-wordmark-teal.png",
       "mode": "100644"
     },
     {
       "path": "code/frontend/public/replicaro-wordmark-white.png",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/scripts/validate-locales.mjs",
       "mode": "100644"
     },
     {
@@ -1382,6 +1514,10 @@
     },
     {
       "path": "code/frontend/src/components/ui.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/i18n.ts",
       "mode": "100644"
     },
     {

@@ -1,6 +1,6 @@
 {
   "schema": "replicaro-unsigned-build-inputs-v1",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "toolchains": {
     "go": "1.26.7",
     "node": "24.19.0",

@@ -740,7 +740,7 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 	closeCancelGate()
 	var dispatchNotification func()
 	if persistedStatus != "interrupted" {
-		dispatchNotification = prepareOperationNotification(db, operationID, "restore", fmt.Sprintf("Restore %d selected items", len(req.Items)), status)
+		dispatchNotification = prepareOperationNotification(db, operationID, "restore", fmt.Sprintf("Restore %d selected items", len(req.Items)), status, len(req.Items))
 	}
 	if finishErr := finishOperationDurably(db, operationID, persistedStatus, operationOutput, time.Now()); finishErr != nil {
 		writeError(w, http.StatusInternalServerError, finishErr)

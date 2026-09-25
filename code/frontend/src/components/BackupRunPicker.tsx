@@ -1,3 +1,4 @@
+import { t } from "../i18n";
 import { Icon } from "./ui";
 import { backupTargetIsActive } from "../services/backupJobs";
 import type { BackupJob } from "../types";
@@ -21,8 +22,8 @@ export function BackupRunPicker({
                     onClick={() => onRun()}
                 >
                     <span>
-                        <strong>Run all</strong>
-                        <span className="faint">Request all {job.targets.length} destinations; every admitted, unavailable, or busy result will be reported</span>
+                        <strong>{t("ui.components.backuprunpicker.run.all")}</strong>
+                        <span className="faint">{t("ui.backupRunPicker.requestAllHelp", { count: job.targets.length })}</span>
                     </span>
                     {busy === "all" ? <span className="spinner" /> : <Icon name="play" size={14} />}
                 </button>
@@ -39,10 +40,10 @@ export function BackupRunPicker({
                     >
                         <span>
                             <strong>{target.repositoryName} <span className="connector-chip">{target.engine}</span></strong>
-                            <span className="faint">{active ? target.lastStatus : "Back up to this destination vault"}</span>
-                            {target.sourceAvailability === "unavailable" && <span className="faint">Source unavailable</span>}
-                            {target.targetAvailability === "unavailable" && <span className="faint">Vault unavailable</span>}
-                            {target.pendingCatchUp && <span className="faint">Scheduled catch-up pending · {target.coalescedMissedCount} coalesced miss{target.coalescedMissedCount === 1 ? "" : "es"}</span>}
+                            <span className="faint">{active ? target.lastStatus : t("ui.components.backuprunpicker.back.up.to.this.destination.vault")}</span>
+                            {target.sourceAvailability === "unavailable" && <span className="faint">{t("ui.components.backuprunpicker.source.unavailable")}</span>}
+                            {target.targetAvailability === "unavailable" && <span className="faint">{t("ui.components.backuprunpicker.vault.unavailable")}</span>}
+                            {target.pendingCatchUp && <span className="faint">{t("ui.backupRunPicker.catchUpPending", { count: target.coalescedMissedCount })}</span>}
                         </span>
                         {busy === target.repositoryId ? <span className="spinner" /> : <Icon name="play" size={14} />}
                     </button>

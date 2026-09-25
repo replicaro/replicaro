@@ -16,6 +16,7 @@ import (
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/jobscript"
+	"github.com/local/replicaro/locale"
 	"github.com/local/replicaro/metadata"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/notifications"
@@ -1307,6 +1308,8 @@ func prepareBackupNotification(task *targetTask, status string) func() {
 		Event: "backup", Status: status, Success: success,
 		NativeBackupSucceeded: nativeBackupSucceeded,
 		Title:                 title, OperationID: task.operationID,
+		TaskKey: "notifications.task.backupTarget", TaskName: task.job.Name, TaskTarget: task.target.RepositoryName,
+		Locale: locale.Effective(settings.Language),
 	}
 	if !notifications.ShouldNotify(event) {
 		return nil

@@ -855,8 +855,11 @@ export const getSettings = () => request<Settings>("/api/settings");
 
 export const getSupportReport = (signal?: AbortSignal) => request<SupportReport>("/api/support/report", { signal, cache: "no-store" });
 
-export const saveSettings = (settings: Settings) =>
-    post("/api/settings", settings);
+export const saveSettings = (settings: Settings) => {
+    const writable = { ...settings };
+    delete writable.effectiveLocale;
+    return post("/api/settings", writable);
+};
 
 export const getAppUpdateStatus = () => request<AppUpdateStatus>("/api/app-update/status");
 

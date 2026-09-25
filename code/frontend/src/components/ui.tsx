@@ -1,3 +1,4 @@
+import { formatDisplayDateTime, getEffectiveLocale, t } from "../i18n";
 import {
     cloneElement,
     createContext,
@@ -239,13 +240,13 @@ export function Tooltip({
 export function StatusBadge({ status }: { status: string }) {
     switch (status) {
         case "running":
-            return <span className="badge info running">Running</span>;
+            return <span className="badge info running">{t("ui.components.ui.running")}</span>;
         case "success":
-            return <span className="badge ok">Healthy</span>;
+            return <span className="badge ok">{t("ui.components.ui.healthy")}</span>;
         case "failed":
-            return <span className="badge danger">Failed</span>;
+            return <span className="badge danger">{t("ui.components.ui.failed")}</span>;
         default:
-            return <span className="badge muted">Never run</span>;
+            return <span className="badge muted">{t("ui.components.ui.never.run")}</span>;
     }
 }
 
@@ -326,8 +327,8 @@ export function Modal({
 				{topAction && <div className="modal-top-action">{topAction}</div>}
                 <div className="row spread" style={{ marginBottom: 4 }}>
                     <h3 style={{ margin: 0 }}>{title}</h3>
-                    <button className="modal-close" onClick={onClose} aria-label="Close">
-                        Close <Icon name="x" size={13} />
+                    <button className="modal-close" onClick={onClose} aria-label={t("ui.components.ui.close")}>
+                        {t("ui.components.ui.close")} <Icon name="x" size={13} />
                     </button>
                 </div>
                 <div style={{ marginTop: 12 }}>{children}</div>
@@ -362,8 +363,7 @@ export function ConfirmDialog({
             </p>
             <div className="modal-footer">
                 <button className="btn" onClick={cancel} disabled={busy}>
-                    Cancel
-                </button>
+                    {t("ui.components.ui.cancel")}</button>
                 <button
                     className="btn danger"
                     onClick={onConfirm}
@@ -389,20 +389,17 @@ export function SaveChangesDialog({
     busy?: boolean;
 }) {
     return (
-        <Modal title="Save changes?" onClose={onCancel}>
+        <Modal title={t("ui.components.ui.save.changes")} onClose={onCancel}>
             <p className="muted" style={{ marginTop: 0 }}>
-                You have unsaved changes. Would you like to save them before closing?
-            </p>
+                {t("ui.components.ui.you.have.unsaved.changes.would.you.like.to.save.them.before.closing")}</p>
             <div className="modal-footer">
                 <button className="btn" onClick={onCancel} disabled={busy}>
-                    Cancel
-                </button>
+                    {t("ui.components.ui.cancel")}</button>
                 <button className="btn" onClick={onDiscard} disabled={busy}>
-                    Discard changes
-                </button>
+                    {t("ui.components.ui.discard.changes")}</button>
                 <button className="btn primary" onClick={onSave} disabled={busy}>
                     {busy && <span className="spinner" />}
-                    Save changes
+                    {t("ui.components.ui.saveChangesButton")}
                 </button>
             </div>
         </Modal>
@@ -452,7 +449,7 @@ export function ToastProvider({ children }: { children: ReactNode }) {
 					<div key={toast.id} className={`toast ${toast.kind}`} role={toast.kind === "error" ? "alert" : "status"}>
 						<span className="toast-icon"><Icon name={toast.kind === "error" ? "xCircle" : "checkCircle"} size={18} /></span>
 						<span className="toast-message">{toast.message}</span>
-						<button type="button" className="toast-dismiss" aria-label="Dismiss notification" onClick={() => setToasts((current) => current.filter((item) => item.id !== toast.id))}><Icon name="x" size={16} /></button>
+						<button type="button" className="toast-dismiss" aria-label={t("ui.components.ui.dismiss.notification")} onClick={() => setToasts((current) => current.filter((item) => item.id !== toast.id))}><Icon name="x" size={16} /></button>
                     </div>
                 ))}
             </div>
@@ -484,7 +481,7 @@ export function EmptyState({
     );
 }
 
-export function Loading({ label = "Loading" }: { label?: string }) {
+export function Loading({ label = t("ui.loading") }: { label?: string }) {
     return (
         <div className="row muted loading" style={{ padding: "18px 4px" }} aria-live="polite">
             <span className="spinner" />
@@ -522,14 +519,14 @@ export function timeAgo(value: string): string {
 
     let text: string;
 
-    if (s < 60) text = "just now";
-    else if (s < 3600) text = `${Math.floor(s / 60)}m`;
-    else if (s < 86400) text = `${Math.floor(s / 3600)}h`;
-    else text = `${Math.floor(s / 86400)}d`;
+    if (s < 60) text = t("ui.time.justNow");
+    else if (s < 3600) text = t("ui.time.minutesShort", { count: Math.floor(s / 60) });
+    else if (s < 86400) text = t("ui.time.hoursShort", { count: Math.floor(s / 3600) });
+    else text = t("ui.time.daysShort", { count: Math.floor(s / 86400) });
 
-    if (text === "just now") return future ? "in under a minute" : text;
+    if (s < 60) return future ? t("ui.time.inUnderMinute") : text;
 
-    return future ? `in ${text}` : `${text} ago`;
+    return future ? t("ui.time.in", { time: text }) : t("ui.time.ago", { time: text });
 }
 
 export function formatTime(value: string): string {
@@ -537,7 +534,7 @@ export function formatTime(value: string): string {
 
     if (!date) return "—";
 
-    return date.toLocaleString(undefined, {
+    return formatDisplayDateTime(date, {
         year: "numeric",
         month: "short",
         day: "numeric",
@@ -554,38 +551,41 @@ export function duration(start: string, end: string): string {
 
     const seconds = Math.max(0, Math.round((b.getTime() - a.getTime()) / 1000));
 
-    if (seconds < 60) return `${seconds}s`;
+    const number = new Intl.NumberFormat(getEffectiveLocale());
+    if (seconds < 60) return t("ui.duration.seconds", { count: number.format(seconds) });
     if (seconds < 3600)
-        return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+        return t("ui.duration.minutesSeconds", { minutes: number.format(Math.floor(seconds / 60)), seconds: number.format(seconds % 60) });
 
-    return `${Math.floor(seconds / 3600)}h ${Math.floor((seconds % 3600) / 60)}m`;
+    return t("ui.duration.hoursMinutes", { hours: number.format(Math.floor(seconds / 3600)), minutes: number.format(Math.floor((seconds % 3600) / 60)) });
 }
 
 export function scheduleLabel(schedule: string): string {
     switch (schedule) {
         case "manual":
         case "":
-            return "Manual";
+            return t("ui.schedule.manual");
         case "hourly":
-            return "Every hour";
+            return t("ui.schedule.everyHour");
         case "daily":
-            return "Daily";
+            return t("ui.care.daily");
         case "weekly":
-            return "Weekly";
+            return t("ui.care.weekly");
         case "monthly":
-            return "Monthly";
+            return t("ui.care.monthly");
     }
 
 	if (schedule.startsWith("every-months:")) {
-		return `Every ${schedule.slice(13)} months`;
+		const count = schedule.slice(13);
+		// Only the label changes; the saved schedule string stays exact.
+		return t("ui.schedule.everyMonths", { count: /^\d+$/.test(count) && Number.isSafeInteger(Number(count)) && Number(count) > 0 ? Number(count) : count });
 	}
 
     if (schedule.startsWith("every:")) {
         const minutes = schedule.slice(6);
-        return `Every ${minutes} min`;
+        return t("ui.schedule.everyMinutesShort", { count: /^\d+$/.test(minutes) && Number.isSafeInteger(Number(minutes)) && Number(minutes) > 0 ? Number(minutes) : minutes });
     }
 	if (schedule.startsWith("cron:")) {
-		return `Cron: ${schedule.slice(5)}`;
+		return t("ui.schedule.cronExpression", { expression: schedule.slice(5) });
 	}
 
     return schedule;

@@ -1,3 +1,4 @@
+import { formatDisplayDate, formatDisplayNumber, getEffectiveLocale, renderMessage, t } from "../i18n";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
@@ -30,7 +31,7 @@ import type { MetadataIndexState } from "../types";
 const PAGE_SIZE = 6;
 const PAGE_SIZE_OPTIONS = [PAGE_SIZE, 9, 18, 36] as const;
 const PAGE_SIZE_STORAGE_KEY = "replicaro.restore.snapshots.pageSize";
-const SNAPSHOT_HISTORY_TOOLTIP = "Replicaro periodically refreshes snapshot metadata for this vault. You can force a refresh immediately. Your backed up files are not changed. Forced refreshes read from the vault's destination and may take time to complete.";
+const SNAPSHOT_HISTORY_TOOLTIP = () => t("ui.snapshotHistory.refreshHelp");
 
 type SnapshotRoot = NonNullable<Snapshot["sourceRoots"]>[number];
 type RestoreChoice = { kind: "snapshot"; repositoryId: string; snapshot: Snapshot; path: string; nativeRootId?: string };
@@ -58,30 +59,30 @@ function dateKey(value: string | Date) {
 
 function friendlyDate(value: string) {
     const date = parseTime(value);
-    if (!date) return "Unknown";
+    if (!date) return t("ui.date.unknown");
     const today = new Date();
     const current = new Date(today.getFullYear(), today.getMonth(), today.getDate()).getTime();
     const then = new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
     const days = Math.round((current - then) / 86400000);
-    if (days === 0) return "Today";
-    if (days === 1) return "Yesterday";
-    if (days > 1 && days < 7) return date.toLocaleDateString(undefined, { weekday: "long" });
-    return date.toLocaleDateString(undefined, { month: "long", day: "numeric" });
+    if (days === 0) return t("ui.date.today");
+    if (days === 1) return t("ui.date.yesterday");
+    if (days > 1 && days < 7) return formatDisplayDate(date, { weekday: "long" });
+    return formatDisplayDate(date, { month: "long", day: "numeric" });
 }
 
 function fullDate(value: string) {
     const date = parseTime(value);
-    return date?.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) ?? "—";
+    return date ? formatDisplayDate(date, { month: "short", day: "numeric", year: "numeric" }) : "—";
 }
 
 function snapshotTime(value: string) {
     const date = parseTime(value);
-    return date?.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit", hour12: false }) ?? "—";
+    return date?.toLocaleTimeString(getEffectiveLocale(), { hour: "2-digit", minute: "2-digit", hour12: false }) ?? "—";
 }
 
 function snapshotMeta(snapshot: Snapshot) {
 	const sources = snapshotSourceLabel(snapshot);
-    return `Taken ${fullDate(snapshot.timestamp)} at ${snapshotTime(snapshot.timestamp)} · ${snapshot.size || "size unknown"} · ${sources}`;
+    return t("ui.restore.snapshotMeta", { date: fullDate(snapshot.timestamp), time: snapshotTime(snapshot.timestamp), size: snapshot.size || t("ui.restore.sizeUnknown"), sources });
 }
 
 function snapshotSourceLabel(snapshot: Snapshot) {
@@ -276,7 +277,7 @@ function RestoreRoute() {
 						setMetadataPaused(Boolean(status.paused));
 						setMetadataStage(status.stage);
 						setCompleteHeaderListing(status.completeHeaderListing);
-						if (status.index.repositoryFailed) setError("Backup data could not be refreshed. Existing backup data is still available.");
+						if (status.index.repositoryFailed) setError(t("ui.restore.refreshFailedExistingAvailable"));
 						else setError("");
 						if (action === "force") {
 							const succeeded = !status.index.repositoryFailed && status.index.complete;
@@ -337,7 +338,7 @@ function RestoreRoute() {
 			cached = await refreshRestoreSnapshots(repositoryID, controller.signal);
 			if (!current()) return;
 			commitSnapshots(repositoryID, cached);
-			if (status.index.repositoryFailed) setError("Backup data could not be refreshed. Existing backup data is still available.");
+			if (status.index.repositoryFailed) setError(t("ui.restore.refreshFailedExistingAvailable"));
 			else setError("");
 			if (action === "force") {
 				const succeeded = !status.index.repositoryFailed && status.index.complete;
@@ -414,7 +415,7 @@ function RestoreRoute() {
     const displayedSnapshots = snapshotsFor === selected ? snapshots : null;
 	const selectedRepository = repos?.find((repository) => repository.id === selected);
 	const selectedEngineLabel = selectedRepository?.engine === "kopia" ? "Kopia" : selectedRepository?.engine === "restic" ? "Restic" : "native";
-	const unmanagedSnapshotsTooltip = `Replicaro does not currently manage these ${selectedEngineLabel} snapshots. They may have been created outside Replicaro or belong to a job Replicaro no longer recognizes. You can browse, restore, and manually delete them, but Replicaro does not apply retention policies to them.`;
+	const unmanagedSnapshotsTooltip = t("ui.restore.unmanagedSnapshotsHelp", { engine: selectedEngineLabel });
     const vaultBusy = error.trim().replace(/\s+/g, " ").toLowerCase() === "vault is busy with another operation";
     const availableDays = useMemo(() => new Set((displayedSnapshots ?? []).map((snapshot) => dateKey(snapshot.timestamp))), [displayedSnapshots]);
 	const dateFiltered = (displayedSnapshots ?? []).filter((snapshot) => !dateFilter || dateKey(snapshot.timestamp) === dateFilter);
@@ -537,7 +538,7 @@ function RestoreRoute() {
         // submit a different destination from the one reviewed in the dialog.
         const targetPath = restoreTarget;
         if (!targetPath) {
-            toast("error", "Choose a restore destination.");
+            toast("error", t("ui.restore.chooseDestination"));
             return;
         }
 		const payload = {
@@ -716,21 +717,21 @@ function RestoreRoute() {
     return (
         <div className="page restore-page">
             <header className="page-header simple">
-                <h1 className="page-title">Restore</h1>
-                <p className="page-desc">Find the snapshot you need, then browse or restore it.</p>
+                <h1 className="page-title">{t("ui.pages.restore.restore")}</h1>
+                <p className="page-desc">{t("ui.pages.restore.find.the.snapshot.you.need.then.browse.or.restore.it")}</p>
             </header>
 
-            {repos === null && <div className="inline-notice" role="status"><span className="spinner" /> Loading vaults…</div>}
+            {repos === null && <div className="inline-notice" role="status"><span className="spinner" /> {t("ui.pages.restore.loading.vaults")}</div>}
             {repos !== null && repos.length === 0 && (
-                <EmptyState icon="camera" title="No vaults yet">
-                    <p><Link to="/protect">Add a vault</Link> before browsing snapshots.</p>
+                <EmptyState icon="camera" title={t("ui.pages.restore.no.vaults.yet")}>
+                    <p>{renderMessage("ui.restore.addVaultBeforeBrowsing", { link: <Link to="/protect">{t("ui.pages.restore.add.a.vault")}</Link> })}</p>
                 </EmptyState>
             )}
 
             {(repos?.length ?? 0) > 0 && (
                 <>
                     <div className="restore-controls">
-                        <div className="vault-tabs" role="tablist" aria-label="Vaults">
+                        <div className="vault-tabs" role="tablist" aria-label={t("ui.pages.restore.vaults")}>
                             {(repos ?? []).map((repo) => (
                                 <button key={repo.id} role="tab" aria-selected={selected === repo.id} className={selected === repo.id ? "active" : ""} onClick={() => chooseVault(repo.id)}>{repo.name}</button>
                             ))}
@@ -739,25 +740,25 @@ function RestoreRoute() {
                             <span className="control-divider" />
 	                            <button className={`btn date-filter${dateFilter ? " active" : ""}`} onClick={() => setCalendarOpen((open) => !open)}>
                                 <Icon name="calendar" size={13} />
-                                {selectedDate ? selectedDate.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "Filter by date"}
+                                {selectedDate ? formatDisplayDate(selectedDate, { month: "short", day: "numeric", year: "numeric" }) : t("ui.restore.filterByDate")}
                             </button>
-	                            {dateFilter && <button className="text-button clear-filter" onClick={clearDate}>Clear ✕</button>}
-							<Tooltip content={SNAPSHOT_HISTORY_TOOLTIP}><button className="btn" aria-label="Refresh snapshot history" disabled={forcingMetadata} onClick={forceRefresh}>
-								{forcingMetadata && <span className="spinner" />}Refresh snapshot history
+	                            {dateFilter && <button className="text-button clear-filter" onClick={clearDate}>{t("ui.pages.restore.clear")}</button>}
+							<Tooltip content={SNAPSHOT_HISTORY_TOOLTIP()}><button className="btn" aria-label={t("ui.pages.restore.refresh.snapshot.history")} disabled={forcingMetadata} onClick={forceRefresh}>
+								{forcingMetadata && <span className="spinner" />}{t("ui.pages.restore.refresh.snapshot.history")}
 							</button></Tooltip>
 	                        </>}
                     </div>
 
-                    {!selected && <EmptyState icon="vault" title="Choose a vault"><p>Select a vault above to browse its snapshots.</p></EmptyState>}
+                    {!selected && <EmptyState icon="vault" title={t("ui.pages.restore.choose.a.vault")}><p>{t("ui.pages.restore.select.a.vault.above.to.browse.its.snapshots")}</p></EmptyState>}
 
                     {selected && calendarOpen && (
                         <div className="calendar-popover">
                             <div className="calendar-header">
-                                <button onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() - 1, 1))} aria-label="Previous month">←</button>
-                                <strong>{calendarMonth.toLocaleDateString(undefined, { month: "long", year: "numeric" })}</strong>
-                                <button onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + 1, 1))} aria-label="Next month">→</button>
+                                <button onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() - 1, 1))} aria-label={t("ui.pages.restore.previous.month")}>←</button>
+                                <strong>{formatDisplayDate(calendarMonth, { month: "long", year: "numeric" })}</strong>
+                                <button onClick={() => setCalendarMonth(new Date(calendarMonth.getFullYear(), calendarMonth.getMonth() + 1, 1))} aria-label={t("ui.pages.restore.next.month")}>→</button>
                             </div>
-                            <div className="calendar-weekdays">{["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"].map((day) => <span key={day}>{day}</span>)}</div>
+							<div className="calendar-weekdays">{[1, 2, 3, 4, 5, 6, 0].map((day) => <span key={day}>{formatDisplayDate(new Date(2024, 0, 7 + day), { weekday: "short" })}</span>)}</div>
                             <div className="calendar-grid">
                                 {calendarCells.map((day, index) => {
                                     if (day === null) return <span key={`empty-${index}`} />;
@@ -766,32 +767,32 @@ function RestoreRoute() {
                                     const isSelected = key === dateFilter;
                                     return (
                                         <button key={key} disabled={!hasSnapshot} className={isSelected ? "selected" : ""} onClick={() => pickDate(day)}>
-                                            {day}{hasSnapshot && <span />}
+                                            {formatDisplayNumber(day)}{hasSnapshot && <span />}
                                         </button>
                                     );
                                 })}
                             </div>
-                            <div className="calendar-legend"><span />days with snapshots</div>
+                            <div className="calendar-legend"><span />{t("ui.restore.daysWithSnapshots")}</div>
                         </div>
                     )}
 
 			                    {selected && <>
-			                        {displayedSnapshots === null && <div className="inline-notice" role="status"><span className="spinner" /> Preparing backup data…</div>}
+			                        {displayedSnapshots === null && <div className="inline-notice" role="status"><span className="spinner" /> {t("ui.pages.restore.preparing.backup.data")}</div>}
 							{displayedSnapshots !== null && <MetadataIndexNotice active={metadataBusy} paused={metadataPaused} stage={metadataStage} completeHeaderListing={completeHeaderListing} state={metadataState} />}
-							{metadataState?.repositoryFailed && <div className="inline-notice" role="status">Backup data could not be refreshed. Existing backup data is still available. <Tooltip content={SNAPSHOT_HISTORY_TOOLTIP}><button className="btn" aria-label="Refresh snapshot history" disabled={forcingMetadata} onClick={forceRefresh}>Refresh snapshot history</button></Tooltip></div>}
-							{metadataState?.headerValid && (metadataState.failedSnapshots ?? 0) > 0 && <div className="inline-notice" role="status">Some backup contents could not be indexed. <button className="btn" disabled={metadataBusy} onClick={retryEntries}>Retry</button></div>}
+							{metadataState?.repositoryFailed && <div className="inline-notice" role="status">{t("ui.restore.refreshFailedExistingAvailable")} <Tooltip content={SNAPSHOT_HISTORY_TOOLTIP()}><button className="btn" aria-label={t("ui.pages.restore.refresh.snapshot.history")} disabled={forcingMetadata} onClick={forceRefresh}>{t("ui.pages.restore.refresh.snapshot.history")}</button></Tooltip></div>}
+							{metadataState?.headerValid && (metadataState.failedSnapshots ?? 0) > 0 && <div className="inline-notice" role="status">{t("ui.restore.contentsNotIndexed")} <button className="btn" disabled={metadataBusy} onClick={retryEntries}>{t("ui.pages.restore.retry")}</button></div>}
 	                        {displayedSnapshots !== null && displayedSnapshots.length > 0 && error && (
 	                            <div className="inline-notice" role="status">{error}</div>
 	                        )}
 	                        {displayedSnapshots !== null && displayedSnapshots.length === 0 && (
-                            <EmptyState icon="camera" title={vaultBusy ? "Try again in a minute or two" : "No snapshots here"}>
+                            <EmptyState icon="camera" title={vaultBusy ? t("ui.restore.tryAgainLater") : t("ui.restore.noSnapshotsHere")}>
                                 <p>{vaultBusy
-                                    ? "Vault is busy with another operation and currently cannot view your snapshots (do not worry, your data is still there)"
-                                    : error || "Run a backup job to create the first point in time."}</p>
+                                    ? t("ui.pages.restore.vault.is.busy.with.another.operation.and.currently.cannot")
+                                    : error || t("ui.pages.restore.run.a.backup.job.to.create.the.first.point")}</p>
                             </EmptyState>
                         )}
                         {displayedSnapshots !== null && displayedSnapshots.length > 0 && dateFiltered.length === 0 && (
-                            <EmptyState icon="calendar" title="No snapshots on this date"><button className="btn" onClick={clearDate}>Clear date filter</button></EmptyState>
+                            <EmptyState icon="calendar" title={t("ui.pages.restore.no.snapshots.on.this.date")}><button className="btn" onClick={clearDate}>{t("ui.pages.restore.clear.date.filter")}</button></EmptyState>
                         )}
 
                         {displayedSnapshots !== null && <div className="snapshot-groups">
@@ -800,28 +801,28 @@ function RestoreRoute() {
                                     <header><strong>{friendlyDate(group.snapshot.timestamp)}</strong><span>{fullDate(group.snapshot.timestamp)}</span></header>
                                     <div>
                                         <div className="snapshot-table-header">
-											<span>Computer</span>
-                                            <span>Time</span>
-                                            <span>Source</span>
-                                            <span>Size</span>
+											<span>{t("ui.pages.restore.computer")}</span>
+                                            <span>{t("ui.pages.restore.time")}</span>
+                                            <span>{t("ui.pages.restore.source")}</span>
+                                            <span>{t("ui.pages.restore.size")}</span>
                                             <span className="snapshot-header-spacer" />
                                         </div>
                                         {group.items.map((snapshot) => (
 											<article key={snapshot.id} className="snapshot-row" data-snapshot-id={snapshot.id}>
-												<span className="snapshot-machine" title={snapshot.machineLabel || undefined}>{snapshot.machineLabel || "Unknown"}</span>
+												<span className="snapshot-machine" title={snapshot.machineLabel || undefined}>{snapshot.machineLabel || t("ui.restore.unknownComputer")}</span>
                                                 <time>{snapshotTime(snapshot.timestamp)}</time>
 												<span className="snapshot-source">{snapshotSourceLabel(snapshot)}</span>
                                                 <span className="snapshot-size">{snapshot.size || "—"}</span>
 											<span className="snapshot-actions">{snapshotRoots(snapshot).map((root) => snapshot.nativeRootType === "f"
-                                                        ? <Tooltip key={root.nativeRootId} content="This snapshot does not support browse; it only supports restore."><button className="btn sm snapshot-browse-unavailable" aria-label="Browse" aria-disabled="true">Browse</button></Tooltip>
-                                                        : <button key={root.nativeRootId} className="btn sm" disabled={!readySnapshotIDs.has(snapshot.id)} onClick={() => openBrowse(snapshot, root)}>Browse{snapshotRoots(snapshot).length > 1 ? ` ${snapshotRootLabel(root)}` : ""}</button>)}<button className="btn sm restore-button" onClick={() => openRestore(snapshot)}>Restore</button><Tooltip content="Delete snapshot"><button className="btn ghost-icon danger-hover" aria-label="Delete" onClick={() => openDelete(snapshot)}><Icon name="trash" size={15} /></button></Tooltip></span>
+                                                        ? <Tooltip key={root.nativeRootId} content={t("ui.pages.restore.this.snapshot.does.not.support.browse.it.only.supports.restore")}><button className="btn sm snapshot-browse-unavailable" aria-label={t("ui.pages.restore.browse")} aria-disabled="true">{t("ui.pages.restore.browse")}</button></Tooltip>
+                                                        : <button key={root.nativeRootId} className="btn sm" disabled={!readySnapshotIDs.has(snapshot.id)} onClick={() => openBrowse(snapshot, root)}>{t("ui.pages.restore.browse")}{snapshotRoots(snapshot).length > 1 ? ` ${snapshotRootLabel(root)}` : ""}</button>)}<button className="btn sm restore-button" onClick={() => openRestore(snapshot)}>{t("ui.pages.restore.restore")}</button><Tooltip content={t("ui.pages.restore.delete.snapshot")}><button className="btn ghost-icon danger-hover" aria-label={t("ui.pages.restore.delete")} onClick={() => openDelete(snapshot)}><Icon name="trash" size={15} /></button></Tooltip></span>
                                             </article>
                                         ))}
                                     </div>
                                 </section>
 							</div>))}
 							{managedSnapshots.length > 0 && <PaginationControls
-								label="managed snapshots"
+								label={t("ui.pages.restore.managed.snapshots")}
 								total={managedSnapshots.length}
 								defaultPageSize={PAGE_SIZE}
 								page={safeManagedPage}
@@ -832,46 +833,46 @@ function RestoreRoute() {
 							/>}
 							{unmanagedSnapshots.length > 0 && <section className="restore-unmanaged-section" aria-labelledby="restore-unmanaged-heading">
 								<div className="find-presentation-heading" id="restore-unmanaged-heading">
-									<h2>Snapshots not managed by Replicaro</h2>
-									<Tooltip content={unmanagedSnapshotsTooltip}><button type="button" className="icon-btn" aria-label="About snapshots not managed by Replicaro"><Icon name="info" size={16} /></button></Tooltip>
+									<h2>{t("ui.pages.restore.snapshots.not.managed.by.replicaro")}</h2>
+									<Tooltip content={unmanagedSnapshotsTooltip}><button type="button" className="icon-btn" aria-label={t("ui.pages.restore.about.snapshots.not.managed.by.replicaro")}><Icon name="info" size={16} /></button></Tooltip>
 								</div>
 								{unmanagedGroups.map((group) => (<div key={`${group.key}-${safeUnmanagedPage}`}>
 									<section className="snapshot-day">
 										<header><strong>{friendlyDate(group.snapshot.timestamp)}</strong><span>{fullDate(group.snapshot.timestamp)}</span></header>
 										<div>
-											<div className="snapshot-table-header"><span>Computer</span><span>Time</span><span>Source</span><span>Size</span><span className="snapshot-header-spacer" /></div>
+											<div className="snapshot-table-header"><span>{t("ui.pages.restore.computer")}</span><span>{t("ui.pages.restore.time")}</span><span>{t("ui.pages.restore.source")}</span><span>{t("ui.pages.restore.size")}</span><span className="snapshot-header-spacer" /></div>
 											{group.items.map((snapshot) => <article key={snapshot.id} className="snapshot-row" data-snapshot-id={snapshot.id}>
-												<span className="snapshot-machine" title={snapshot.machineLabel || undefined}>{snapshot.machineLabel || "Unknown"}</span><time>{snapshotTime(snapshot.timestamp)}</time><span className="snapshot-source">{snapshotSourceLabel(snapshot)}</span><span className="snapshot-size">{snapshot.size || "—"}</span>
+												<span className="snapshot-machine" title={snapshot.machineLabel || undefined}>{snapshot.machineLabel || t("ui.restore.unknownComputer")}</span><time>{snapshotTime(snapshot.timestamp)}</time><span className="snapshot-source">{snapshotSourceLabel(snapshot)}</span><span className="snapshot-size">{snapshot.size || "—"}</span>
 												<span className="snapshot-actions">{snapshotRoots(snapshot).map((root) => snapshot.nativeRootType === "f"
-                                                        ? <Tooltip key={root.nativeRootId} content="This snapshot does not support browse; it only supports restore."><button className="btn sm snapshot-browse-unavailable" aria-label="Browse" aria-disabled="true">Browse</button></Tooltip>
-                                                        : <button key={root.nativeRootId} className="btn sm" disabled={!readySnapshotIDs.has(snapshot.id)} onClick={() => openBrowse(snapshot, root)}>Browse{snapshotRoots(snapshot).length > 1 ? ` ${snapshotRootLabel(root)}` : ""}</button>)}<button className="btn sm restore-button" onClick={() => openRestore(snapshot)}>Restore</button><Tooltip content="Delete snapshot"><button className="btn ghost-icon danger-hover" aria-label="Delete" onClick={() => openDelete(snapshot)}><Icon name="trash" size={15} /></button></Tooltip></span>
+                                                        ? <Tooltip key={root.nativeRootId} content={t("ui.pages.restore.this.snapshot.does.not.support.browse.it.only.supports.restore")}><button className="btn sm snapshot-browse-unavailable" aria-label={t("ui.pages.restore.browse")} aria-disabled="true">{t("ui.pages.restore.browse")}</button></Tooltip>
+                                                        : <button key={root.nativeRootId} className="btn sm" disabled={!readySnapshotIDs.has(snapshot.id)} onClick={() => openBrowse(snapshot, root)}>{t("ui.pages.restore.browse")}{snapshotRoots(snapshot).length > 1 ? ` ${snapshotRootLabel(root)}` : ""}</button>)}<button className="btn sm restore-button" onClick={() => openRestore(snapshot)}>{t("ui.pages.restore.restore")}</button><Tooltip content={t("ui.pages.restore.delete.snapshot")}><button className="btn ghost-icon danger-hover" aria-label={t("ui.pages.restore.delete")} onClick={() => openDelete(snapshot)}><Icon name="trash" size={15} /></button></Tooltip></span>
 											</article>)}
 										</div>
 									</section>
 								</div>))}
-								<PaginationControls label="snapshots not managed by Replicaro" total={unmanagedSnapshots.length} defaultPageSize={PAGE_SIZE} page={safeUnmanagedPage} pageSize={pageSize} pageSizeOptions={PAGE_SIZE_OPTIONS} onPage={setUnmanagedPage} onPageSize={changePageSize} />
+								<PaginationControls label={t("ui.pages.restore.snapshots.not.managed.by.replicaro.2")} total={unmanagedSnapshots.length} defaultPageSize={PAGE_SIZE} page={safeUnmanagedPage} pageSize={pageSize} pageSizeOptions={PAGE_SIZE_OPTIONS} onPage={setUnmanagedPage} onPageSize={changePageSize} />
 							</section>}
                         </div>}
                     </>}
                 </>
             )}
-			{deleting && <Modal title="Delete snapshot" onClose={dismissDelete}>
-				<p>Delete this snapshot from the vault? Deletion cannot be undone.</p>
-				<p>Physical space is reclaimed only by later vault maintenance.</p>
-				<div className="modal-footer"><button className="btn" disabled={deleteBusy} onClick={dismissDelete}>Cancel</button><button className="btn danger" disabled={deleteBusy} onClick={() => void confirmDelete()}>{deleteBusy && <span className="spinner" />}Delete</button></div>
+			{deleting && <Modal title={t("ui.pages.restore.delete.snapshot")} onClose={dismissDelete}>
+				<p>{t("ui.pages.restore.delete.this.snapshot.from.the.vault.deletion.cannot.be.undone")}</p>
+				<p>{t("ui.pages.restore.physical.space.is.reclaimed.only.by.later.vault.maintenance")}</p>
+				<div className="modal-footer"><button className="btn" disabled={deleteBusy} onClick={dismissDelete}>{t("ui.pages.restore.cancel")}</button><button className="btn danger" disabled={deleteBusy} onClick={() => void confirmDelete()}>{deleteBusy && <span className="spinner" />}{t("ui.pages.restore.delete")}</button></div>
 			</Modal>}
 
             {browsing && (
-                <Modal title="Snapshot" wide onClose={closeBrowse}>
+                <Modal title={t("ui.pages.restore.snapshot")} wide onClose={closeBrowse}>
 					<div className="snapshot-modal-meta mono">{snapshotMeta(browsing.snapshot)} · {browsing.snapshot.id.slice(0, 12)}</div>
                     <div className="browse-crumbs">
 						<button onClick={() => openBrowse(browsing.snapshot, browsing.root, "")}>{displayPath(browsing.root.path) || "/"}</button>
 						{crumbs.map((crumb, index) => <span key={`${crumb}-${index}`}>{associatedWindowsBreadcrumb && index === 0 ? "" : browseSeparator}<button onClick={() => openBrowse(browsing.snapshot, browsing.root, crumbs.slice(0, index + 1).join("/"))}>{associatedWindowsBreadcrumb && index === 0 ? `${crumb}:` : crumb}</button></span>)}
                     </div>
                     <div className="file-list">
-						{browsePath && <button className="file-up" onClick={() => openBrowse(browsing.snapshot, browsing.root, crumbs.slice(0, -1).join("/"))}><Icon name="arrowUp" size={16} /><span>Up one directory</span></button>}
+						{browsePath && <button className="file-up" onClick={() => openBrowse(browsing.snapshot, browsing.root, crumbs.slice(0, -1).join("/"))}><Icon name="arrowUp" size={16} /><span>{t("ui.pages.restore.up.one.directory")}</span></button>}
                         {entries === null && <Loading />}
-                        {entries !== null && entries.length === 0 && <p className="muted file-empty">This directory is empty.</p>}
+                        {entries !== null && entries.length === 0 && <p className="muted file-empty">{t("ui.pages.restore.this.directory.is.empty")}</p>}
                         {(entries ?? []).map((entry) => {
                             const childPath = browsePath ? `${browsePath}/${entry.name}` : entry.name;
 							const nativePath = repos?.find((repo) => repo.id === selected)?.engine === "restic" ? resticNativeAddress(browsing.root.path, childPath) : childPath;
@@ -883,35 +884,35 @@ function RestoreRoute() {
                                     <Icon name={entry.isDir ? "folder" : "file"} size={15} />
 								{entry.isDir ? <button onClick={() => openBrowse(browsing.snapshot, browsing.root, childPath)}>{displayName}</button> : <span>{displayName}</span>}
 								{!entry.isDir && <span>{entry.size}</span>}
-								{!entry.isDir && <button className="restore-file" onClick={() => { openRestore(browsing.snapshot, childPath, browsing.root.nativeRootId); closeBrowse(); }}>Restore file</button>}
+								{!entry.isDir && <button className="restore-file" onClick={() => { openRestore(browsing.snapshot, childPath, browsing.root.nativeRootId); closeBrowse(); }}>{t("ui.pages.restore.restore.file")}</button>}
                                 </div>
                             );
                         })}
                     </div>
                     <div className="modal-footer browse-footer">
-                        <span className="mono">{entries?.length ?? 0} items{browseRaw ? " · listing loaded" : ""}</span>
-						<button className="btn primary" onClick={() => { openRestore(browsing.snapshot); closeBrowse(); }}>Restore entire snapshot</button>
+                        <span className="mono">{browseRaw ? t("ui.restore.itemCountListingLoaded", { count: entries?.length ?? 0 }) : t("ui.restore.itemCount", { count: entries?.length ?? 0 })}</span>
+						<button className="btn primary" onClick={() => { openRestore(browsing.snapshot); closeBrowse(); }}>{t("ui.pages.restore.restore.entire.snapshot")}</button>
                     </div>
                 </Modal>
             )}
 
             {restoring && (
-                <Modal title="Restore snapshot" onClose={dismissRestore}>
+                <Modal title={t("ui.pages.restore.restore.snapshot")} onClose={dismissRestore}>
 					<fieldset className="modal-workflow-fields" disabled={restoreBusy}>
                     <><div className="snapshot-modal-id">{restoring.snapshot.id.slice(0, 12)}</div><div className="snapshot-modal-meta mono">{snapshotMeta(restoring.snapshot)}</div></>
-                    <div className="modal-section-label">Restore to</div>
+                    <div className="modal-section-label">{t("ui.pages.restore.restore.to")}</div>
 					<label className="field">
-						<span>{restoringFileRoot ? "Destination file" : "Destination folder"}</span>
+						<span>{restoringFileRoot ? t("ui.pages.restore.destination.file") : t("ui.pages.restore.destination.folder")}</span>
 						{restoringFileRoot
-							? <input value={restoreTarget} onChange={(event) => setRestoreTarget(event.target.value)} aria-label="Destination file" />
-							: <DirectoryField value={restoreTarget} onChange={setRestoreTarget} ariaLabel="Destination folder" />}
-						{restoringFileRoot && <small>Enter the full destination path, including the filename.</small>}
+							? <input value={restoreTarget} onChange={(event) => setRestoreTarget(event.target.value)} aria-label={t("ui.pages.restore.destination.file")} />
+							: <DirectoryField value={restoreTarget} onChange={setRestoreTarget} ariaLabel={t("ui.pages.restore.destination.folder")} />}
+						{restoringFileRoot && <small>{t("ui.pages.restore.enter.the.full.destination.path.including.the.filename")}</small>}
                     </label>
                     {(restoreCapability(repos?.find((repo) => repo.id === restoring.repositoryId), engines)?.conflictModes.length ?? 0) > 1 &&
-						<label className="field restore-conflict-field"><span>Should existing files in destination be overwritten?</span><select value={conflictMode} onChange={(event) => setConflictMode(event.target.value)}>{restoreCapability(repos?.find((repo) => repo.id === restoring.repositoryId), engines)?.conflictModes.map((mode) => <option key={mode.id} value={mode.id}>{restoreConflictModeLabel(mode)}</option>)}</select></label>}
-					{restoreBusy && repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage && <p className="recovery-warning">Cold storage retrieval can take hours or days. Replicaro is waiting for native Restic. Cancellation or shutdown stops the local process, but provider restore requests may continue.</p>}
+						<label className="field restore-conflict-field"><span>{t("ui.pages.restore.should.existing.files.in.destination.be.overwritten")}</span><select value={conflictMode} onChange={(event) => setConflictMode(event.target.value)}>{restoreCapability(repos?.find((repo) => repo.id === restoring.repositoryId), engines)?.conflictModes.map((mode) => <option key={mode.id} value={mode.id}>{restoreConflictModeLabel(mode)}</option>)}</select></label>}
+					{restoreBusy && repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage && <p className="recovery-warning">{t("ui.pages.restore.cold.storage.retrieval.can.take.hours.or.days.replicaro.is.waiting.for")}</p>}
 					</fieldset>
-					<div className="modal-footer"><button className="btn" disabled={restoreBusy && !repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage} onClick={restoreBusy && repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage ? cancelColdRestore : dismissRestore}>{restoreBusy && repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage ? "Cancel restore" : "Cancel"}</button><button className="btn primary" disabled={restoreBusy || !restoreTarget} onClick={() => void doRestore()}>{restoreBusy && <span className="spinner" />}<Icon name="restore" size={14} />Restore</button></div>
+					<div className="modal-footer"><button className="btn" disabled={restoreBusy && !repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage} onClick={restoreBusy && repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage ? cancelColdRestore : dismissRestore}>{restoreBusy && repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage ? t("ui.pages.restore.cancel.restore") : t("ui.pages.restore.cancel")}</button><button className="btn primary" disabled={restoreBusy || !restoreTarget} onClick={() => void doRestore()}>{restoreBusy && <span className="spinner" />}<Icon name="restore" size={14} />{t("ui.pages.restore.restore")}</button></div>
                 </Modal>
             )}
         </div>

@@ -1,3 +1,4 @@
+import { t } from "../i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 
 import { browseDirectories } from "../services/api";
@@ -8,7 +9,7 @@ export function DirectoryField({
     value,
     onChange,
     placeholder,
-	buttonLabel = "Browse",
+	buttonLabel = t("ui.pages.protect.browse"),
 	ariaLabel,
 	disabled = false,
 	readOnly = false,
@@ -114,7 +115,7 @@ function DirectoryPicker({
 	};
 
     return (
-        <Modal title="Choose a folder" onClose={close} wide>
+        <Modal title={t("ui.components.directorypicker.choose.a.folder")} onClose={close} wide>
             <div className="directory-input" style={{ marginBottom: 12 }}>
                 <input
                     className="mono"
@@ -127,8 +128,7 @@ function DirectoryPicker({
                     autoFocus
                 />
                 <button type="button" className="btn" onClick={() => void load(path)}>
-                    Go
-                </button>
+                    {t("ui.components.directorypicker.go")}</button>
             </div>
 
             {error && <div className="inline-error">{error}</div>}
@@ -151,7 +151,7 @@ function DirectoryPicker({
                     <div className="directory-list">
                         {listing.parent && (
                             <button type="button" className="directory-up" onClick={() => void load(listing.parent)}>
-                                <Icon name="arrowUp" size={16} /> <span>Up one level</span>
+                                <Icon name="arrowUp" size={16} /> <span>{t("ui.components.directorypicker.up.one.level")}</span>
                             </button>
                         )}
                         {listing.directories.map((directory) => (
@@ -164,13 +164,12 @@ function DirectoryPicker({
                             </button>
                         ))}
                         {listing.directories.length === 0 && !listing.parent && (
-                            <p className="muted">No subfolders.</p>
+                            <p className="muted">{t("ui.components.directorypicker.no.subfolders")}</p>
                         )}
                     </div>
                     <div className="modal-footer">
                         <button type="button" className="btn" onClick={close}>
-                            Cancel
-                        </button>
+                            {t("ui.components.directorypicker.cancel")}</button>
                         <button
                             type="button"
                             className="btn primary"
@@ -179,8 +178,7 @@ function DirectoryPicker({
 								onSelect(listing.current);
 							}}
                         >
-                            Select this folder
-                        </button>
+                            {t("ui.components.directorypicker.select.this.folder")}</button>
                     </div>
                 </>
             )}

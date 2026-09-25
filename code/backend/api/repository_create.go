@@ -323,6 +323,7 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		AutoUnlock: true, ConnectorOptions: options,
 	})
 	if err != nil {
+		markSupportStorageObservation(w, "vault_create_destination", err)
 		badRequest(w, err.Error())
 		return
 	}

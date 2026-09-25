@@ -1,4 +1,6 @@
 import { BrowserRouter, Navigate, Route, Routes, useParams } from "react-router-dom";
+import { useSyncExternalStore } from "react";
+import { getEffectiveLocale, subscribeLocale } from "./i18n";
 
 import MainLayout from "./layouts/MainLayout";
 import { ToastProvider } from "./components/ui";
@@ -20,6 +22,9 @@ function LegacyFileHistoryRedirect() {
 }
 
 export default function App() {
+    // Re-render mounted UI when a saved preference selects another bundled
+    // catalog. The native operation data rendered by pages stays untouched.
+    useSyncExternalStore(subscribeLocale, getEffectiveLocale);
     return (
         <ToastProvider>
             <BrowserRouter>

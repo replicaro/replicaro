@@ -13,6 +13,7 @@ import (
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/kopiapolicy"
+	"github.com/local/replicaro/locale"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/notifications"
 	"github.com/local/replicaro/operationlog"
@@ -717,6 +718,7 @@ func prepareRepositoryTaskNotification(
 	if !notifications.ShouldNotify(event) || !nativeEnabled && !webhookEnabled {
 		return nil
 	}
+	event.Locale = locale.Effective(settings.Language)
 	if err := database.StartOperationStep(db, operationID, "application", "notification", time.Now()); err != nil {
 		_ = database.LogError(db, "Notification step could not be registered: "+err.Error())
 		return nil

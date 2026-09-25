@@ -1452,6 +1452,7 @@ func handleExistingVaultRetry(db *sql.DB, auth *rcloneAuthStore) http.HandlerFun
 			Connector: storage.Connector, Location: storage.Location, ConnectorOptions: storage.Options,
 		})
 		if err != nil {
+			markSupportStorageObservation(w, "vault_connect_destination", err)
 			writeError(w, http.StatusConflict, fmt.Errorf("pending connection storage is unavailable"))
 			return
 		}
@@ -2393,6 +2394,7 @@ func handleExistingVaultReview(db *sql.DB, auth *rcloneAuthStore, refine bool) h
 			Connector: normalized.Connector, Location: normalized.Location, ConnectorOptions: normalized.Options,
 		})
 		if err != nil {
+			markSupportStorageObservation(w, "vault_connect_destination", err)
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -2405,6 +2407,9 @@ func handleExistingVaultReview(db *sql.DB, auth *rcloneAuthStore, refine bool) h
 			}
 			preview, err := refineExistingVaultProfile(ctx, normalized, *request.Baseline)
 			if err != nil {
+				// A refined review can fail its second storage bind after the
+				// initial check succeeded; retain only its fixed observation fact.
+				markSupportStorageObservation(w, "vault_connect_destination", err)
 				writeError(w, http.StatusConflict, err)
 				return
 			}
@@ -2415,6 +2420,7 @@ func handleExistingVaultReview(db *sql.DB, auth *rcloneAuthStore, refine bool) h
 		discoveryInput.DiscoverIdentityOnly = true
 		discovery, _, err := previewExistingVault(ctx, discoveryInput)
 		if err != nil {
+			markSupportStorageObservation(w, "vault_connect_destination", err)
 			writeError(w, http.StatusBadRequest, err)
 			return
 		}
@@ -2428,6 +2434,7 @@ func handleExistingVaultReview(db *sql.DB, auth *rcloneAuthStore, refine bool) h
 		reportVaultProgress(r.Context(), "Verifying vault identity and recovery profiles under the vault lock...")
 		lockedPreview, lockedRepository, lockedErr := previewExistingVault(ctx, normalized)
 		if lockedErr != nil {
+			markSupportStorageObservation(w, "vault_connect_destination", lockedErr)
 			writeError(w, http.StatusBadRequest, lockedErr)
 			return
 		}
@@ -2533,6 +2540,7 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 			Connector: req.Connector, Location: req.Location, ConnectorOptions: req.Options,
 		})
 		if identityErr != nil {
+			markSupportStorageObservation(w, "vault_connect_destination", identityErr)
 			badRequest(w, identityErr.Error())
 			return
 		}
@@ -2643,6 +2651,9 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 		}
 		lockedPreview, lockedRepo, lockedReviewErr := reviewExistingVaultForConnection(ctx, reviewStorage)
 		if lockedReviewErr != nil {
+			// Final review can rebind storage after the earlier admission succeeded.
+			// Preserve its observation fact before returning the existing error.
+			markSupportStorageObservation(w, "vault_connect_destination", lockedReviewErr)
 			writeError(w, http.StatusBadRequest, lockedReviewErr)
 			return
 		}
@@ -3468,6 +3479,9 @@ func resumeRepositoryConnection(
 	repo.StorageIdentityJSON = payload.StorageIdentityJSON
 	_, err := bindExistingRepositoryStorage(r.Context(), repo)
 	if err != nil || repo.ID != intent.CanonicalIdentity {
+		// A retry can lose storage between its first bind and this locked bind.
+		// The public mismatch response stays fixed; only the typed fact is exported.
+		markSupportStorageObservation(w, "vault_connect_destination", err)
 		writeError(w, http.StatusConflict, fmt.Errorf("pending connection does not match the reviewed vault selection"))
 		return
 	}

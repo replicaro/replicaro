@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -197,8 +198,9 @@ func (s Store) WithRepositoryAvailabilityCheck(
 }
 
 type remoteConfig struct {
-	root string
-	env  []string
+	root      string
+	cryptRoot string
+	env       []string
 }
 
 // BaseRemoteConfiguration exposes only the already-established canonical
@@ -412,7 +414,7 @@ func (s Store) session(ctx context.Context) (session *storeSession, err error) {
 	}
 	baseEnv = append(baseEnv,
 		"RCLONE_CONFIG_CRYPT_TYPE=crypt",
-		"RCLONE_CONFIG_CRYPT_REMOTE="+strings.TrimSuffix(remote.root, "/")+"/replicaro",
+		"RCLONE_CONFIG_CRYPT_REMOTE="+strings.TrimSuffix(remote.cryptRoot, "/")+"/replicaro",
 		"RCLONE_CONFIG_CRYPT_FILENAME_ENCRYPTION=off",
 		"RCLONE_CONFIG_CRYPT_DIRECTORY_NAME_ENCRYPTION=false",
 		"RCLONE_CONFIG_CRYPT_SUFFIX=none",
@@ -1610,12 +1612,22 @@ func translateRemote(repo models.Repository) (remoteConfig, error) {
 	}
 	env := []string{}
 	root := ""
+	cryptRoot := ""
 	switch repo.Connector {
 	case "fs":
 		env = append(env, "RCLONE_CONFIG_BASE_TYPE=local")
 		// filepath.ToSlash is a native conversion: on POSIX a literal
 		// backslash is part of the filename and must not be rewritten.
-		root = "base:" + filepath.ToSlash(filepath.Clean(effective.Location))
+		localPath := filepath.ToSlash(filepath.Clean(effective.Location))
+		root = "base:" + localPath
+		if runtime.GOOS == "windows" && strings.HasPrefix(effective.Location, `\\`) &&
+			(!strings.HasPrefix(effective.Location, `\\?\`) || strings.HasPrefix(strings.ToUpper(effective.Location), `\\?\UNC\`)) {
+			// rclone's named-local path join collapses leading UNC separators when
+			// crypt copies a pending object to its canonical name. A direct local
+			// path preserves them; keep the base remote for independent size/list
+			// operations and let rclone own crypt transport and config bytes.
+			cryptRoot = localPath
+		}
 	case "s3":
 		archiveWriteClass, coldErr := models.NormalizeColdStorage(repo.Engine, repo.Connector, repo.ColdStorage, repo.ArchiveWriteClass)
 		if coldErr != nil {
@@ -1740,7 +1752,10 @@ func translateRemote(repo models.Repository) (remoteConfig, error) {
 	default:
 		return remoteConfig{}, fmt.Errorf("unsupported connector-to-rclone translation: %s", repo.Connector)
 	}
-	return remoteConfig{root: strings.TrimSuffix(root, "/"), env: env}, nil
+	if cryptRoot == "" {
+		cryptRoot = root
+	}
+	return remoteConfig{root: strings.TrimSuffix(root, "/"), cryptRoot: strings.TrimSuffix(cryptRoot, "/"), env: env}, nil
 }
 
 func remotePath(parts ...string) string {

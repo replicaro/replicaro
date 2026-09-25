@@ -1,11 +1,23 @@
 package models
 
 const (
-	ThemeSystem  = "system"
-	ThemeLight   = "light"
-	ThemeNeutral = "neutral"
-	ThemeDark    = "dark"
+	LanguageSystem  = "system"
+	LanguageEnglish = "en"
+	ThemeSystem     = "system"
+	ThemeLight      = "light"
+	ThemeNeutral    = "neutral"
+	ThemeDark       = "dark"
 )
+
+func ValidLanguage(value string) bool {
+	switch value {
+	case LanguageSystem, LanguageEnglish, "de", "fr", "ar", "ur", "hi", "es", "it", "zh-Hans", "yue-Hant",
+		"ja", "ga", "ko", "ms", "id", "tr", "he", "pt-PT", "pt-BR", "ru", "pl", "nl", "bn", "el", "fa", "vi", "pcm":
+		return true
+	default:
+		return false
+	}
+}
 
 func ValidTheme(value string) bool {
 	return value == ThemeSystem || value == ThemeLight || value == ThemeNeutral || value == ThemeDark
@@ -16,6 +28,8 @@ type Settings struct {
 	AutoStart                    bool   `json:"autoStart"`
 	LogRetentionDays             int    `json:"logRetentionDays"`
 	Theme                        string `json:"theme"`
+	Language                     string `json:"language"`
+	EffectiveLocale              string `json:"effectiveLocale"`
 	WebhookURL                   string `json:"webhookUrl"`
 	NotifyWindowsOnSuccess       bool   `json:"notifyWindowsOnSuccess"`
 	NotifyWindowsOnFailure       bool   `json:"notifyWindowsOnFailure"`

@@ -14,6 +14,7 @@ func RecentActivity(db *sql.DB) ([]models.ActivityEntry, error) {
 	return queryActivity(db, `
 		SELECT id, timestamp, level, message
 		FROM activity_log
+		WHERE level IS NULL OR level <> 'SUPPORT'
 		ORDER BY id DESC
 		LIMIT 10`)
 }
@@ -23,6 +24,7 @@ func ListActivity(db *sql.DB) ([]models.ActivityEntry, error) {
 	return queryActivity(db, `
 		SELECT id, timestamp, level, message
 		FROM activity_log
+		WHERE level IS NULL OR level <> 'SUPPORT'
 		ORDER BY id DESC`)
 }
 
@@ -74,6 +76,17 @@ func LogError(
 		formatSortableTimestamp(time.Now()), message,
 	)
 
+	return err
+}
+
+// LogSupport retains bounded diagnostics for export without presenting them as
+// ordinary activity or dashboard issues. The failure response remains the
+// operation's user-visible result.
+func LogSupport(db *sql.DB, message string) error {
+	_, err := db.Exec(
+		`INSERT INTO activity_log (timestamp, level, message) VALUES (?, 'SUPPORT', ?)`,
+		formatSortableTimestamp(time.Now()), message,
+	)
 	return err
 }
 

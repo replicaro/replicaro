@@ -1,3 +1,4 @@
+import { formatDisplayDateTime, renderMessage, t } from "../i18n";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode } from "react";
 import { createPortal } from "react-dom";
@@ -50,7 +51,7 @@ type ReviewedRestore = {
 const emptyPageState = (): PageState => ({ hasMore: false, nextOffset: 0, loading: false, revision: 0 });
 const browseRootKey = "\u0000browse-root";
 const allVaultsValue = "__all_vaults__";
-const SNAPSHOT_HISTORY_TOOLTIP = "Replicaro periodically refreshes snapshot metadata for this vault. You can force a refresh immediately. Your backed up files are not changed. Forced refreshes read from the vault's destination and may take time to complete.";
+const SNAPSHOT_HISTORY_TOOLTIP = () => t("ui.snapshotHistory.refreshHelp");
 
 function resultKey(result: FileSearchResult) {
 	return JSON.stringify([result.source, result.path]);
@@ -86,9 +87,9 @@ function selectionConflict(results: FileSearchResult[]) {
 		const leftPath = canonicalSelectionPath(results[left]);
 		for (let right = left + 1; right < results.length; right++) {
 			const rightPath = canonicalSelectionPath(results[right]);
-			if (leftPath === rightPath) return "Selected items contain the same restore path from multiple sources. Remove one before restoring.";
+			if (leftPath === rightPath) return t("ui.findFile.sameRestorePathConflict");
 			if (leftPath.startsWith(`${rightPath}/`) || rightPath.startsWith(`${leftPath}/`)) {
-				return "Selected items contain both a folder and an item inside it. Remove one before restoring.";
+				return t("ui.findFile.nestedRestorePathConflict");
 			}
 		}
 	}
@@ -256,17 +257,17 @@ function SelectionCheckbox({
 
 function formatDate(value: string) {
     const date = parseTime(value);
-    return date?.toLocaleString(undefined, {
+    return date ? formatDisplayDateTime(date, {
         month: "short",
         day: "numeric",
         year: "numeric",
         hour: "2-digit",
         minute: "2-digit",
-    }) ?? "Unknown date";
+    }) : t("ui.date.unknownDate");
 }
 
 function sourceLabel(result: FileSearchResult) {
-	return nativeRootLabel(result.source || "Unknown source");
+	return nativeRootLabel(result.source || t("ui.findFile.unknownSource"));
 }
 
 function presentVersions(history: FileVersion[] | undefined) {
@@ -311,7 +312,7 @@ function sharedSnapshotMachineLabel(snapshotId: string, results: FileSearchResul
 }
 
 function versionTypeLabel(version: FileVersion | undefined, fallbackIsDir: boolean) {
-	return (version?.isDir ?? fallbackIsDir) ? "Folder" : "File";
+	return (version?.isDir ?? fallbackIsDir) ? t("ui.findFile.folderType") : t("ui.findFile.fileType");
 }
 
 function isMetadataRevisionError(reason: unknown) {
@@ -368,7 +369,7 @@ function FindFilePage({ repoId }: { repoId: string }) {
 	const submitSearch = () => {
 		const nextQuery = query.trim();
 		if (nextQuery.length < 2) {
-			toast("error", "Enter at least two characters to search.");
+			toast("error", t("ui.findFile.enterSearchTerm"));
 			return;
 		}
 		setSearchCommand((current) => ({ sequence: (current?.sequence ?? 0) + 1, query: nextQuery }));
@@ -381,9 +382,9 @@ function FindFilePage({ repoId }: { repoId: string }) {
 		});
 	}, []);
 
-	const vaultSelect = repos ? <select aria-label="Vault" value={selected} onChange={(event) => chooseVault(event.target.value)}>
-		<option value="">Choose a vault</option>
-		<option value={allVaultsValue}>All Vaults</option>
+	const vaultSelect = repos ? <select aria-label={t("ui.pages.findfile.vault")} value={selected} onChange={(event) => chooseVault(event.target.value)}>
+		<option value="">{t("ui.pages.findfile.choose.a.vault")}</option>
+		<option value={allVaultsValue}>{t("ui.pages.findfile.all.vaults")}</option>
 		{repos.map((repo) => <option key={repo.id} value={repo.id}>{repo.name}</option>)}
 	</select> : null;
 	const selectedStatus = selected && selected !== allVaultsValue ? vaultStatuses[selected] : undefined;
@@ -394,21 +395,21 @@ function FindFilePage({ repoId }: { repoId: string }) {
 	return (
 		<div className="page find-file-page">
 			<header className="page-header simple">
-				<h1 className="page-title">File History</h1>
-				<p className="page-desc">View file and folder history across a whole vault, then restore selected versions.</p>
+				<h1 className="page-title">{t("ui.pages.findfile.file.history")}</h1>
+				<p className="page-desc">{t("ui.pages.findfile.view.file.and.folder.history.across.a.whole.vault.then.restore.selecte")}</p>
 			</header>
 
 			{repos === null ? (
-				<div className="inline-notice" role="status"><span className="spinner" /> Loading vaults…</div>
+				<div className="inline-notice" role="status"><span className="spinner" /> {t("ui.pages.findfile.loading.vaults")}</div>
 			) : repos.length === 0 ? (
-				<EmptyState icon="vault" title="No vaults yet"><p><a href="/protect">Add a vault</a> before searching backup history.</p></EmptyState>
+				<EmptyState icon="vault" title={t("ui.pages.findfile.no.vaults.yet")}><p>{renderMessage("ui.fileHistory.addVaultBeforeSearch", { link: <a href="/protect">{t("ui.pages.findfile.add.a.vault")}</a> })}</p></EmptyState>
 			) : (
 				<>
 					<section className="find-history-section find-search-section" aria-labelledby="search-vault-heading">
-						<div className="section-heading find-search-heading"><div><h2 id="search-vault-heading">Search vault</h2></div></div>
+						<div className="section-heading find-search-heading"><div><h2 id="search-vault-heading">{t("ui.pages.findfile.search.vault")}</h2></div></div>
 						<div className="find-file-toolbar">
-							<div className="field find-vault"><span>Vault</span>{vaultSelect}{selected && selected !== allVaultsValue && <Tooltip content={SNAPSHOT_HISTORY_TOOLTIP}><button className="metadata-force-link" aria-label="Refresh snapshot history" disabled={selectedStatus?.forcingMetadata} onClick={() => setForceRefreshSequence((value) => value + 1)}>{selectedStatus?.forcingMetadata && <span className="spinner" />}Refresh snapshot history</button></Tooltip>}</div>
-							<label className="field find-search"><span>File or folder name</span><div className="find-search-input"><input ref={searchInput} value={query} placeholder={selected ? "Search by name or path" : "Select a vault to search by name or path"} disabled={searchDisabled} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") submitSearch(); }} /><button className="btn primary" onClick={submitSearch} disabled={searchDisabled || searchBusy}>{searchBusy ? <span className="spinner" /> : <Icon name="history" size={14} />}Search</button></div><small>Use * for any characters or ? for one character.</small></label>
+							<div className="field find-vault"><span>{t("ui.pages.findfile.vault")}</span>{vaultSelect}{selected && selected !== allVaultsValue && <Tooltip content={SNAPSHOT_HISTORY_TOOLTIP()}><button className="metadata-force-link" aria-label={t("ui.pages.findfile.refresh.snapshot.history")} disabled={selectedStatus?.forcingMetadata} onClick={() => setForceRefreshSequence((value) => value + 1)}>{selectedStatus?.forcingMetadata && <span className="spinner" />}{t("ui.pages.findfile.refresh.snapshot.history")}</button></Tooltip>}</div>
+							<label className="field find-search"><span>{t("ui.pages.findfile.file.or.folder.name")}</span><div className="find-search-input"><input ref={searchInput} value={query} placeholder={selected ? t("ui.fileHistory.searchPlaceholder") : t("ui.fileHistory.selectVaultPlaceholder")} disabled={searchDisabled} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === "Enter") submitSearch(); }} /><button className="btn primary" onClick={submitSearch} disabled={searchDisabled || searchBusy}>{searchBusy ? <span className="spinner" /> : <Icon name="history" size={14} />}{t("ui.pages.findfile.search")}</button></div><small>{t("ui.pages.findfile.use.for.any.characters.or.for.one.character")}</small></label>
 						</div>
 						{error && <div className="inline-error">{error}</div>}
 						{selected && selected !== allVaultsValue && <div className="find-single-vault-search-target" ref={setSingleSearchTarget} />}
@@ -438,8 +439,8 @@ function FindFilePage({ repoId }: { repoId: string }) {
 						onFocusSearch={() => searchInput.current?.focus()}
 						onStatusChange={reportVaultStatus}
 					/> : !selected ? <section className="find-history-section find-browse-section" aria-labelledby="browse-vault-heading">
-						<div className="section-heading"><div><h2 id="browse-vault-heading">Browse vault</h2></div></div>
-						<EmptyState icon="history" title="Choose a vault"><p>Select a vault above to browse file and folder history.</p></EmptyState>
+						<div className="section-heading"><div><h2 id="browse-vault-heading">{t("ui.pages.findfile.browse.vault")}</h2></div></div>
+						<EmptyState icon="history" title={t("ui.pages.findfile.choose.a.vault")}><p>{t("ui.pages.findfile.select.a.vault.above.to.browse.file.and.folder.history")}</p></EmptyState>
 					</section> : null}
 				</>
 			)}
@@ -735,7 +736,7 @@ function VaultFileHistory({
 		.filter((candidate) => (selectedVersion(candidate)?.isDir ?? candidate.isDir) && isSelectionDescendant(result, candidate))
 		.sort((left, right) => canonicalSelectionPath(right).length - canonicalSelectionPath(left).length)[0];
 	const parentSelectionMessage = (result: FileSearchResult) => selectedFolderAncestor(result)
-		? `This ${result.isDir ? "folder" : "file"} will be restored along with the parent folder that you selected`
+		? result.isDir ? t("ui.findFile.childFolderRestoredWithParent") : t("ui.findFile.childFileRestoredWithParent")
 		: "";
 
 	const performSearch = useCallback(async (nextQuery: string, commandSequence = 0) => {
@@ -856,7 +857,7 @@ function VaultFileHistory({
 					let items = response.items;
 					while (response.hasMore) {
 						if (!Number.isSafeInteger(response.nextOffset) || response.nextOffset <= response.offset) {
-							throw new Error("Backup history returned an invalid page boundary.");
+							throw new Error(t("ui.findFile.invalidHistoryPageBoundary"));
 						}
 						response = await getFileHistory(selected, result.path, result.source, response.nextOffset, controller.signal, response.revision);
 						if (generation.current !== vaultGeneration || historyRequests.current.get(key) !== controller) return;
@@ -1139,44 +1140,46 @@ function VaultFileHistory({
 		const childError = browseErrors[key];
 		const source = nativeRootLabel(item.source);
 		const label = item.isSource ? source : item.name;
-		const selectionLabel = `${checked ? "Deselect" : "Select"} ${item.isSource ? label : displayFilePath(item.path, item.source)} from ${source}`;
+		const selectionLabel = checked
+            ? t("ui.fileHistory.deselectFromSource", { item: item.isSource ? label : displayFilePath(item.path, item.source), source })
+            : t("ui.fileHistory.selectFromSource", { item: item.isSource ? label : displayFilePath(item.path, item.source), source });
 		const disabledMessage = item.isSource ? "" : parentSelectionMessage(item);
 		const rowLabel = <strong>{label}</strong>;
 		return <div className="browse-tree-node" key={key} role="listitem">
 			<div className={`browse-tree-row${checked ? " selected" : ""}`} style={{ paddingLeft: 10 + depth * 22 } as CSSProperties}>
-				{expandable ? <button type="button" className="browse-disclosure" aria-expanded={expanded} aria-label={`${expanded ? "Collapse" : "Expand"} ${label}`} onClick={() => toggleBrowseNode(item)}>{expanded ? "▾" : "▸"}</button> : <span className="browse-disclosure-spacer" />}
+				{expandable ? <button type="button" className="browse-disclosure" aria-expanded={expanded} aria-label={expanded ? t("ui.fileHistory.collapseNamed", { name: label }) : t("ui.fileHistory.expandNamed", { name: label })} onClick={() => toggleBrowseNode(item)}>{expanded ? "▾" : "▸"}</button> : <span className="browse-disclosure-spacer" />}
 				{item.isSource ? <span className="browse-checkbox-spacer" /> : <SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={disabledMessage} onChange={() => toggleResult(item)} />}
 				<Icon name={item.isDir ? "folder" : "file"} size={17} />
 				{expandable
-					? <button type="button" className="browse-tree-main browse-tree-label-button" aria-expanded={expanded} aria-label={`Toggle ${label} from name`} onClick={() => toggleBrowseNode(item)}>{rowLabel}</button>
+					? <button type="button" className="browse-tree-main browse-tree-label-button" aria-expanded={expanded} aria-label={t("ui.fileHistory.toggleNamedFromName", { name: label })} onClick={() => toggleBrowseNode(item)}>{rowLabel}</button>
 					: <span className="browse-tree-main">{rowLabel}</span>}
 			</div>
 			{expanded && <div role="list" className="browse-tree-children">
-				{childPage?.loading && browseItems[key] === undefined && <div role="listitem" className="browse-tree-status"><span className="spinner" /> Loading folder…</div>}
-				{childError && !childPage?.loading && <div role="listitem" className="browse-tree-status"><span>{childError}</span><button type="button" className="btn" onClick={() => void loadBrowsePage(item, false)}>Retry folder</button></div>}
-				{browseItems[key] && browseItems[key].length === 0 && !childPage?.loading && <div role="listitem" className="browse-tree-status">This folder has no indexed items.</div>}
+				{childPage?.loading && browseItems[key] === undefined && <div role="listitem" className="browse-tree-status"><span className="spinner" /> {t("ui.pages.findfile.loading.folder")}</div>}
+				{childError && !childPage?.loading && <div role="listitem" className="browse-tree-status"><span>{childError}</span><button type="button" className="btn" onClick={() => void loadBrowsePage(item, false)}>{t("ui.pages.findfile.retry.folder")}</button></div>}
+				{browseItems[key] && browseItems[key].length === 0 && !childPage?.loading && <div role="listitem" className="browse-tree-status">{t("ui.pages.findfile.this.folder.has.no.indexed.items")}</div>}
 				{renderBrowseRows(browseItems[key] ?? [], depth + 1)}
-				{childPage?.hasMore && <div role="listitem"><button type="button" className="btn browse-load-more" disabled={childPage.loading} onClick={() => void loadBrowsePage(item, true)}>{childPage.loading && <span className="spinner" />}Load more in {label}</button></div>}
+				{childPage?.hasMore && <div role="listitem"><button type="button" className="btn browse-load-more" disabled={childPage.loading} onClick={() => void loadBrowsePage(item, true)}>{childPage.loading && <span className="spinner" />}{t("ui.fileHistory.loadMoreIn", { folder: label })}</button></div>}
 			</div>}
 		</div>;
 	});
 		const restorePanel = selectedResults.length > 0 && <aside className="find-selection-panel">
-		<div className="section-heading"><div><h2>Restore selected</h2><p className="section-copy">Choose one point in time or a version per item.</p></div></div>
+		<div className="section-heading"><div><h2>{t("ui.pages.findfile.restore.selected")}</h2><p className="section-copy">{t("ui.pages.findfile.choose.one.point.in.time.or.a.version.per.item")}</p></div></div>
 		<div className="find-mode-tabs">
-			<button className={mode === "single" ? "active" : ""} onClick={() => setMode("single")}>One backup date</button>
-			<button className={mode === "individual" ? "active" : ""} onClick={() => setMode("individual")}>Each item’s version</button>
+			<button className={mode === "single" ? "active" : ""} onClick={() => setMode("single")}>{t("ui.pages.findfile.one.backup.date")}</button>
+			<button className={mode === "individual" ? "active" : ""} onClick={() => setMode("individual")}>{t("ui.pages.findfile.each.item.s.version")}</button>
 		</div>
-		{mode === "single" ? <label className="field"><span>Backup date shared by all selected items</span><select value={effectiveSingleSnapshot} onChange={(event) => setSingleSnapshot(event.target.value)} disabled={!allHistoriesLoaded || commonSnapshots.length === 0}>{(!allHistoriesLoaded || commonSnapshots.length === 0) && <option value="">{allHistoriesLoaded ? "No unambiguous common backup contains every item" : "Loading item history…"}</option>}{commonSnapshots.map((snapshot) => { const machineLabel = sharedSnapshotMachineLabel(snapshot.id, selectedResults, histories); return <option key={snapshot.id} value={snapshot.id}>{formatDate(snapshot.timestamp)}{machineLabel ? ` · ${machineLabel}` : ""}</option>; })}</select></label> : <div className="find-version-list">
+		{mode === "single" ? <label className="field"><span>{t("ui.pages.findfile.backup.date.shared.by.all.selected.items")}</span><select value={effectiveSingleSnapshot} onChange={(event) => setSingleSnapshot(event.target.value)} disabled={!allHistoriesLoaded || commonSnapshots.length === 0}>{(!allHistoriesLoaded || commonSnapshots.length === 0) && <option value="">{allHistoriesLoaded ? t("ui.pages.findfile.no.unambiguous.common.backup.contains.every.item") : t("ui.pages.findfile.loading.item.history")}</option>}{commonSnapshots.map((snapshot) => { const machineLabel = sharedSnapshotMachineLabel(snapshot.id, selectedResults, histories); return <option key={snapshot.id} value={snapshot.id}>{formatDate(snapshot.timestamp)}{machineLabel ? ` · ${machineLabel}` : ""}</option>; })}</select></label> : <div className="find-version-list">
 			{selectedResults.map((result) => {
 				const key = resultKey(result);
 				const versions = presentVersions(histories[key]).sort(newestVersionFirst);
-					return <label className="field find-version-row" key={key}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} /><select value={chosenVersions[key] ?? ""} onChange={(event) => setChosenVersions((current) => ({ ...current, [key]: event.target.value }))} disabled={!versions.length}><option value="">{versions.length ? "Choose a version" : "Loading history…"}</option>{versions.map((version) => <option key={fileVersionKey(version)} value={fileVersionKey(version)}>{versionChoiceLabel(version)}</option>)}</select></label>;
+					return <label className="field find-version-row" key={key}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} /><select value={chosenVersions[key] ?? ""} onChange={(event) => setChosenVersions((current) => ({ ...current, [key]: event.target.value }))} disabled={!versions.length}><option value="">{versions.length ? t("ui.pages.findfile.choose.a.version") : t("ui.pages.findfile.loading.history")}</option>{versions.map((version) => <option key={fileVersionKey(version)} value={fileVersionKey(version)}>{versionChoiceLabel(version)}</option>)}</select></label>;
 			})}
 		</div>}
-		<div className="find-selected-items"><span className="modal-section-label">Selected items</span>{selectedResults.map((result) => { const key = resultKey(result); const version = selectedVersion(result); const isDir = version?.isDir ?? result.isDir; return <div className="find-selected-item" key={key}><Icon name={isDir ? "folder" : "file"} size={14} /><span style={{ display: "flex", minWidth: 0, flex: 1, flexDirection: "column", gap: 3 }}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} />{isDir && <span className="mono faint">+ all files and folders inside</span>}</span><span className="mono faint">{versionTypeLabel(version, result.isDir)}</span><button onClick={() => toggleResult(result)} aria-label={`Remove ${displayFilePath(result.path, result.source)}`}>Remove</button></div>; })}</div>
+		<div className="find-selected-items"><span className="modal-section-label">{t("ui.pages.findfile.selected.items")}</span>{selectedResults.map((result) => { const key = resultKey(result); const version = selectedVersion(result); const isDir = version?.isDir ?? result.isDir; return <div className="find-selected-item" key={key}><Icon name={isDir ? "folder" : "file"} size={14} /><span style={{ display: "flex", minWidth: 0, flex: 1, flexDirection: "column", gap: 3 }}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} />{isDir && <span className="mono faint">{t("ui.pages.findfile.all.files.and.folders.inside")}</span>}</span><span className="mono faint">{versionTypeLabel(version, result.isDir)}</span><button onClick={() => toggleResult(result)} aria-label={t("ui.fileHistory.removeNamed", { name: displayFilePath(result.path, result.source) })}>{t("ui.pages.findfile.remove")}</button></div>; })}</div>
 		{restoreSelectionConflict && <div className="inline-error" role="alert">{restoreSelectionConflict}</div>}
-		<label className="field"><span>Restore destination</span><DirectoryField value={effectiveTargetPath} onChange={setTargetPath} placeholder="Choose a new or existing destination" /></label>
-			<button className="btn primary find-restore-button" disabled={!canRestore} onClick={reviewRestore}><Icon name="restore" size={14} />Review restore</button>
+		<label className="field"><span>{t("ui.pages.findfile.restore.destination")}</span><DirectoryField value={effectiveTargetPath} onChange={setTargetPath} placeholder={t("ui.pages.findfile.choose.a.new.or.existing.destination")} /></label>
+			<button className="btn primary find-restore-button" disabled={!canRestore} onClick={reviewRestore}><Icon name="restore" size={14} />{t("ui.pages.findfile.review.restore")}</button>
 		</aside>;
 		const showSearchSurface = allVaults || Boolean(error || indexing || searching || matchesVisible || indexState?.repositoryFailed || (indexState?.failedSnapshots ?? 0) > 0);
 		const SearchSurface = allVaults ? "section" : "div";
@@ -1185,27 +1188,27 @@ function VaultFileHistory({
 		<>
 			<PortalSurface target={searchTarget}>
 			{showSearchSurface && <SearchSurface className="find-history-section find-search-section find-vault-matches" aria-labelledby={allVaults ? `${sectionId}-search-heading` : undefined}>
-				{allVaults && <div className="section-heading find-all-vault-heading"><div><h2 id={`${sectionId}-search-heading`}>{searchCommand ? `Matches ${repository.name}` : repository.name}</h2></div><Tooltip content={SNAPSHOT_HISTORY_TOOLTIP}><button className="metadata-force-link" aria-label={`Refresh snapshot history for ${repository.name}`} disabled={forcingMetadata} onClick={forceRefresh}>{forcingMetadata && <span className="spinner" />}Refresh snapshot history</button></Tooltip></div>}
+				{allVaults && <div className="section-heading find-all-vault-heading"><div><h2 id={`${sectionId}-search-heading`}>{searchCommand ? t("ui.fileHistory.matchesInVault", { vault: repository.name }) : repository.name}</h2></div><Tooltip content={SNAPSHOT_HISTORY_TOOLTIP()}><button className="metadata-force-link" aria-label={t("ui.fileHistory.refreshHistoryForVault", { vault: repository.name })} disabled={forcingMetadata} onClick={forceRefresh}>{forcingMetadata && <span className="spinner" />}{t("ui.pages.findfile.refresh.snapshot.history")}</button></Tooltip></div>}
 				{error && <div className="inline-error">{error}</div>}
-				{indexState?.repositoryFailed && <div className="inline-notice" role="status">Backup history could not be refreshed. Search and browsing remain disabled until indexing completes.</div>}
-				{indexState?.headerValid && (indexState.failedSnapshots ?? 0) > 0 && <div className="inline-notice" role="status">Backup history is unavailable because {indexState.failedSnapshots} snapshot{indexState.failedSnapshots === 1 ? "" : "s"} could not be indexed. Search and browsing remain disabled until indexing completes. <button className="btn" onClick={() => void retryIndex()} disabled={retryingIndex}>{retryingIndex ? "Retrying…" : "Retry"}</button></div>}
+				{indexState?.repositoryFailed && <div className="inline-notice" role="status">{t("ui.pages.findfile.backup.history.could.not.be.refreshed.search.and.browsing.remain.disab")}</div>}
+				{indexState?.headerValid && (indexState.failedSnapshots ?? 0) > 0 && <div className="inline-notice" role="status">{t("ui.fileHistory.indexingFailed", { count: indexState.failedSnapshots ?? 0 })} <button className="btn" onClick={() => void retryIndex()} disabled={retryingIndex}>{retryingIndex ? t("ui.fileHistory.retrying") : t("ui.fileHistory.retry")}</button></div>}
 				<MetadataIndexNotice active={indexing} paused={metadataPaused} stage={metadataStage} completeHeaderListing={completeHeaderListing} state={indexState} blockSearchAndBrowse />
 				{searching && <Loading />}
-				{!searching && matchesVisible && results && results.length === 0 && <EmptyState icon="file" title="No matches"><p>{`No files or folders matched “${searchedQuery}”.`}</p></EmptyState>}
+				{!searching && matchesVisible && results && results.length === 0 && <EmptyState icon="file" title={t("ui.pages.findfile.no.matches")}><p>{t("ui.fileHistory.noMatchesForQuery", { query: searchedQuery })}</p></EmptyState>}
 
 				{!searching && matchesVisible && results && results.length > 0 && <div className="find-file-workspace">
 					{restorePanel}
 					<section className="find-results-panel">
-						<div className="section-heading find-matches-heading"><div>{!allVaults && <h2>Matches</h2>}<p className="section-copy">{results.length} result{results.length === 1 ? "" : "s"}. Select one or more files or folders to restore.</p></div><div className="find-matches-actions"><span className="mono faint">{selectedResults.length} selected</span><button type="button" className="icon-btn" aria-label="Close matches" onClick={() => { setMatchesVisible(false); onFocusSearch?.(); }}>×</button></div></div>
-						<section className="find-presentation-group without-heading" aria-label={allVaults ? `${repository.name} search results` : "Vault search results"}>
+						<div className="section-heading find-matches-heading"><div>{!allVaults && <h2>{t("ui.pages.findfile.matches")}</h2>}<p className="section-copy">{t("ui.fileHistory.resultCountHelp", { count: results.length })}</p></div><div className="find-matches-actions"><span className="mono faint">{t("ui.fileHistory.selectedCount", { count: selectedResults.length })}</span><button type="button" className="icon-btn" aria-label={t("ui.pages.findfile.close.matches")} onClick={() => { setMatchesVisible(false); onFocusSearch?.(); }}>×</button></div></div>
+						<section className="find-presentation-group without-heading" aria-label={allVaults ? t("ui.fileHistory.namedVaultSearchResults", { vault: repository.name }) : t("ui.fileHistory.vaultSearchResults")}>
 							<div className="find-results-list">{results.map((result) => {
 								const key = resultKey(result);
 								const checked = Boolean(selectedItems[key]);
 								const path = displayFilePath(result.path, result.source);
-								const selectionLabel = `${checked ? "Deselect" : "Select"} ${path}`;
-								return <label key={key} className={`find-result${checked ? " selected" : ""}`}><SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={parentSelectionMessage(result)} onChange={() => toggleResult(result)} /><Icon name={result.isDir ? "folder" : "file"} size={18} /><span className="find-result-main"><strong><FilePathLabel value={result.path} source={result.source} /></strong><span className="mono">Source: {sourceLabel(result)}</span></span></label>;
+								const selectionLabel = checked ? t("ui.fileHistory.deselectNamed", { name: path }) : t("ui.fileHistory.selectNamed", { name: path });
+								return <label key={key} className={`find-result${checked ? " selected" : ""}`}><SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={parentSelectionMessage(result)} onChange={() => toggleResult(result)} /><Icon name={result.isDir ? "folder" : "file"} size={18} /><span className="find-result-main"><strong><FilePathLabel value={result.path} source={result.source} /></strong><span className="mono">{t("ui.fileHistory.sourceLabel")} {sourceLabel(result)}</span></span></label>;
 							})}</div>
-							{searchPage.hasMore && <button className="btn find-presentation-load-more" onClick={() => void loadMoreResults()} disabled={searchPage.loading}>{searchPage.loading && <span className="spinner" />}Load more matches</button>}
+							{searchPage.hasMore && <button className="btn find-presentation-load-more" onClick={() => void loadMoreResults()} disabled={searchPage.loading}>{searchPage.loading && <span className="spinner" />}{t("ui.pages.findfile.load.more.matches")}</button>}
 						</section>
 					</section>
 				</div>}
@@ -1214,33 +1217,33 @@ function VaultFileHistory({
 
 			<PortalSurface target={browseTarget}>
 			<section className="find-history-section find-browse-section" aria-labelledby={`${sectionId}-browse-heading`}>
-				<div className="section-heading"><div><h2 id={`${sectionId}-browse-heading`}>{allVaults ? `Browse ${repository.name}` : "Browse vault"}</h2></div></div>
-				{indexBlocked ? <EmptyState icon="history" title="Indexing snapshot metadata"><p>Search and browsing is disabled while indexing completes.</p></EmptyState> : <div className="find-file-workspace browse-workspace">
+				<div className="section-heading"><div><h2 id={`${sectionId}-browse-heading`}>{allVaults ? t("ui.fileHistory.browseNamedVault", { vault: repository.name }) : t("ui.fileHistory.browseVault")}</h2></div></div>
+				{indexBlocked ? <EmptyState icon="history" title={t("ui.pages.findfile.indexing.snapshot.metadata")}><p>{t("ui.pages.findfile.search.and.browsing.is.disabled.while.indexing.completes")}</p></EmptyState> : <div className="find-file-workspace browse-workspace">
 								{restorePanel}
 								<div className="browse-vault-panel">
-									{(() => { const key = browseRootKey; const items = browseItems[key]; const page = browsePages[key]; return <section className="find-presentation-group without-heading" aria-label={allVaults ? `Browse ${repository.name} files` : "Browse vault files"}>
-									{browseErrors[key] && <div className="inline-error" role="alert">{browseErrors[key]} <button type="button" className="btn" onClick={() => void loadBrowsePage(null, false)}>Retry vault browser</button></div>}
-									{page?.loading && items === undefined && <div className="browse-tree" role="list" aria-label="Vault file history"><div role="listitem" className="browse-tree-status"><span className="spinner" /> Loading vault contents…</div></div>}
-									{items && items.length > 0 && <div className="browse-tree" role="list" aria-label="Vault file history">{renderBrowseRows(items, 0)}</div>}
-									{page?.hasMore && <button type="button" className="btn browse-load-more" disabled={page.loading} onClick={() => void loadBrowsePage(null, true)}>{page.loading && <span className="spinner" />}Load more sources</button>}
-									{items?.length === 0 && !page?.loading && <div className="browse-tree" role="list" aria-label="Vault file history"><div role="listitem" className="browse-tree-status">No files or folders found yet.</div></div>}
+									{(() => { const key = browseRootKey; const items = browseItems[key]; const page = browsePages[key]; return <section className="find-presentation-group without-heading" aria-label={allVaults ? t("ui.fileHistory.browseNamedVaultFiles", { vault: repository.name }) : t("ui.fileHistory.browseVaultFiles")}>
+									{browseErrors[key] && <div className="inline-error" role="alert">{browseErrors[key]} <button type="button" className="btn" onClick={() => void loadBrowsePage(null, false)}>{t("ui.pages.findfile.retry.vault.browser")}</button></div>}
+									{page?.loading && items === undefined && <div className="browse-tree" role="list" aria-label={t("ui.pages.findfile.vault.file.history")}><div role="listitem" className="browse-tree-status"><span className="spinner" /> {t("ui.pages.findfile.loading.vault.contents")}</div></div>}
+									{items && items.length > 0 && <div className="browse-tree" role="list" aria-label={t("ui.pages.findfile.vault.file.history")}>{renderBrowseRows(items, 0)}</div>}
+									{page?.hasMore && <button type="button" className="btn browse-load-more" disabled={page.loading} onClick={() => void loadBrowsePage(null, true)}>{page.loading && <span className="spinner" />}{t("ui.pages.findfile.load.more.sources")}</button>}
+									{items?.length === 0 && !page?.loading && <div className="browse-tree" role="list" aria-label={t("ui.pages.findfile.vault.file.history")}><div role="listitem" className="browse-tree-status">{t("ui.pages.findfile.no.files.or.folders.found.yet")}</div></div>}
 								</section>; })()}
 							</div>
 						</div>}
 			</section>
 			</PortalSurface>
 
-			{reviewedRestore && <Modal title="Review restore" onClose={dismissReviewedRestore} wide>
+			{reviewedRestore && <Modal title={t("ui.pages.findfile.review.restore")} onClose={dismissReviewedRestore} wide>
 				<fieldset className="modal-workflow-fields" disabled={restoring}>
-                <p className="muted modal-intro">{reviewedRestore.mode === "single" ? "All selected items will come from the same backup date." : "Each item will come from the version chosen in the selection panel."}</p>
-                <div className="find-confirm-list">{reviewedRestore.rows.map((row) => <div className="find-confirm-row" key={row.key}><Icon name={row.isDir ? "folder" : "file"} size={15} /><span><strong><FilePathLabel value={row.path} /></strong><span className="mono">{formatDate(row.timestamp)} · {row.isDir ? "Folder" : "File"}</span></span></div>)}</div>
-                <div className="find-confirm-destination"><span>Destination</span><strong className="mono">{displayPath(reviewedRestore.targetPath)}</strong></div>
+                <p className="muted modal-intro">{reviewedRestore.mode === "single" ? t("ui.fileHistory.singleDateHelp") : t("ui.fileHistory.perItemHelp")}</p>
+				<div className="find-confirm-list">{reviewedRestore.rows.map((row) => <div className="find-confirm-row" key={row.key}><Icon name={row.isDir ? "folder" : "file"} size={15} /><span><strong><FilePathLabel value={row.path} /></strong><span className="mono">{formatDate(row.timestamp)} · {row.isDir ? t("ui.findFile.folderType") : t("ui.findFile.fileType")}</span></span></div>)}</div>
+                <div className="find-confirm-destination"><span>{t("ui.pages.findfile.destination")}</span><strong className="mono">{displayPath(reviewedRestore.targetPath)}</strong></div>
 				{(restoreCapability(selectedRepository, engines)?.conflictModes.length ?? 0) <= 1
 					? <p className="muted">{restoreCapability(selectedRepository, engines)?.conflictModes[0]?.description}</p>
-					: <label className="field"><span>Should existing files be overwritten?</span><select value={reviewedRestore.conflictMode} onChange={(event) => setReviewedRestore((current) => current ? { ...current, conflictMode: event.target.value } : current)}>{restoreCapability(selectedRepository, engines)?.conflictModes.map((mode) => <option key={mode.id} value={mode.id}>{restoreConflictModeLabel(mode)}</option>)}</select></label>}
-				{restoring && selectedRepository?.coldStorage && <p className="recovery-warning">Cold storage retrieval can take hours or days. Replicaro is waiting for native Restic. Cancellation or shutdown stops the local process, but provider restore requests may continue.</p>}
+					: <label className="field"><span>{t("ui.pages.findfile.should.existing.files.be.overwritten")}</span><select value={reviewedRestore.conflictMode} onChange={(event) => setReviewedRestore((current) => current ? { ...current, conflictMode: event.target.value } : current)}>{restoreCapability(selectedRepository, engines)?.conflictModes.map((mode) => <option key={mode.id} value={mode.id}>{restoreConflictModeLabel(mode)}</option>)}</select></label>}
+				{restoring && selectedRepository?.coldStorage && <p className="recovery-warning">{t("ui.pages.findfile.cold.storage.retrieval.can.take.hours.or.days.replicaro.is.waiting.for")}</p>}
 				</fieldset>
-				<div className="modal-footer"><button className="btn" disabled={restoring && !selectedRepository?.coldStorage} onClick={restoring && selectedRepository?.coldStorage ? cancelColdRestore : dismissReviewedRestore}>{restoring && selectedRepository?.coldStorage ? "Cancel restore" : "Back"}</button><button className="btn primary" disabled={restoring} onClick={() => void doRestore()}>{restoring && <span className="spinner" />}<Icon name="restore" size={14} />Restore selected</button></div>
+				<div className="modal-footer"><button className="btn" disabled={restoring && !selectedRepository?.coldStorage} onClick={restoring && selectedRepository?.coldStorage ? cancelColdRestore : dismissReviewedRestore}>{restoring && selectedRepository?.coldStorage ? t("ui.pages.findfile.cancel.restore") : t("ui.findFile.back")}</button><button className="btn primary" disabled={restoring} onClick={() => void doRestore()}>{restoring && <span className="spinner" />}<Icon name="restore" size={14} />{t("ui.pages.findfile.restore.selected")}</button></div>
 			</Modal>}
 
 		</>

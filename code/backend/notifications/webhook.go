@@ -14,9 +14,14 @@ import (
 	"time"
 
 	"github.com/local/replicaro/desktop"
+	"github.com/local/replicaro/locale"
 )
 
 type Event struct {
+	Locale                string `json:"-"`
+	TaskKey               string `json:"-"`
+	TaskName              string `json:"-"`
+	TaskTarget            string `json:"-"`
 	Event                 string `json:"event"`
 	Status                string `json:"status,omitempty"`
 	Success               bool   `json:"success"`
@@ -136,36 +141,51 @@ func prepare(event *Event) {
 		event.TimelineURL = ""
 	}
 	taskName := strings.TrimSpace(event.Title)
-	event.Message = notificationMessage(taskName, *event)
+	if event.TaskKey != "" {
+		taskName = locale.Text(event.Locale, event.TaskKey, map[string]string{
+			"name": event.TaskName, "target": event.TaskTarget,
+		})
+	}
+	event.Message = localizedNotificationMessage(taskName, *event)
 	if len(event.Message) > maxWebhookMessageBytes {
 		event.Message = event.Message[:maxWebhookMessageBytes] + "…"
 	}
-	event.Title = notificationTitle(*event)
+	event.Title = localizedNotificationTitle(*event)
+}
+
+func localizedNotificationTitle(event Event) string {
+	key := "notifications.title.failed"
+	switch notificationStatus(event) {
+	case "success":
+		key = "notifications.title.success"
+	case "completed_with_issues":
+		key = "notifications.title.completedWithIssues"
+	}
+	return locale.Text(event.Locale, key, nil)
+}
+
+func localizedNotificationMessage(taskName string, event Event) string {
+	key := "notifications.message.failed"
+	switch notificationStatus(event) {
+	case "success":
+		key = "notifications.message.success"
+	case "completed_with_issues":
+		key = "notifications.message.completedWithIssues"
+		if event.Event == "backup" && event.NativeBackupSucceeded {
+			key = "notifications.message.backupNativeSucceededWithIssues"
+		}
+	}
+	return locale.Text(event.Locale, key, map[string]string{"taskName": taskName})
 }
 
 func notificationTitle(event Event) string {
-	switch notificationStatus(event) {
-	case "success":
-		return "Task SUCCESSFUL"
-	case "completed_with_issues":
-		return "Task COMPLETED WITH ISSUES"
-	default:
-		return "Task FAILED"
-	}
+	event.Locale = "en"
+	return localizedNotificationTitle(event)
 }
 
 func notificationMessage(taskName string, event Event) string {
-	switch notificationStatus(event) {
-	case "success":
-		return taskName + " has succeeded. Click here to learn more."
-	case "completed_with_issues":
-		if event.Event == "backup" && event.NativeBackupSucceeded {
-			return taskName + " completed with issues after the native backup succeeded. Click here to learn more."
-		}
-		return taskName + " completed with issues. Click here to learn more."
-	default:
-		return taskName + " has failed. Click here to learn more."
-	}
+	event.Locale = "en"
+	return localizedNotificationMessage(taskName, event)
 }
 
 func notificationStatus(event Event) string {

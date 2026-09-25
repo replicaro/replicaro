@@ -28,6 +28,7 @@ import (
 	"github.com/local/replicaro/integrations"
 	"github.com/local/replicaro/jobscript"
 	"github.com/local/replicaro/kopiapolicy"
+	"github.com/local/replicaro/locale"
 	"github.com/local/replicaro/metadata"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/operationlog"
@@ -2827,6 +2828,9 @@ func handlerForExecutionInstanceWithReader(
 				job.SourceBindingState = stored.SourceBindingState
 			}
 			if validationErr != nil {
+				if r.Method == http.MethodPost {
+					markSupportStorageObservation(w, "job_create_source", validationErr)
+				}
 				writeError(w, http.StatusConflict, validationErr)
 				return
 			}
@@ -3064,6 +3068,7 @@ func handlerForExecutionInstanceWithReader(
 			expectedSource := job.Source
 			job, err = bindImportedJobSourceStorage(r.Context(), job)
 			if err != nil {
+				markSupportStorageObservation(w, "job_bind_source", err)
 				writeError(w, http.StatusConflict, err)
 				return
 			}
@@ -3242,6 +3247,7 @@ func handlerForExecutionInstanceWithReader(
 		if *req.Enabled && job.SourceBindingState == "unbound_imported" {
 			bound, bindErr := bindImportedJobSourceStorage(r.Context(), job)
 			if bindErr != nil {
+				markSupportStorageObservation(w, "job_bind_source", bindErr)
 				writeError(w, http.StatusConflict, bindErr)
 				return
 			}
@@ -3345,6 +3351,7 @@ func handlerForExecutionInstanceWithReader(
 				return
 			}
 
+			settings.EffectiveLocale = locale.Effective(settings.Language)
 			writeJSON(w, settings)
 
 		case http.MethodPost:
@@ -3363,6 +3370,14 @@ func handlerForExecutionInstanceWithReader(
 				badRequest(w, "unsupported theme: "+req.Theme)
 				return
 			}
+			language := ""
+			if req.Language != nil {
+				language = *req.Language
+				if !models.ValidLanguage(language) {
+					badRequest(w, "unsupported language: "+language)
+					return
+				}
+			}
 			if req.LogRetentionDays < 1 {
 				badRequest(w, "log retention must be at least one day")
 				return
@@ -3379,6 +3394,7 @@ func handlerForExecutionInstanceWithReader(
 				AutoStart:                    req.AutoStart,
 				LogRetentionDays:             req.LogRetentionDays,
 				Theme:                        req.Theme,
+				Language:                     language,
 				WebhookURL:                   req.WebhookURL,
 				NotifyWindowsOnSuccess:       req.NotifyWindowsOnSuccess || req.NativeNotificationsOnSuccess,
 				NotifyWindowsOnFailure:       req.NotifyWindowsOnFailure || req.NativeNotificationsOnFailure,

@@ -62,38 +62,17 @@ func ExecuteRequest(request HelperRequest) (HelperResponse, error) {
 			return HelperResponse{}, err
 		}
 		response, err := observationResponse(observed, observedFilesystem)
-		if err != nil || !request.SelectSpelling {
-			return response, err
+		if err == nil && request.SelectSpelling {
+			// Keep the v4 wire field for callers that still request it. Binding
+			// preserves the validated route; directory enumeration could change a
+			// UNC root and required a second, redundant observation.
+			response.ConfiguredPath = request.Path
 		}
-		selected := filesystemSpelling(request.Path, false)
-		if selected != request.Path {
-			// Re-observe the selected route so the persisted descriptor and source
-			// describe one spelling. Lookup failure itself keeps the validated input.
-			observed, observedFilesystem, _, err = resolveExistingObservation(selected, request.ObjectType)
-			if err != nil {
-				return HelperResponse{}, err
-			}
-			response, err = observationResponse(observed, observedFilesystem)
-			if err != nil {
-				return HelperResponse{}, err
-			}
-		}
-		response.ConfiguredPath = selected
-		return response, nil
+		return response, err
 	case "bind_parent":
 		descriptor, err := ResolveRepositoryForCreation(request.Path)
 		if err != nil {
 			return HelperResponse{}, err
-		}
-		selected := request.Path
-		if request.SelectSpelling {
-			selected = filesystemSpelling(request.Path, true)
-			if selected != request.Path {
-				descriptor, err = ResolveRepositoryForCreation(selected)
-				if err != nil {
-					return HelperResponse{}, err
-				}
-			}
 		}
 		key, err := descriptor.CanonicalKey()
 		if err != nil {
@@ -101,7 +80,7 @@ func ExecuteRequest(request HelperRequest) (HelperResponse, error) {
 		}
 		response := HelperResponse{Version: HelperVersion, Descriptor: &descriptor, Key: key}
 		if request.SelectSpelling {
-			response.ConfiguredPath = selected
+			response.ConfiguredPath = request.Path
 		}
 		return response, nil
 	case "enumerate":

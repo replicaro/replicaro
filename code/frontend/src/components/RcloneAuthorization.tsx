@@ -1,3 +1,4 @@
+import { renderMessage, t } from "../i18n";
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
 
 import {
@@ -158,7 +159,7 @@ function RcloneAuthorizationForProvider({
 		const selected = value.question.id === "config_driveid" ? answer :
 			(answer || value.question.defaultValue || value.question.choices[0]?.value);
 		if (!selected) {
-			onError("Choose one of rclone’s account options.");
+			onError(t("ui.rclone.chooseAccountOption"));
 			return;
 		}
 		const generation = ++authorizationGeneration.current;
@@ -183,34 +184,32 @@ function RcloneAuthorizationForProvider({
 
 	return (
 		<section className="advanced-panel rclone-authorization">
-			<div className="modal-section-label">{label} account</div>
-			{showDescription && <p>
-				Replicaro uses open source <a href="https://github.com/rclone/rclone" target="_blank" rel="noreferrer">rclone</a> to connect to {label}. You need to authorize rclone with your {label} account in order to create backups. You can revoke access at any time, and only Replicaro will be able to use this rclone access. Click the connect button below to get started.
-			</p>}
+			<div className="modal-section-label">{t("ui.rclone.accountTitle", { provider: label })}</div>
+			{showDescription && <p>{renderMessage("ui.rclone.authorizationDescription", { provider: label, rcloneLink: <a href="https://github.com/rclone/rclone" target="_blank" rel="noreferrer">{t("ui.components.rcloneauthorization.rclone")}</a> })}</p>}
 			{busy && <div className="inline-notice" role="status">
-				<span className="spinner" /> Finish authorization in the browser window opened by rclone.
+				<span className="spinner" /> {t("ui.rclone.finishInBrowser")}
 			</div>}
 			{value?.status === "waiting_browser" && authorizationUrl && <div className="inline-notice" role="status">
 				<a href={authorizationUrl} target="_blank" rel="noreferrer">
-					{`Open page where you must authorize Replicaro (through rclone) to access your ${label} account`}
+					{t("ui.rclone.openAuthorizationPage", { provider: label })}
 				</a>
-				<div>Finish authorization in the browser, then return to Replicaro.</div>
+				<div>{t("ui.components.rcloneauthorization.finish.authorization.in.the.browser.then.return.to.replicaro")}</div>
 			</div>}
 			{value?.status === "ready" && <div className="inline-notice" role="status">
-				Account authorization is ready. Click {readyAction} to continue.
+				{readyAction === "create vault" ? t("ui.rclone.readyCreateVault") : readyAction === "check existing vault" ? t("ui.rclone.readyCheckVault") : t("ui.rclone.readySaveLogin")}
 			</div>}
 			{value?.status === "question" && value.question?.notice &&
 				<div className="inline-error" role="alert">{value.question.notice}</div>}
 			{value?.status === "question" && value.question && <label className="field">
-				<span>{value.question.prompt || "Choose the native rclone account option"}</span>
+				<span>{value.question.prompt || t("ui.rclone.chooseNativeOption")}</span>
 				<select
-					aria-label={value.question.id === "config_driveid" ? "OneDrive location" : "Rclone account option"}
+					aria-label={value.question.id === "config_driveid" ? t("ui.rclone.oneDriveLocation") : t("ui.rclone.accountOption")}
 					value={answer}
 					disabled={busy || disabled}
 					onChange={(event) => setAnswer(event.target.value)}
 				>
 					{value.question.id === "config_driveid" &&
-						<option value="" disabled>Select a OneDrive location</option>}
+						<option value="" disabled>{t("ui.components.rcloneauthorization.select.a.onedrive.location")}</option>}
 					{value.question.choices.map((choice) =>
 						<option key={choice.value} value={choice.value}>
 							{choice.label || choice.value}
@@ -223,10 +222,10 @@ function RcloneAuthorizationForProvider({
 					? <button className="btn" disabled={busy || disabled ||
 						(value.question?.id === "config_driveid" && !answer)}
 						onClick={() => void continueFlow()}>
-						{busy && <span className="spinner" />}Continue
+						{busy && <span className="spinner" />}{t("ui.rclone.continue")}
 					</button>
 					: value?.status !== "ready" && value?.status !== "waiting_browser" && <button className="btn" disabled={busy || disabled} onClick={() => void start()}>
-						{busy && <span className="spinner" />}{`Connect ${label}`}
+						{busy && <span className="spinner" />}{t("ui.rclone.connectProvider", { provider: label })}
 					</button>}
 			</div>
 		</section>

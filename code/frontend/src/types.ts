@@ -1,3 +1,5 @@
+import type { LanguagePreference } from "./i18n";
+
 export interface ObjectLockSettings {
 	enrolled: boolean;
 	paused: boolean;
@@ -481,6 +483,8 @@ export interface PlatformInfo {
 export type ThemePreference = "system" | "light" | "neutral" | "dark";
 
 export interface Settings {
+    language?: LanguagePreference;
+    effectiveLocale?: string;
     defaultEngine: "restic" | "kopia";
     autoStart: boolean;
     logRetentionDays: number;

@@ -9,6 +9,15 @@ import (
 )
 
 const installationIDKey = "installationId"
+const languageKey = "language"
+
+// EnsureLanguageSetting only fills the absent key. It runs on the writable
+// startup connection before read-only pools open, including on older installs.
+func EnsureLanguageSetting(db *sql.DB) error {
+	_, err := db.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO NOTHING`, languageKey, models.LanguageSystem)
+	return err
+}
 
 func InstallationID(db *sql.DB) (string, error) {
 	var id string
@@ -53,6 +62,7 @@ func GetSettings(
 		AutoStart:                    true,
 		LogRetentionDays:             30,
 		Theme:                        models.ThemeDark,
+		Language:                     models.LanguageSystem,
 		NotifyWindowsOnFailure:       true,
 		NativeNotificationsOnFailure: true,
 		StartWithWindows:             true,
@@ -102,6 +112,10 @@ func GetSettings(
 				// Historical invalid values never represented an applied theme.
 				// Preserve the former visible behavior instead of guessing.
 				settings.Theme = models.ThemeDark
+			}
+		case languageKey:
+			if models.ValidLanguage(value) {
+				settings.Language = value
 			}
 
 		case "autoStart":
@@ -193,6 +207,9 @@ func SaveSettings(
 	if !models.ValidTheme(settings.Theme) {
 		return fmt.Errorf("unsupported theme: %s", settings.Theme)
 	}
+	if settings.Language != "" && !models.ValidLanguage(settings.Language) {
+		return fmt.Errorf("unsupported language: %s", settings.Language)
+	}
 	if !ValidMaxConcurrentJobRuns(settings.MaxConcurrentJobRuns) {
 		return fmt.Errorf("max concurrent job runs must be between %d and %d", MinMaxConcurrentJobRuns, MaxMaxConcurrentJobRuns)
 	}
@@ -201,6 +218,20 @@ func SaveSettings(
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	if settings.Language == "" {
+		// A missing language field means an older writer supplied the prior
+		// settings shape. Resolve it inside this replacement transaction so
+		// that writer cannot reset a newer client's explicit choice.
+		err = tx.QueryRow(`SELECT value FROM settings WHERE key = ?`, languageKey).Scan(&settings.Language)
+		if err == sql.ErrNoRows {
+			settings.Language = models.LanguageSystem
+		} else if err != nil {
+			return err
+		}
+		if !models.ValidLanguage(settings.Language) {
+			settings.Language = models.LanguageSystem
+		}
+	}
 
 	var dashboardIssuesReviewedAt string
 	_ = tx.QueryRow(
@@ -222,6 +253,7 @@ func SaveSettings(
 	values := map[string]string{
 		"defaultEngine":                settings.DefaultEngine,
 		"theme":                        settings.Theme,
+		languageKey:                    settings.Language,
 		"webhookUrl":                   settings.WebhookURL,
 		"notifyWindowsOnSuccess":       strconv.FormatBool(settings.NotifyWindowsOnSuccess),
 		"notifyWindowsOnFailure":       strconv.FormatBool(settings.NotifyWindowsOnFailure),

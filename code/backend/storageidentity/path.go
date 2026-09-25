@@ -12,7 +12,8 @@ import (
 // NormalizeConfiguredPath performs lexical cleanup only. Configured paths are
 // operational names, not comparison keys: folding case here can change the
 // object opened on a case-sensitive filesystem (including Windows directories).
-// Filesystem spelling is selected separately, once, by the binding helper.
+// Binding retains this spelling after the helper validates the selected route;
+// physical descriptor components never become an operational pathname.
 func NormalizeConfiguredPath(value string) (string, error) {
 	if err := ValidateConfiguredPath(value); err != nil {
 		return "", err
@@ -95,7 +96,7 @@ func BindExistingParent(value string) (resolved string, existing string, err err
 	var tail []string
 	for {
 		if _, statErr := os.Lstat(candidate); statErr == nil {
-			physical, evalErr := filepath.EvalSymlinks(candidate)
+			physical, evalErr := evalStorageSymlinks(candidate)
 			if evalErr != nil {
 				return "", "", fmt.Errorf("resolve storage parent: %w", evalErr)
 			}
@@ -187,7 +188,7 @@ func resolveExistingObservation(value, objectType string) (Descriptor, string, s
 	if objectType == "file" && !info.Mode().IsRegular() {
 		return Descriptor{}, "", "", &MissingStorageError{}
 	}
-	physical, err := filepath.EvalSymlinks(absolute)
+	physical, err := evalStorageSymlinks(absolute)
 	if err != nil {
 		return Descriptor{}, "", "", fmt.Errorf("resolve exact storage path: %w", err)
 	}
@@ -202,6 +203,43 @@ func resolveExistingObservation(value, objectType string) (Descriptor, string, s
 		err = descriptor.Validate()
 	}
 	return descriptor, observedFilesystem, physical, err
+}
+
+// Go's Windows EvalSymlinks rejects the intermediate \\?\UNC\server prefix
+// before it reaches an otherwise valid share. Resolve the equivalent ordinary
+// UNC route through the same symlink/junction check, while callers retain the
+// exact extended spelling as their configured operational path.
+func evalStorageSymlinks(value string) (string, error) {
+	if runtime.GOOS == "windows" && strings.HasPrefix(strings.ToLower(value), strings.ToLower(`\\?\UNC\`)) {
+		ordinary := `\\` + value[len(`\\?\UNC\`):]
+		physical, err := filepath.EvalSymlinks(ordinary)
+		if err != nil {
+			return "", err
+		}
+		// Verbatim UNC admits names that ordinary UNC may normalize (for
+		// example trailing spaces or dots). The replacement prefix is safe
+		// only when both routes prove the same opened object.
+		if err := verifyResolvedUNCObject(value, physical); err != nil {
+			return "", err
+		}
+		return physical, nil
+	}
+	return filepath.EvalSymlinks(value)
+}
+
+func verifyResolvedUNCObject(original, resolved string) error {
+	originalInfo, err := os.Stat(original)
+	if err != nil {
+		return fmt.Errorf("inspect extended UNC route: %w", err)
+	}
+	resolvedInfo, err := os.Stat(resolved)
+	if err != nil {
+		return fmt.Errorf("inspect resolved UNC object: %w", err)
+	}
+	if !os.SameFile(originalInfo, resolvedInfo) {
+		return fmt.Errorf("extended UNC route does not match its resolved object")
+	}
+	return nil
 }
 
 // pathOnlyDescriptor records that the configured path was valid and visible

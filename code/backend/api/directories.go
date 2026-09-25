@@ -66,6 +66,13 @@ func browseDirectories(requested string) (directoryListing, error) {
 			// Broken, looping and non-directory links vanish.
 			info, err := os.Stat(filepath.Join(abs, entry.Name()))
 			isDirectory = err == nil && info.IsDir()
+			if isDirectory && runtime.GOOS == "windows" && directoryListingDenied(filepath.Join(abs, entry.Name())) {
+				// Windows compatibility junctions can allow the metadata read
+				// above while denying directory listing. Do not offer a route
+				// that immediately fails when opened in the picker. Check access,
+				// not names or reparse tags: usable junctions remain selectable.
+				isDirectory = false
+			}
 		}
 		if isDirectory {
 			directories = append(directories, directoryEntry{
@@ -83,4 +90,20 @@ func browseDirectories(requested string) (directoryListing, error) {
 	return directoryListing{
 		Current: abs, Parent: parent, Roots: directoryRoots(), Directories: directories,
 	}, nil
+}
+
+func directoryListingDenied(path string) bool {
+	// Probe only Windows link candidates, requesting one name to establish
+	// listing access. EOF means an accessible empty directory.
+	// Only permission denial hides an entry; transient or unrelated errors keep
+	// their normal direct-open error path. This observation does not replace
+	// later navigation or source/destination admission, and never resolves the
+	// chosen route into a different path.
+	directory, err := os.Open(path)
+	if err != nil {
+		return os.IsPermission(err)
+	}
+	defer directory.Close()
+	_, err = directory.Readdirnames(1)
+	return os.IsPermission(err)
 }

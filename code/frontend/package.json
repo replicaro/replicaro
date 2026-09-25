@@ -1,12 +1,14 @@
 {
   "name": "frontend",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "node ./node_modules/typescript/bin/tsc -b && node ./node_modules/vite/bin/vite.js build",
     "lint": "node ./node_modules/eslint/bin/eslint.js .",
+    "validate:locales": "node ./scripts/validate-locales.mjs",
+    "test:locales": "node --test ./scripts/validate-locales.node.mjs",
     "preview": "vite preview",
     "test": "node ./node_modules/vitest/vitest.mjs run",
     "test:coverage": "node ./node_modules/vitest/vitest.mjs run --coverage",

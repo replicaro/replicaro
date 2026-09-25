@@ -138,7 +138,7 @@ Build backup jobs around your data. No need to understand command-line.
 
 - **Pick your backup engine.**
 
-  - Restic is great. Kopia is great. Why should you be forced to use only one? Replicaro allows you to pick whatever backup engine you want.
+  - Restic is great. Kopia is great. Why should you be forced to use only one? Replicaro allows you to pick whatever backup engine you want. You can also easily import existing Restic or Kopia repositories.
 
 - **Multi-vault backups made easy.**
 
@@ -196,6 +196,10 @@ Build backup jobs around your data. No need to understand command-line.
 
   - Open source projects are great because you get to inspect the code. It helps build trust. But being able to see the code, such as on Github, does not mean the app you download matches exactly that code. That is why we have made Replicaro byte-per-byte reproducible: you can compile Replicaro's code yourself using the scripts we have included, and the binaries you generate will match exactly the unsigned binaries released on Github. Trust but verify, right? Our signed binaries are the same unsigned binaries you see but with our code signing applied.
 
+- **Multi-language and internationalization support.**
+
+  - English not your prefered language? No problem. Replicaro also supports Arabic (Modern Standard), Bengali, Brazilian Portuguese, Cantonese (Traditional Chinese), Dutch, European Portuguese, French, German, Greek, Hebrew, Hindi, Indonesian, Irish, Italian, Japanese, Korean, Malaysian Malay, Mandarin (Simplified Chinese), Nigerian Pidgin, Persian (Farsi), Polish, Russian, Spanish, Turkish, Urdu, and Vietnamese.
+
 - **Make the interface yours.**
 
   - Dark, Light, and Neutral themes make Replicaro comfortable on any desktop.
@@ -211,6 +215,100 @@ Build backup jobs around your data. No need to understand command-line.
 <div align="center">
   <strong>Your data. Your storage. Your protection.</strong>
 </div>
+
+## Translate Replicaro
+
+The canonical English interface catalog is at
+[`code/frontend/public/locales/en.json`](code/frontend/public/locales/en.json).
+Translations are contributed through pull requests and require review before
+they are included in the app. A new catalog is a candidate until a maintainer
+explicitly registers its locale in the frontend catalog registry, backend
+catalog loader, and supported language setting. The v1.0.2 source includes
+English, German, French, Arabic, Urdu, Hindi, Spanish, Italian, Simplified
+Chinese (Mandarin), Traditional Chinese (Cantonese), Japanese, Irish, Korean,
+Malay, Indonesian, Turkish, Hebrew, European Portuguese, Brazilian Portuguese,
+Russian, Polish, Dutch, Bengali, Greek, Persian (Farsi), Vietnamese, and Nigerian
+Pidgin. The new translations require fluent-speaker and maintainer approval
+before release. Updates to an already registered
+translation can remain catalog-only.
+New catalogs must also be included in the
+[`public-source manifest`](code/build/unsigned/public-source-v1.json) so public
+builds receive the same translations as internal builds.
+
+English is the source of truth for every translation. Preserve its meaning,
+including the strength of claims, warnings, qualifications, and uncertainty.
+If an English statement seems incorrect or overstated, raise that as a separate
+source-text issue; do not silently correct, weaken, or strengthen it in another
+language. Natural phrasing and the target language's grammar should convey the
+same message.
+
+The shared English catalog serves both British and American English. Regional
+Spanish, French, and other OS language variants use their shared language
+catalog when no exact regional catalog is registered. European Portuguese
+(`pt-PT`) and Brazilian Portuguese (`pt-BR`) have separate catalogs. Matching
+tries an exact locale, then progressively less specific tags, then a registered
+variant of the same language before moving to the next OS preference; English
+is the final fallback. Same-language variant fallback uses sorted catalog order,
+so `pt` and `pt-AO` currently select `pt-BR`. Users can choose a specific catalog
+in Appearance. Text and formatting both use the selected catalog's locale;
+there is no separate regional-format setting.
+
+The language area always includes **Reset to English**, with that exact English
+label excluded from translation. It saves the English preference immediately;
+other unsaved settings stay in the form until the user saves them separately.
+
+Arabic (`ar`) uses Modern Standard Arabic, Persian (`fa`) uses standard Iranian
+Persian, Malay (`ms`) uses Malaysian Malay, and Pidgin (`pcm`) uses Nigerian
+Pidgin. Mandarin (`zh-Hans`) uses Simplified Chinese; Cantonese (`yue-Hant`)
+uses Traditional Chinese. OS tags beginning with `zh` select Mandarin, including
+Traditional Chinese OS settings; Cantonese requires a `yue` tag or an explicit
+selection. These catalogs are not automatic script or dialect conversions.
+
+All Replicaro-formatted dates use the **Gregorian calendar** in every language,
+including Arabic and Persian. Month names, digits, field order, and time
+formatting use the selected locale through the browser's `Intl` data. A browser
+that lacks formatting data for a locale may use its default locale for dates
+and numbers; the calendar stays Gregorian. Use `formatDisplayDate` or
+`formatDisplayDateTime` from `code/frontend/src/i18n.ts` for UI dates so locale
+defaults cannot switch the calendar. This applies to snapshot dates, activity and profile timestamps,
+and date-picker labels. It does not rewrite stored timestamps, time zones, raw
+engine output, or native retention calendar semantics. Support-report payloads
+remain English, including when their surrounding UI is translated.
+
+1. Fork the [public Replicaro repository](https://github.com/replicaro/replicaro)
+   and create a branch in your fork.
+2. Copy `code/frontend/public/locales/en.json` in the same directory. Name the
+   copy for the correct BCP 47 locale identifier, such as `fr-FR.json`. Use a
+   hyphen between language and region subtags, rather than an underscore.
+   Set the top-level `locale` to that identifier and `direction` for the language.
+   The bundled Arabic, Urdu, Hebrew, and Persian catalogs use `rtl`; the other
+   bundled catalogs use `ltr`.
+3. Translate the values. Keep every message key and placeholder exactly as in
+   `en.json`; do not add or remove message keys. Preserve interpolation syntax.
+   For plural messages, use the categories required by the target locale, which
+   can differ from English (`one` and `other`); the locale validator checks them.
+4. Keep **Replicaro**, **Restic**, **Kopia**, and **rclone** unchanged. Preserve
+   user-provided names, paths, commands, configuration values, and log samples.
+   These are data, not prose to translate.
+5. Write complete, natural sentences in the target language. Check labels and
+   messages in context, especially at narrow window widths. Do not put raw
+   HTML, scripts, or external links in catalog values.
+
+The public translation PR check runs these commands. Run them locally from
+`code/frontend` before opening a pull request:
+
+```sh
+npm ci
+npm run validate:locales
+npm run build
+```
+
+Open a pull request against the public repository. State the language and
+exact locale identifier, how a fluent speaker reviewed the wording, and include
+screenshots of representative screens at desktop and narrow widths. A fluent
+speaker and a maintainer must review the translation before it ships. Updates
+to an existing translation normally change only that locale's catalog and any
+bounded metadata needed for it; explain any broader change in the pull request.
 
 ## License
 

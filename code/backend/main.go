@@ -668,6 +668,10 @@ func run() (result error) {
 		_ = db.Close()
 		return err
 	}
+	if err := database.EnsureLanguageSetting(db); err != nil {
+		_ = db.Close()
+		return fmt.Errorf("initialize language setting: %w", err)
+	}
 	if err := artifactrecovery.Reconcile(db); err != nil {
 		_ = db.Close()
 		return fmt.Errorf("recover local engine artifacts: %w", err)

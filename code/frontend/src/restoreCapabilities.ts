@@ -1,4 +1,5 @@
 import type { EngineDescriptor, Repository } from "./types";
+import { t } from "./i18n";
 
 export function restoreCapability(repository: Repository | undefined, engines: EngineDescriptor[]) {
 	return engines.find((engine) => engine.id === repository?.engine)?.capabilities.restore;
@@ -10,7 +11,7 @@ export function defaultConflictMode(repository: Repository | undefined, engines:
 }
 
 export function restoreConflictModeLabel(mode: { id: string; label: string }) {
-	if (mode.id === "always" || mode.id === "overwrite") return "Yes, overwrite";
-	if (mode.id === "never" || mode.id === "no-overwrite") return "Do not overwrite";
+	if (mode.id === "always" || mode.id === "overwrite") return t("ui.restore.yesOverwrite");
+	if (mode.id === "never" || mode.id === "no-overwrite") return t("ui.restore.doNotOverwrite");
 	return mode.label;
 }

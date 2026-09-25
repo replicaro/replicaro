@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/local/replicaro/appupdate"
+	"github.com/local/replicaro/locale"
 	"github.com/local/replicaro/operationruntime"
 	"github.com/local/replicaro/rendezvous"
 	"github.com/local/replicaro/runtimeendpoint"
@@ -51,6 +52,11 @@ func applicationHandlerAtWithSecurityModeAndRcloneAuth(
 		db, readDB, endpoint, record, activate, mode, rcloneAuth, updater, runtimeManager,
 	)
 	webUI, err := webUIFileSystem()
+	if err == nil {
+		if _, catalogErr := fs.Stat(webUI, "locales/en.json"); catalogErr == nil {
+			err = locale.LoadFS(webUI)
+		}
+	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		r = withSecurity(r, security)

@@ -148,8 +148,8 @@ func WindowsNetworkProviderKind(provider string) (Kind, error) {
 }
 
 func cleanWindowsPath(value string) string {
-	// Windows can enable case sensitivity per directory. Only the filesystem
-	// spelling proof may select another spelling; identity must keep descendants.
+	// Windows can enable case sensitivity per directory. Keep entered spelling
+	// after lexical cleanup; physical identity keeps exact descendants separately.
 	return cleanWindowsConfiguredPath(value)
 }
 

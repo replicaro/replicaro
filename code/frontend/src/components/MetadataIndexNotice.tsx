@@ -1,3 +1,4 @@
+import { t } from "../i18n";
 import type { MetadataIndexState } from "../types";
 
 type MetadataStage = "" | "queued" | "preparing" | "refreshing_headers" | "indexing_entries";
@@ -22,15 +23,15 @@ export function MetadataIndexNotice({
 	const processed = Math.min(known, (state?.readySnapshots ?? 0) + (state?.failedSnapshots ?? 0));
 	const indexingContents = stage === "indexing_entries" || (state?.headerValid && !completeHeaderListing);
 	const message = paused
-		? "Indexing paused due to active vault work..."
+		? t("ui.metadataIndex.paused")
 		: indexingContents
-			? `Indexing snapshot contents…${known > 0 ? ` ${processed}/${known}` : ""}`
-			: "Indexing snapshots…";
+			? known > 0 ? t("ui.metadataIndex.contentsProgress", { processed, known }) : t("ui.metadataIndex.contents")
+			: t("ui.metadataIndex.snapshots");
 	return <div className="inline-notice metadata-index-notice" role="status">
 		{!paused && <span className="spinner" />}
 		<span><strong>{message}</strong>
-			{blockSearchAndBrowse && <span>Search and browsing is disabled while indexing completes.</span>}
-			<span>You can safely close this page if you need to. Indexing will resume in the background.</span>
+			{blockSearchAndBrowse && <span>{t("ui.components.metadataindexnotice.search.and.browsing.is.disabled.while.indexing.completes")}</span>}
+			<span>{t("ui.components.metadataindexnotice.you.can.safely.close.this.page.if.you.need.to.indexing.will.resume.in")}</span>
 		</span>
 	</div>;
 }

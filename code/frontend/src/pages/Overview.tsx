@@ -1,3 +1,4 @@
+import { formatDisplayDate, formatDisplayNumber, getEffectiveLocale, renderMessage, t } from "../i18n";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
@@ -34,14 +35,14 @@ import { NativeLogPager, retainReadableLog } from "./nativeLogPaging";
 
 type TimelineFilter = "all" | "backups" | "restores" | "checks" | "maintenance" | "other" | "issues";
 
-const timelineFilters: Array<{ value: TimelineFilter; label: string }> = [
-    { value: "all", label: "All" },
-    { value: "backups", label: "Backups" },
-    { value: "restores", label: "Restores" },
-    { value: "checks", label: "Integrity checks" },
-    { value: "maintenance", label: "Space reclamation" },
-    { value: "other", label: "Other" },
-    { value: "issues", label: "Issues" },
+const timelineFilters: Array<{ value: TimelineFilter; label: () => string }> = [
+    { value: "all", label: () => t("ui.timeline.all") },
+    { value: "backups", label: () => t("ui.timeline.backups") },
+    { value: "restores", label: () => t("ui.timeline.restores") },
+    { value: "checks", label: () => t("ui.timeline.integrityChecks") },
+    { value: "maintenance", label: () => t("ui.timeline.spaceReclamation") },
+    { value: "other", label: () => t("ui.timeline.other") },
+    { value: "issues", label: () => t("ui.timeline.issues") },
 ];
 
 const TIMELINE_PAGE_SIZE = 10;
@@ -109,13 +110,14 @@ function operationLogPageLabel(page: OperationLogResponse) {
 		? Math.min(Math.floor(Math.log(page.size) / Math.log(1000)), logSizeUnits.length - 1)
 		: 0;
 	const divisor = 1000 ** unitIndex;
-	const format = (bytes: number) => unitIndex === 0 ? String(bytes) : String(Number((bytes / divisor).toPrecision(3)));
+	// Keep the log's three significant digits while letting the locale supply
+	// separators; a fractional-digit default would hide tiny nonzero offsets.
+	const format = (bytes: number) => formatDisplayNumber(bytes / divisor, { maximumSignificantDigits: 3 });
 	const unit = logSizeUnits[unitIndex];
 	if (unitIndex === 0) {
-		const rangeUnit = page.offset + 1 === page.nextOffset ? "byte" : "bytes";
-		return `${page.offset + 1}–${page.nextOffset} ${rangeUnit} of ${page.size}-byte log`;
+		return t("ui.overview.logByteRange", { count: page.nextOffset - page.offset, start: page.offset + 1, end: page.nextOffset, size: page.size });
 	}
-	return `${format(page.offset + 1)}–${format(page.nextOffset)} ${unit} of ${format(page.size)} ${unit} log`;
+	return t("ui.overview.logUnitRange", { start: format(page.offset + 1), end: format(page.nextOffset), size: format(page.size), unit });
 }
 
 function eventTime(value: string) {
@@ -124,24 +126,24 @@ function eventTime(value: string) {
 
     const today = new Date();
     if (date.toDateString() === today.toDateString()) {
-        return date.toLocaleTimeString(undefined, {
+        return date.toLocaleTimeString(getEffectiveLocale(), {
             hour: "2-digit",
             minute: "2-digit",
             hour12: true,
         });
     }
-    return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+    return formatDisplayDate(date, { month: "short", day: "numeric" });
 }
 
 function operationTag(entry: OperationEntry) {
-	if (entry.status === "queued") return "queued";
-	if (entry.status === "running") return "running";
-    if (entry.status === "interrupted") return "stopped";
-    if (entry.status === "failed") return "failed";
-	if (entry.status === "reconnect_required") return "Reconnect required";
-    if (entry.status === "completed_with_issues") return "completed with issues";
-    if (entry.status === "partial") return "partial";
-    if (entry.status === "success" && (entry.kind === "backup" || entry.kind === "restore")) return "success";
+	if (entry.status === "queued") return t("ui.operation.queued");
+	if (entry.status === "running") return t("ui.operation.running");
+    if (entry.status === "interrupted") return t("ui.operation.stopped");
+    if (entry.status === "failed") return t("ui.operation.failed");
+	if (entry.status === "reconnect_required") return t("ui.operation.reconnectRequired");
+    if (entry.status === "completed_with_issues") return t("ui.operation.completedWithIssues");
+    if (entry.status === "partial") return t("ui.operation.partial");
+    if (entry.status === "success" && (entry.kind === "backup" || entry.kind === "restore")) return t("ui.operation.success");
     return entry.kind;
 }
 
@@ -152,19 +154,19 @@ function operationTitle(entry: OperationEntry) {
 
 function activeOperationProgress(entry: OperationEntry) {
     if (entry.kind !== "backup") {
-        return `${entry.status === "queued" ? "queued" : "started"} ${timeAgo(entry.startedAt)}`;
+        return entry.status === "queued" ? t("ui.overview.operationQueuedAt", { time: timeAgo(entry.startedAt) }) : t("ui.overview.operationStartedAt", { time: timeAgo(entry.startedAt) });
     }
     const backup = entry.steps?.find((step) =>
         step.domain === "native" && step.kind === "backup" && step.status === "succeeded"
     );
     if (!backup) {
-        return `${entry.status === "queued" ? "queued" : "started"} ${timeAgo(entry.startedAt)}`;
+        return entry.status === "queued" ? t("ui.overview.operationQueuedAt", { time: timeAgo(entry.startedAt) }) : t("ui.overview.operationStartedAt", { time: timeAgo(entry.startedAt) });
     }
     // Restic retention is a native child; Kopia retention remains part of its backup child.
     const retentionRunning = entry.steps?.some((step) =>
         step.domain === "native" && step.kind === "retention" && step.status === "running"
     );
-    return `Snapshot finished ${timeAgo(backup.finishedAt)} · ${retentionRunning ? "retention running" : "finalizing"}`;
+    return retentionRunning ? t("ui.overview.snapshotFinishedRetentionRunning", { time: timeAgo(backup.finishedAt) }) : t("ui.overview.snapshotFinishedFinalizing", { time: timeAgo(backup.finishedAt) });
 }
 
 function backupCompletedWithIssues(operation?: OperationEntry, event?: TimelineEvent) {
@@ -807,14 +809,14 @@ export default function Overview() {
 		}
 	};
 	const subcopy = jobsRunning
-		? `${activeBackupOperations.length} backup operation${activeBackupOperations.length === 1 ? " is" : "s are"} currently queued or running.`
+		? t("ui.overview.runningOperations", { count: activeBackupOperations.length })
 		: hasIssues
-        ? <><button type="button" className="text-button inline-issues-link" onClick={showIssues}>{issueCount} issue{issueCount === 1 ? "" : "s"}</button> need{issueCount === 1 ? "s" : ""} attention. Review the &quot;Issues&quot; timeline below.</>
+        ? renderMessage("ui.overview.issuesNeedAttention", { count: issueCount, issueLink: <button type="button" className="text-button inline-issues-link" onClick={showIssues}>{t("ui.overview.issueCount", { count: issueCount })}</button> })
         : failing.length
-        ? `${failing[0].repositoryName} has a failed target run. Review its output in the timeline below.`
+        ? t("ui.overview.failedTargetRun", { vault: failing[0].repositoryName })
         : stats?.lastBackup
-          ? `The latest backup completed ${timeAgo(stats.lastBackup)}.`
-          : "Create and run a backup job to begin protecting your data.";
+          ? t("ui.overview.latestBackupCompleted", { time: timeAgo(stats.lastBackup) })
+          : t("ui.overview.beginProtecting");
     const reviewIssues = async () => {
         setReviewingIssues(true);
         try {
@@ -826,7 +828,7 @@ export default function Overview() {
             setIssuesCursor("");
 			setIssuesLoading(filter === "issues");
 			setIssueRequestKey((key) => key + 1);
-            toast("ok", "Issues marked as reviewed");
+            toast("ok", t("ui.overview.issuesReviewed"));
         } catch (reason) {
             toast("error", (reason as Error).message);
         } finally {
@@ -852,7 +854,7 @@ export default function Overview() {
 			setCancelError("");
 		} catch {
 			setConfirmCancel(false);
-			setCancelError("Could not cancel this operation. Try again.");
+			setCancelError(t("ui.overview.cancelOperationFailed"));
 			cancelFreshAfterRequest.current = activeDetailRequestSequence.current;
 			setCancelNeedsFreshSnapshot(true);
 		} finally {
@@ -860,9 +862,9 @@ export default function Overview() {
 		}
 	};
 	const protectionRingContents = jobsRunning ? (
-		<div className="running-indicator" role="img" aria-label="Backup jobs running">
+		<div className="running-indicator" role="img" aria-label={t("ui.pages.overview.backup.jobs.running")}>
 			<span className="pacman-motion" aria-hidden="true" />
-			<span>Running</span>
+			<span>{t("ui.pages.overview.running")}</span>
 		</div>
 	) : (
         <>
@@ -882,12 +884,12 @@ export default function Overview() {
                 {hasIssues ? (
                     <>
                         <strong className="ring-alert-mark" aria-hidden="true">!</strong>
-                        <span>Issues found</span>
+                        <span>{t("ui.pages.overview.issues.found")}</span>
                     </>
                 ) : (
                     <>
-                        <strong>{percent}%</strong>
-                        <span>Protected</span>
+                        <strong>{formatDisplayNumber(percent)}%</strong>
+                        <span>{t("ui.pages.overview.protected")}</span>
                     </>
                 )}
             </div>
@@ -904,55 +906,55 @@ export default function Overview() {
             {gettingStarted ? (
 				<section className="getting-started" aria-labelledby="getting-started-title">
 					<div className="getting-started-copy">
-						<span className="getting-started-kicker">Getting started</span>
-						<h1 id="getting-started-title">Hi there. Ready to protect your data?</h1>
-						<Link className="btn primary" to="/protect#vaults">Add a vault</Link>
+						<span className="getting-started-kicker">{t("ui.pages.overview.getting.started")}</span>
+						<h1 id="getting-started-title">{t("ui.pages.overview.hi.there.ready.to.protect.your.data")}</h1>
+						<Link className="btn primary" to="/protect#vaults">{t("ui.pages.overview.add.a.vault")}</Link>
 					</div>
 					<ol className="getting-started-steps">
 						<li>
-							<strong>Step 1: Add a vault.</strong>
-							<span>Create a new encrypted vault or connect an existing one. Local, network, and cloud vaults are supported.</span>
+							<strong>{t("ui.pages.overview.step.1.add.a.vault")}</strong>
+							<span>{t("ui.pages.overview.create.a.new.encrypted.vault.or.connect.an.existing.one.local.network")}</span>
 						</li>
 						<li>
-							<strong>Step 2: Create a backup job.</strong>
-							<span>Choose the files you want to protect and vault you want to back them up into. Also pick the schedule on which you want the backup to run.</span>
+							<strong>{t("ui.pages.overview.step.2.create.a.backup.job")}</strong>
+							<span>{t("ui.pages.overview.choose.the.files.you.want.to.protect.and.vault.you.want.to.back.them.u")}</span>
 						</li>
 						<li>
-							<strong>Step 3: Watch Replicaro work.</strong>
-							<span>Replicaro automatically backs up your files based on your selected schedule.</span>
+							<strong>{t("ui.pages.overview.step.3.watch.replicaro.work")}</strong>
+							<span>{t("ui.pages.overview.replicaro.automatically.backs.up.your.files.based.on.your.selected.sch")}</span>
 						</li>
 					</ol>
 				</section>
 			) : needsFirstJob ? (
 				<section className="getting-started" aria-labelledby="first-job-title">
 					<div className="getting-started-copy">
-						<span className="getting-started-kicker">Getting started</span>
-						<h1 id="first-job-title">Create your first backup job</h1>
-						<Link className="btn primary" to="/protect#jobs">Create a backup job</Link>
+						<span className="getting-started-kicker">{t("ui.pages.overview.getting.started")}</span>
+						<h1 id="first-job-title">{t("ui.pages.overview.create.your.first.backup.job")}</h1>
+						<Link className="btn primary" to="/protect#jobs">{t("ui.pages.overview.create.a.backup.job")}</Link>
 					</div>
 					<ol className="getting-started-steps">
 						<li>
-							<strong>Step 1: Choose what to protect.</strong>
-							<span>Select the files or folders you want Replicaro to back up.</span>
+							<strong>{t("ui.pages.overview.step.1.choose.what.to.protect")}</strong>
+							<span>{t("ui.pages.overview.select.the.files.or.folders.you.want.replicaro.to.back.up")}</span>
 						</li>
 						<li>
-							<strong>Step 2: Choose a vault.</strong>
-							<span>Select where Replicaro should save this job&apos;s backups.</span>
+							<strong>{t("ui.pages.overview.step.2.choose.a.vault")}</strong>
+							<span>{t("ui.overview.chooseBackupDestinationHelp")}</span>
 						</li>
 						<li>
-							<strong>Step 3: Pick a schedule.</strong>
-							<span>Choose when the job should run, then let Replicaro protect your data automatically.</span>
+							<strong>{t("ui.pages.overview.step.3.pick.a.schedule")}</strong>
+							<span>{t("ui.pages.overview.choose.when.the.job.should.run.then.let.replicaro.protect.your.data.au")}</span>
 						</li>
 					</ol>
 				</section>
 			) : (
-			<section className="protection-hero" aria-label={jobsRunning ? "Jobs are running" : hasIssues ? `${issueCount} issue${issueCount === 1 ? "" : "s"} need attention` : `${percent}% protected`}>
+			<section className="protection-hero" aria-label={jobsRunning ? t("ui.overview.jobsRunning") : hasIssues ? t("ui.overview.issueAttentionShort", { count: issueCount }) : t("ui.overview.percentProtected", { percent })}>
                 {jobsRunning ? (
 					<div className="protection-ring running">
 						{protectionRingContents}
 					</div>
 				) : hasIssues ? (
-                    <button type="button" className={`protection-ring ${ringTone}`} onClick={showIssues} aria-label="View dashboard issues">
+                    <button type="button" className={`protection-ring ${ringTone}`} onClick={showIssues} aria-label={t("ui.pages.overview.view.dashboard.issues")}>
                         {protectionRingContents}
                     </button>
                 ) : (
@@ -964,27 +966,27 @@ export default function Overview() {
                 <div className="protection-copy">
                     <h1>
                         {jobsRunning
-							? "Jobs are running…"
+							? t("ui.overview.jobsRunningEllipsis")
 							: hasIssues
-                            ? "There is a problem"
+                            ? t("ui.overview.thereIsProblem")
                             : percent === 100 && enabledJobs.length
-                              ? "Everything is protected"
-                              : <>{healthyJobs.length} of {enabledJobs.length} <Link to="/protect#jobs">jobs</Link> healthy</>}
+                              ? t("ui.overview.everythingProtected")
+                              : renderMessage("ui.overview.healthyJobs", { healthy: healthyJobs.length, total: enabledJobs.length, jobsLink: <Link to="/protect#jobs">{t("ui.pages.overview.jobs")}</Link> })}
                     </h1>
                     <p>{subcopy}</p>
                     {!jobsRunning && hasIssues && (
                         <button className={`btn ${issueTone}-outline issue-review-button`} disabled={reviewingIssues} onClick={() => void reviewIssues()}>
                             {reviewingIssues && <span className="spinner" />}
-                            Mark all as reviewed
+                            {t("ui.overview.markAllReviewed")}
                         </button>
                     )}
                     <div className="overview-stats">
-                        <div><Link to="/protect#vaults"><strong>{stats?.repositoryCount ?? repos.length}</strong><span>Vaults</span></Link></div>
-                        <div><Link to="/protect#jobs"><strong>{stats?.jobCount ?? jobs.length}</strong><span>Jobs</span></Link></div>
-                        <div className="ok"><strong>{stats?.successfulRuns ?? 0}</strong><span>Runs ok</span></div>
+                        <div><Link to="/protect#vaults"><strong>{formatDisplayNumber(stats?.repositoryCount ?? repos.length)}</strong><span>{t("ui.pages.overview.vaults")}</span></Link></div>
+                        <div><Link to="/protect#jobs"><strong>{formatDisplayNumber(stats?.jobCount ?? jobs.length)}</strong><span>{t("ui.pages.overview.jobs.2")}</span></Link></div>
+                        <div className="ok"><strong>{formatDisplayNumber(stats?.successfulRuns ?? 0)}</strong><span>{t("ui.pages.overview.runs.ok")}</span></div>
                         <div className={hasIssues ? issueTone : ""}>
                             <button type="button" className="overview-stat-link" onClick={showIssues} aria-controls="timeline">
-                                <strong>{stats?.failedRuns ?? 0}</strong><span>Issues</span>
+                                <strong>{formatDisplayNumber(stats?.failedRuns ?? 0)}</strong><span>{t("ui.pages.overview.issues")}</span>
                             </button>
                         </div>
                     </div>
@@ -993,19 +995,19 @@ export default function Overview() {
 			)}
 
             {activeOperations.length > 0 && (
-                <section className="active-operations" aria-label="Active operations">
+                <section className="active-operations" aria-label={t("ui.pages.overview.active.operations")}>
                     <div className="section-heading">
                         <div>
-                            <h2>Active now</h2>
-                            <p className="section-copy">Work currently running in the background.</p>
+                            <h2>{t("ui.pages.overview.active.now")}</h2>
+                            <p className="section-copy">{t("ui.pages.overview.work.currently.running.in.the.background")}</p>
                         </div>
-                        <span className="active-count">{activeOperations.length}</span>
+                        <span className="active-count">{formatDisplayNumber(activeOperations.length)}</span>
                     </div>
                     <div className="active-operation-list">
                         {activeOperations.map((operation) => (
 							// Use the shared tooltip so the complete operation title and log action
 							// have the same visual and keyboard treatment as other Replicaro hints.
-							<Tooltip key={operation.id} content={`View live log for - ${operation.title}`}><button type="button" className="active-operation" onClick={() => openOperationDetail(operation)} aria-label={`Open ${operation.title}`}>
+							<Tooltip key={operation.id} content={t("ui.overview.viewLiveLogFor", { title: operation.title })}><button type="button" className="active-operation" onClick={() => openOperationDetail(operation)} aria-label={t("ui.overview.openOperation", { title: operation.title })}>
                                 <span className="spinner" />
                                 <div>
                                     {operation.kind === "backup" ? (
@@ -1016,7 +1018,7 @@ export default function Overview() {
                                         <strong>{operation.title}</strong>
                                     )}
                                     <span>{operation.kind} · {operation.engine} · {activeOperationProgress(operation)}</span>
-									{activeRepositoryByID.get(operation.repositoryId || "")?.coldStorage && ["restore", "check", "maintenance"].includes(operation.kind) && <span>Cold storage retrieval can take hours or days. Replicaro is waiting for native Restic. Native prune may thaw, download, repack, re-upload, and delete archived packs; provider latency, cost, minimum-duration, and temporary-copy rules vary. Cancellation or shutdown stops the local process, but provider restore requests may continue.</span>}
+									{activeRepositoryByID.get(operation.repositoryId || "")?.coldStorage && ["restore", "check", "maintenance"].includes(operation.kind) && <span>{t("ui.pages.overview.cold.storage.retrieval.can.take.hours.or.days.replicaro.is.waiting.for")}</span>}
                                 </div>
 							</button></Tooltip>
                         ))}
@@ -1036,20 +1038,20 @@ export default function Overview() {
 							<span>{detailedOperation.kind} · {detailedOperation.engine} · {activeOperationProgress(detailedOperation)}</span>
 						</div>
 						{(detailedOperation.steps ?? []).length > 0 && (
-							<div className="operation-detail-steps" aria-label="Operation steps">
+							<div className="operation-detail-steps" aria-label={t("ui.pages.overview.operation.steps")}>
 								{detailedOperation.steps?.map((step) => (
 									<div key={step.id}><strong>{step.kind.replaceAll("_", " ")}</strong><span>{step.status}</span></div>
 								))}
 							</div>
 						)}
-						<div className="modal-section-label">Live log</div>
-                        {!detailedOperationActive && <button type="button" className="text-button" aria-pressed={showRawLog} onClick={() => setShowRawLog((raw) => !raw)}>{showRawLog ? "Show readable log" : "Show raw log"}</button>}
+						<div className="modal-section-label">{t("ui.pages.overview.live.log")}</div>
+                        {!detailedOperationActive && <button type="button" className="text-button" aria-pressed={showRawLog} onClick={() => setShowRawLog((raw) => !raw)}>{showRawLog ? t("ui.pages.overview.show.readable.log") : t("ui.pages.overview.show.raw.log")}</button>}
 						{detailedOperationActive ? !operationDetail ? (
-							<p className="muted">Waiting for output…</p>
+							<p className="muted">{t("ui.pages.overview.waiting.for.output")}</p>
 						) : !operationDetail.live.available ? (
-							<p className="muted">Live output is unavailable for this operation.</p>
+							<p className="muted">{t("ui.pages.overview.live.output.is.unavailable.for.this.operation")}</p>
 						) : operationDetail.live.entries.length === 0 ? (
-							<p className="muted">Waiting for output…</p>
+							<p className="muted">{t("ui.pages.overview.waiting.for.output")}</p>
 						) : (
 							<pre className="output operation-live-log" aria-live="polite">{[
 								...(operationDetail.live.truncated ? ["[Earlier live output omitted]"] : []),
@@ -1058,15 +1060,15 @@ export default function Overview() {
 						) : (
 							<>
 								<pre className="output operation-live-log">{completedOperationLogLoadState === "failed"
-									? "Log could not be loaded."
+									? t("ui.pages.overview.log.could.not.be.loaded")
 									: completedOperationLogLoadState === "pending"
-										? "Loading log…"
-										: completedOperationLog ? showRawLog ? completedOperationLog : readableLog(completedOperationLog, detailedOperation, undefined, completedOperationLogPage) : "(no output recorded)"}</pre>
+										? t("ui.pages.overview.loading.log")
+										: completedOperationLog ? showRawLog ? completedOperationLog : readableLog(completedOperationLog, detailedOperation, undefined, completedOperationLogPage) : t("ui.pages.overview.no.output.recorded")}</pre>
 								{showRawLog && operationLogHasMultiplePages(completedOperationLogPage) && completedOperationLogPage && (
 									<div className="log-page-controls">
-										<button type="button" className="btn" disabled={completedOperationLogPage.offset === 0 || completedOperationLogLoadState === "pending"} onClick={() => void loadCompletedOperationLogPage(completedOperationLogPage.previousOffset)}>Previous log page</button>
+										<button type="button" className="btn" disabled={completedOperationLogPage.offset === 0 || completedOperationLogLoadState === "pending"} onClick={() => void loadCompletedOperationLogPage(completedOperationLogPage.previousOffset)}>{t("ui.pages.overview.previous.log.page")}</button>
 										<span className="log-page-size">{operationLogPageLabel(completedOperationLogPage)}</span>
-										<button type="button" className="btn" disabled={completedOperationLogPage.eof || completedOperationLogLoadState === "pending"} onClick={() => void loadCompletedOperationLogPage(completedOperationLogPage.nextOffset)}>Next log page</button>
+										<button type="button" className="btn" disabled={completedOperationLogPage.eof || completedOperationLogLoadState === "pending"} onClick={() => void loadCompletedOperationLogPage(completedOperationLogPage.nextOffset)}>{t("ui.pages.overview.next.log.page")}</button>
 									</div>
 								)}
 							</>
@@ -1074,8 +1076,8 @@ export default function Overview() {
 						{cancelError && <div className="inline-error">{cancelError}</div>}
 						{detailedOperationActive && (canceling || (operationDetail?.live.cancelable && !cancelNeedsFreshSnapshot)) && (
 							<div className="modal-footer">
-								{canceling ? <span className="muted">Canceling…</span> : (
-									<button type="button" className="btn danger-outline" disabled={cancelSubmitting} onClick={() => setConfirmCancel(true)}>Cancel job</button>
+								{canceling ? <span className="muted">{t("ui.pages.overview.canceling")}</span> : (
+									<button type="button" className="btn danger-outline" disabled={cancelSubmitting} onClick={() => setConfirmCancel(true)}>{t("ui.pages.overview.cancel.job")}</button>
 								)}
 							</div>
 						)}
@@ -1084,26 +1086,26 @@ export default function Overview() {
 			)}
 
 			{confirmCancel && selectedActiveOperation && (
-				<Modal title="Cancel operation?" onClose={() => { if (!cancelSubmitting) setConfirmCancel(false); }}>
-					<p className="muted">This stops future work and the running local process. Work already completed will not be undone.</p>
+				<Modal title={t("ui.pages.overview.cancel.operation")} onClose={() => { if (!cancelSubmitting) setConfirmCancel(false); }}>
+					<p className="muted">{t("ui.pages.overview.this.stops.future.work.and.the.running.local.process.work.already.comp")}</p>
 					<div className="modal-footer">
-						<button type="button" className="btn" disabled={cancelSubmitting} onClick={() => setConfirmCancel(false)}>Keep running</button>
-						<button type="button" className="btn danger" disabled={cancelSubmitting} onClick={() => void submitCancellation()}>{cancelSubmitting && <span className="spinner" />}Cancel operation</button>
+						<button type="button" className="btn" disabled={cancelSubmitting} onClick={() => setConfirmCancel(false)}>{t("ui.pages.overview.keep.running")}</button>
+						<button type="button" className="btn danger" disabled={cancelSubmitting} onClick={() => void submitCancellation()}>{cancelSubmitting && <span className="spinner" />}{t("ui.pages.overview.cancel.operation.2")}</button>
 					</div>
 				</Modal>
 			)}
 
             <section className="timeline-section" id="timeline">
                 <div className="section-heading timeline-heading">
-                    <h2>Timeline</h2>
-                    <div className="filter-pills" role="group" aria-label="Timeline filters">
+                    <h2>{t("ui.pages.overview.timeline")}</h2>
+                    <div className="filter-pills" role="group" aria-label={t("ui.pages.overview.timeline.filters")}>
                         {timelineFilters.map(({ value, label }) => (
                             <button
                                 key={value}
                                 className={filter === value ? "active" : ""}
                                 onClick={() => selectFilter(value)}
                             >
-                                {label}
+                                {label()}
                             </button>
                         ))}
                     </div>
@@ -1112,8 +1114,8 @@ export default function Overview() {
                 {issuesLoading && filtered.length === 0 ? (
                     <Loading />
                 ) : filtered.length === 0 ? (
-                    <EmptyState icon="history" title="Nothing in this view">
-                        <p>Completed operations and system activity will appear here.</p>
+                    <EmptyState icon="history" title={t("ui.pages.overview.nothing.in.this.view")}>
+                        <p>{t("ui.pages.overview.completed.operations.and.system.activity.will.appear.here")}</p>
                     </EmptyState>
                 ) : (
                     <div className="timeline-list">
@@ -1127,28 +1129,28 @@ export default function Overview() {
                                 <div className="timeline-line">
                                     <time>{eventTime(event.timestamp)}</time>
                                     <span className="timeline-tag">{event.tag}</span>
-                                    {event.isNew && <span className="new-issue-badge">New</span>}
+                                    {event.isNew && <span className="new-issue-badge">{t("ui.pages.overview.new")}</span>}
                                     <span className="timeline-title">{event.title}</span>
                                     {event.outputAvailable && (
                                         <button
                                             className="text-button"
                                             onClick={() => void toggleTimelineOutput(event)}
                                         >
-											{openOutput === event.id ? "hide log" : "log"}
+											{openOutput === event.id ? t("ui.pages.overview.hide.log") : t("ui.pages.overview.log")}
                                         </button>
                                     )}
                                 </div>
 								{openOutput === event.id && (
 									<div>
-										<button type="button" className="text-button" aria-pressed={showRawLog} onClick={() => setShowRawLog((raw) => !raw)}>{showRawLog ? "Show readable log" : "Show raw log"}</button>
+										<button type="button" className="text-button" aria-pressed={showRawLog} onClick={() => setShowRawLog((raw) => !raw)}>{showRawLog ? t("ui.pages.overview.show.readable.log") : t("ui.pages.overview.show.raw.log")}</button>
                                         <pre className="output timeline-output">{openOutputLoadFailed
-											? "Log could not be loaded."
-											: openOutputLoading ? "Loading log…" : openOutputText ? showRawLog ? openOutputText : readableLog(openOutputText, operations.find(operation => operation.id === event.operationID), event, openOutputPage) : "(no output recorded)"}</pre>
+											? t("ui.pages.overview.log.could.not.be.loaded")
+											: openOutputLoading ? t("ui.pages.overview.loading.log") : openOutputText ? showRawLog ? openOutputText : readableLog(openOutputText, operations.find(operation => operation.id === event.operationID), event, openOutputPage) : t("ui.pages.overview.no.output.recorded")}</pre>
 										{showRawLog && event.operationID && operationLogHasMultiplePages(openOutputPage) && openOutputPage && (
 											<div className="log-page-controls">
-												<button type="button" className="btn" disabled={openOutputPage.offset === 0} onClick={() => void loadTimelineOperationLogPage(event.operationID!, openOutputPage.previousOffset)}>Previous log page</button>
+												<button type="button" className="btn" disabled={openOutputPage.offset === 0} onClick={() => void loadTimelineOperationLogPage(event.operationID!, openOutputPage.previousOffset)}>{t("ui.pages.overview.previous.log.page")}</button>
 												<span className="log-page-size">{operationLogPageLabel(openOutputPage)}</span>
-												<button type="button" className="btn" disabled={openOutputPage.eof} onClick={() => void loadTimelineOperationLogPage(event.operationID!, openOutputPage.nextOffset)}>Next log page</button>
+												<button type="button" className="btn" disabled={openOutputPage.eof} onClick={() => void loadTimelineOperationLogPage(event.operationID!, openOutputPage.nextOffset)}>{t("ui.pages.overview.next.log.page")}</button>
 											</div>
 										)}
 									</div>
@@ -1161,7 +1163,7 @@ export default function Overview() {
                 {!issuesLoading && ((filter === "issues" && issuesHasMore) || (filter !== "issues" && visible < filtered.length)) && (
                     <button className="btn load-older" disabled={issuesLoading} onClick={loadOlder}>
                         {issuesLoading && <span className="spinner" />}
-                        Load older events
+                        {t("ui.overview.loadOlderEvents")}
                     </button>
                 )}
             </section>

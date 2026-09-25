@@ -1,3 +1,4 @@
+import { formatDisplayDateTime, formatDisplayNumber, getEffectiveLocale, knownMessage, renderMessage, t } from "../i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 
@@ -64,7 +65,7 @@ import {
 	} from "../services/api";
 import { APIError } from "../services/api";
 import type { ExistingVaultStorageInput, JobInput, ManualTargetAdmissionResult, RcloneAuthStatus, RepositoryConnectionIntent, RepositoryCreationIntent, VaultOwnershipStatus, VaultPasswordChangeResult, VaultProfileSyncStatus, VaultProgressRecord } from "../services/api";
-import { backupTargetIsActive } from "../services/backupJobs";
+import { backupTargetIsActive, nextSnapshotTooltip } from "../services/backupJobs";
 import { validVaultPassword } from "../services/vaultPassword";
 import type {
     BackupJob,
@@ -390,8 +391,12 @@ function VaultActivityLog({ records }: { records: VaultProgressRecord[] }) {
 	const container = useRef<HTMLElement | null>(null);
 	const lines = useRef<HTMLDivElement | null>(null);
 	const dialogWasScrolled = useRef(false);
+	// Native records remain in the request capture and result path. This small
+	// activity view is a stage-only progress account, not another native log.
+	const stages = records.filter((record) => record.type === "stage");
+	const hasStages = stages.length > 0;
 	useEffect(() => {
-		if (!records.length) return;
+		if (!hasStages) return;
 		if (lines.current) lines.current.scrollTop = lines.current.scrollHeight;
 		if (!dialogWasScrolled.current) {
 			const dialog = container.current?.closest<HTMLElement>('[role="dialog"]');
@@ -403,11 +408,16 @@ function VaultActivityLog({ records }: { records: VaultProgressRecord[] }) {
 				dialogWasScrolled.current = true;
 			}
 		}
-	}, [records]);
-	return <aside ref={container} className="vault-work-log" role="log" aria-label="Vault activity">
-		<strong>Vault activity</strong>
-		<div ref={lines} className="vault-work-log-lines">{records.map((record, index) => <div key={index} className={record.type === "stage" ? "vault-work-stage" : "vault-work-native"}>{record.text}</div>)}</div>
+	}, [records, hasStages]);
+	return <aside ref={container} className="vault-work-log" role="log" aria-label={t("ui.pages.protect.vault.activity")}>
+		<strong>{t("ui.pages.protect.vault.activity")}</strong>
+		<div ref={lines} className={`vault-work-log-lines${stages.length ? "" : " is-empty"}`}>{stages.map((record, index) => <div key={index} className="vault-work-stage">{record.text}</div>)}</div>
+		<span className="spinner vault-work-log-spinner" aria-hidden="true" />
 	</aside>;
+}
+
+function VaultOverlayIdentity({ name }: { name: string }) {
+	return <div className="vault-overlay-identity"><span className="vault-glyph" aria-hidden="true"><Icon name="shield" size={18} /></span><strong>{name}</strong></div>;
 }
 
 const vaultMutationBlocksCard = (mutation: VaultMutation) =>
@@ -417,13 +427,13 @@ const vaultMutationBlocksCard = (mutation: VaultMutation) =>
 
 function VaultPasswordResult({ result }: { result: VaultPasswordChangeResult }) {
 	return <div className="vault-password-result">
-		<span><b>Phase:</b> {result.phase.replaceAll("_", " ")}</span>
-		<span><b>Native {result.native.engine} result:</b> {result.native.status || "unresolved"}{result.native.output ? ` — ${formatNativeLogText(result.native.engine, "password_change", result.native.output)}` : ""}</span>
-		<span><b>Protected recovery metadata:</b> {result.sidecarStatus}</span>
-		<span><b>Local cleanup:</b> {result.cleanupPending ? "pending" : "not pending"}</span>
+		<span><b>{t("ui.pages.protect.phase")}</b> {result.phase.replaceAll("_", " ")}</span>
+		<span><b>{t("ui.protect.nativeResultLabel", { engine: result.native.engine })}</b> {result.native.status || t("ui.protect.unresolved")}{result.native.output ? ` — ${formatNativeLogText(result.native.engine, "password_change", result.native.output)}` : ""}</span>
+		<span><b>{t("ui.pages.protect.protected.recovery.metadata")}</b> {result.sidecarStatus}</span>
+		<span><b>{t("ui.pages.protect.local.cleanup")}</b> {result.cleanupPending ? t("ui.protect.pending") : t("ui.protect.notPending")}</span>
 		<span>{result.message}</span>
 		{result.resticKeyTruth && <span>{result.resticKeyTruth}</span>}
-		{result.native.mutationDisposition === "rejected_before_mutation" && !result.resticKeyTruth && <span>The selected password was not changed.</span>}
+		{result.native.mutationDisposition === "rejected_before_mutation" && !result.resticKeyTruth && <span>{t("ui.pages.protect.the.selected.password.was.not.changed")}</span>}
 	</div>;
 }
 
@@ -433,34 +443,35 @@ function VaultMutationOverlay({ mutation, onReopenSettings }: { mutation: VaultM
 	const retainedPasswordRecovery = mutation.kind === "settings" ? mutation.retainedPasswordRecovery : undefined;
 	const cleanupNotice = mutation.kind === "password" && mutation.status === "recovery" && result?.phase === "cleanup_pending";
 	return <div className={`vault-mutation-overlay${cleanupNotice ? " is-nonblocking" : ""}`} role={mutation.status === "error" ? "alert" : "status"} aria-live="polite">
-		{active && <span className="spinner" aria-hidden="true" />}
-		<strong>{mutation.kind === "settings"
-			? mutation.status === "running" ? "Saving vault settings…"
-				: mutation.status === "succeeded" ? "Vault settings saved."
-					: "Vault settings could not be saved."
-			: mutation.status === "running" ? "Changing vault password…"
-				: mutation.status === "checking" ? "Checking password-change status…"
-					: mutation.status === "recovery" ? "Password change needs attention."
-						: mutation.status === "uncertain" ? "Password change outcome is uncertain."
-							: mutation.status === "succeeded" ? "Vault password change completed."
-								: "Vault password change did not finish."}</strong>
+		<VaultOverlayIdentity name={mutation.repositoryName} />
+		<strong className="vault-overlay-status">{mutation.kind === "settings"
+			? mutation.status === "running" ? t("ui.pages.protect.saving.vault.settings")
+				: mutation.status === "succeeded" ? t("ui.pages.protect.vault.settings.saved")
+					: t("ui.pages.protect.vault.settings.could.not.be.saved")
+			: mutation.status === "running" ? t("ui.pages.protect.changing.vault.password")
+				: mutation.status === "checking" ? t("ui.pages.protect.checking.password.change.status")
+					: mutation.status === "recovery" ? t("ui.pages.protect.password.change.needs.attention")
+						: mutation.status === "uncertain" ? t("ui.pages.protect.password.change.outcome.is.uncertain")
+							: mutation.status === "succeeded" ? t("ui.pages.protect.vault.password.change.completed")
+								: t("ui.pages.protect.vault.password.change.did.not.finish")}</strong>
+		{active && <><span>{t("ui.pages.protect.you.can.continue.using.replicaro.while.this.finishes")}</span><span className="spinner" aria-hidden="true" /></>}
 		{mutation.error && <span className={mutation.status === "uncertain" ? "vault-mutation-uncertain" : "vault-mutation-error"}>{mutation.error}</span>}
 		{result && <VaultPasswordResult result={result} />}
 		{!active && <div className="vault-mutation-actions">
-			{(mutation.status === "error" || mutation.status === "uncertain") && <button className="btn sm" onClick={() => mutation.kind === "settings" ? settleVaultSettingsPresentation(mutation.repositoryId, mutation.generation) : clearVaultMutation(mutation.repositoryId, mutation.generation)}>Dismiss</button>}
-			{mutation.kind === "settings" && mutation.status === "error" && <button className="btn sm" onClick={() => retryVaultSettingsMutation(mutation.repositoryId)}>Retry save</button>}
-			{mutation.kind === "settings" && mutation.status === "error" && <button className="btn sm" onClick={() => onReopenSettings(mutation.repositoryId, mutation.generation)}>Reopen settings</button>}
-			{mutation.kind === "password" && mutation.status === "recovery" && <button className="btn sm" onClick={() => continueVaultPasswordMutation(mutation.repositoryId)}>Continue password change</button>}
+			{(mutation.status === "error" || mutation.status === "uncertain") && <button className="btn sm" onClick={() => mutation.kind === "settings" ? settleVaultSettingsPresentation(mutation.repositoryId, mutation.generation) : clearVaultMutation(mutation.repositoryId, mutation.generation)}>{t("ui.pages.protect.dismiss")}</button>}
+			{mutation.kind === "settings" && mutation.status === "error" && <button className="btn sm" onClick={() => retryVaultSettingsMutation(mutation.repositoryId)}>{t("ui.pages.protect.retry.save")}</button>}
+			{mutation.kind === "settings" && mutation.status === "error" && <button className="btn sm" onClick={() => onReopenSettings(mutation.repositoryId, mutation.generation)}>{t("ui.pages.protect.reopen.settings")}</button>}
+			{mutation.kind === "password" && mutation.status === "recovery" && <button className="btn sm" onClick={() => continueVaultPasswordMutation(mutation.repositoryId)}>{t("ui.pages.protect.continue.password.change")}</button>}
 		</div>}
 		{mutation.kind === "settings" && mutation.status !== "running" && retainedPasswordRecovery?.result && <div className="vault-retained-password-recovery">
-			<strong>Password change still needs attention.</strong>
+			<strong>{t("ui.pages.protect.password.change.still.needs.attention")}</strong>
 			<VaultPasswordResult result={retainedPasswordRecovery.result} />
 			<div className="vault-mutation-actions"><button className="btn sm" onClick={() => runVaultPasswordMutation(
 				mutation.repositoryId,
 				retainedPasswordRecovery.repositoryName,
 				() => retryVaultPasswordChange(mutation.repositoryId),
 				mutation.generation,
-			)}>Continue password change</button></div>
+			)}>{t("ui.pages.protect.continue.password.change")}</button></div>
 		</div>}
 	</div>;
 }
@@ -539,12 +550,12 @@ function availableImportedVaultName(baseName: string, vaultID: string, repositor
 }
 const MAX_CUSTOM_SCHEDULE_MINUTES = 153_722_867;
 const EXAMPLE_PREFIX = "example: ";
-const integrityCheckHelp = "Checks the integrity of the snapshots stored in this vault. The whole vault is downloaded and tested for corruption.";
-const coldStorageIntegrityHelp = "Replicaro disables integrity checks for all cold storage vaults to avoid you incurring excessive costs. Use hot storage if you need integrity checks.";
-const connectAccessReminder = "Remember to disable other software from accessing this vault. Only Replicaro should now be using this vault.";
+const integrityCheckHelp = () => t("ui.protect.help.integrityCheckHelp");
+const coldStorageIntegrityHelp = () => t("ui.protect.help.coldStorageIntegrityHelp");
+const connectAccessReminder = () => t("ui.protect.disableOtherSoftwareReminder");
 const profileDateLabel = (value: string) => {
 	const date = new Date(value);
-	return Number.isNaN(date.getTime()) ? "Unknown date" : date.toLocaleString(undefined, {
+	return Number.isNaN(date.getTime()) ? t("ui.date.unknownDate") : formatDisplayDateTime(date, {
 		month: "short",
 		day: "numeric",
 		year: "numeric",
@@ -552,18 +563,11 @@ const profileDateLabel = (value: string) => {
 		minute: "2-digit",
 	});
 };
-const nextSnapshotTooltip = (job: BackupJob) => {
-	if (!job.enabled) return "This job is disabled, so no snapshot is scheduled.";
-	if (job.schedule === "manual") return "This job runs manually, so no snapshot is scheduled.";
-	const relative = timeAgo(job.nextRun);
-	if (relative === "—") return "The next snapshot time is unavailable.";
-	return relative.startsWith("in ") ? `Next snapshot ${relative}.` : "The next snapshot is due now.";
-};
-const maintenanceHelp = "Runs maintenance to compact the vault and reclaim space from snapshots that have been marked for deletion.";
-const objectLockMaintenanceHelp = "Replicaro requires the space reclamation schedule to run at least one day sooner than the object lock duration. Maintenance options that do not meet this requirement are unavailable, and Replicaro automatically selects the longest eligible schedule when necessary.";
-const pausedObjectLockMaintenanceHelp = "Manual is available while object lock is paused. When object lock is resumed, Replicaro automatically selects the longest eligible schedule if the current choice is unavailable.";
-const objectLockForwardHelp = "These settings apply to new snapshots. Existing locks are never shortened or removed. 2 days is the minimum allowed duration.";
-const objectLockTransitionHelp = "After enrollment, the duration can only be increased. S3 Governance can be changed to Compliance, but Compliance cannot be changed to Governance.";
+const maintenanceHelp = () => t("ui.protect.help.maintenanceHelp");
+const objectLockMaintenanceHelp = () => t("ui.protect.help.objectLockMaintenanceHelp");
+const pausedObjectLockMaintenanceHelp = () => t("ui.protect.help.pausedObjectLockMaintenanceHelp");
+const objectLockForwardHelp = () => t("ui.protect.help.objectLockForwardHelp");
+const objectLockTransitionHelp = () => t("ui.protect.help.objectLockTransitionHelp");
 
 const emptyObjectLock = (): ObjectLockSettings => ({
 	enrolled: false, paused: false, mode: "", durationValue: 0, durationUnit: "",
@@ -610,14 +614,13 @@ function validObjectLockSettings(settings: ObjectLockSettings, schedule: string,
 	}
 	return true;
 }
-const coldStorageProviderGuidance = [
-	"Cold storage means retrieval is not instant; restores can take hours or days or longer. Replicaro places metadata (including the vault.replicaro object) in hot storage. The size of metadata is usually very small, so the cost of using hot storage for metadata is usually minimal. Metadata must remain in hot storage to ensure backup jobs complete successfully. Data packs, which use the bulk of storage space, are put into cold storage.",
-	"If you have bucket lifecycle rules set up at your provider, it is highly recommended to disable those rules so that they do not accidentally move metadata to cold storage. Backups will break if metadata is put in cold storage.",
-	`Each cold storage provider has its own costs related to access, retrieval, and deletion of data in cold storage. ${coldStorageIntegrityHelp} Space reclamation remains set to the default "daily"; if you want to disable space reclamation, set it to "manual" from Advanced Settings below.`,
+const coldStorageProviderGuidance = () => [
+    t("ui.protect.coldGuidance1", { sidecar: "vault.replicaro" }),
+    t("ui.protect.coldGuidance2"),
+    t("ui.protect.coldGuidance3"),
 ];
-const coldStorageArchiveClassHelp = "This choice cannot be changed once the vault is created. It is recommended to leave this as GLACIER instead of DEEP_ARCHIVE because most non-AWS S3-compatible providers support GLACIER but not DEEP_ARCHIVE. If you use DEEP_ARCHIVE and your provider does not support it, backups will fail on the first run. If that happens, remove the vault from Replicaro, manually delete the Replicaro vault data from the remote location (Replicaro does not delete remote data when a vault is removed, so you need to do it manually), and then create a new cold storage vault that leaves it at the GLACIER storage class.";
-const coldStorageCancellationGuidance = "Cancellation or shutdown stops the local Restic process, but provider restore requests may continue.";
-const vaultPasswordHelp = "Your password is never stored in the vault, and the password never leaves your computer. Only you know your password. Do not forget your password because it cannot be recovered or reset if you forget.";
+const coldStorageArchiveClassHelp = () => t("ui.protect.help.coldStorageArchiveClassHelp", { glacier: "GLACIER", deepArchive: "DEEP_ARCHIVE" });
+const vaultPasswordHelp = () => t("ui.protect.help.vaultPasswordHelp");
 
 function normalizedRcloneFolderName(value: string) {
 	return value.trim().normalize("NFC");
@@ -662,12 +665,14 @@ function providerPresentationDescription(
 	fallback: string,
 	engine?: string,
 ) {
-	if (!engine) return fallback;
-	return engineCatalog
+	const localized = knownMessage(`ui.integration.${connector}.description`, fallback);
+	if (!engine) return localized;
+	const engineDescription = engineCatalog
 		.filter((descriptor) => descriptor.id === engine)
 		.flatMap((descriptor) => descriptor.providers)
 		.find((provider) => provider.id === connector && provider.supported)
-		?.description || fallback;
+		?.description;
+	return engineDescription && engineDescription !== fallback ? engineDescription : localized;
 }
 
 // Certification status must never be shown in the end-user UI. Runtime
@@ -685,19 +690,19 @@ function examplePlaceholder(value?: string) {
 type JobSort = "newest" | "oldest" | "name-asc" | "name-desc";
 type VaultSort = "newest" | "oldest" | "size" | "name-asc" | "name-desc";
 
-const JOB_SORT_OPTIONS: ReadonlyArray<{ value: JobSort; label: string }> = [
-    { value: "newest", label: "Newest (last run)" },
-    { value: "oldest", label: "Oldest (last run)" },
-    { value: "name-asc", label: "Name A–Z" },
-    { value: "name-desc", label: "Name Z–A" },
+const JOB_SORT_OPTIONS: ReadonlyArray<{ value: JobSort; label: () => string }> = [
+    { value: "newest", label: () => t("ui.sort.newestLastRun") },
+    { value: "oldest", label: () => t("ui.sort.oldestLastRun") },
+    { value: "name-asc", label: () => t("ui.sort.nameAscending") },
+    { value: "name-desc", label: () => t("ui.sort.nameDescending") },
 ];
 
-const VAULT_SORT_OPTIONS: ReadonlyArray<{ value: VaultSort; label: string }> = [
-    { value: "newest", label: "Newest" },
-    { value: "oldest", label: "Oldest" },
-    { value: "size", label: "Size (largest)" },
-    { value: "name-asc", label: "Name A–Z" },
-    { value: "name-desc", label: "Name Z–A" },
+const VAULT_SORT_OPTIONS: ReadonlyArray<{ value: VaultSort; label: () => string }> = [
+    { value: "newest", label: () => t("ui.sort.newest") },
+    { value: "oldest", label: () => t("ui.sort.oldest") },
+    { value: "size", label: () => t("ui.sort.largestSize") },
+    { value: "name-asc", label: () => t("ui.sort.nameAscending") },
+    { value: "name-desc", label: () => t("ui.sort.nameDescending") },
 ];
 
 function readStoredPageSize<T extends number>(key: string, options: readonly T[], fallback: T): T {
@@ -777,12 +782,12 @@ function sortVaults(repositories: Repository[], sort: VaultSort) {
         .map(({ repository }) => repository);
 }
 
-const customScheduleUnits: Record<string, { label: string; minutes: number; max: number } | undefined> = {
-	custom: { label: "Minutes", minutes: 1, max: MAX_CUSTOM_SCHEDULE_MINUTES },
-	"custom-hours": { label: "Hours", minutes: 60, max: Math.floor(MAX_CUSTOM_SCHEDULE_MINUTES / 60) },
-	"custom-days": { label: "Days", minutes: 1440, max: Math.floor(MAX_CUSTOM_SCHEDULE_MINUTES / 1440) },
-	"custom-weeks": { label: "Weeks", minutes: 10080, max: Math.floor(MAX_CUSTOM_SCHEDULE_MINUTES / 10080) },
-	"custom-months": { label: "Months", minutes: 0, max: Math.floor(MAX_CUSTOM_SCHEDULE_MINUTES / (31 * 1440)) },
+const customScheduleUnits: Record<string, { label: () => string; minutes: number; max: number } | undefined> = {
+	custom: { label: () => t("ui.protect.minutesUnit"), minutes: 1, max: MAX_CUSTOM_SCHEDULE_MINUTES },
+	"custom-hours": { label: () => t("ui.protect.hoursUnit"), minutes: 60, max: Math.floor(MAX_CUSTOM_SCHEDULE_MINUTES / 60) },
+	"custom-days": { label: () => t("ui.protect.daysUnit"), minutes: 1440, max: Math.floor(MAX_CUSTOM_SCHEDULE_MINUTES / 1440) },
+	"custom-weeks": { label: () => t("ui.protect.weeksUnit"), minutes: 10080, max: Math.floor(MAX_CUSTOM_SCHEDULE_MINUTES / 10080) },
+	"custom-months": { label: () => t("ui.protect.monthsUnit"), minutes: 0, max: Math.floor(MAX_CUSTOM_SCHEDULE_MINUTES / (31 * 1440)) },
 };
 
 function customScheduleError(form: { schedule: string; customInterval: string }) {
@@ -790,11 +795,14 @@ function customScheduleError(form: { schedule: string; customInterval: string })
 	if (!unit) return null;
 	const count = Number(form.customInterval);
 	if (/^\d+$/.test(form.customInterval) && Number.isSafeInteger(count) && count >= 1 && count <= unit.max) return null;
-	return `Custom schedule must be a whole number from 1 to ${unit.max.toLocaleString("en-US")} ${unit.label.toLowerCase()}.`;
+	const locale = getEffectiveLocale();
+	// German unit names are nouns and keep their capital letters mid-sentence.
+	const unitLabel = locale === "de" ? unit.label() : unit.label().toLocaleLowerCase(locale);
+	return t("ui.protect.customScheduleError", { max: unit.max.toLocaleString(locale), unit: unitLabel });
 }
 
 const MAX_CRON_EXPRESSION_LENGTH = 256;
-const cronScheduleHelp = "This is cron-style scheduling. If you do not know what cron is, you should not use this schedule option. Cron schedules use this computer’s local time.";
+const cronScheduleHelp = () => t("ui.protect.help.cronScheduleHelp");
 
 function normalizedCronExpression(value: string) {
 	const expression = value.trim().split(/\s+/).filter(Boolean).join(" ");
@@ -815,31 +823,31 @@ function scheduleValue(form: { schedule: string; customInterval: string; cronExp
 
 function scheduleHelp(schedule: string) {
 	return schedule === "manual"
-		? "Replicaro will only run this job when you start it manually."
-		: "Replicaro will automatically run this job based on your selected schedule.";
+		? t("ui.protect.manualScheduleHelp")
+		: t("ui.protect.automaticScheduleHelp");
 }
 
 const schedulePresets = [
-    ["manual", "Manual only"],
-    ["hourly", "Every hour"],
-    ["daily", "Every day"],
-    ["weekly", "Every week"],
-    ["monthly", "Every month"],
-    ["custom", "Every N minutes…"],
-	["custom-hours", "Every N hours…"],
-	["custom-days", "Every N days…"],
-	["custom-weeks", "Every N weeks…"],
-	["custom-months", "Every N months…"],
-	["cron", "Cron-style Scheduling"],
+    ["manual", () => t("ui.schedule.manualOnly")],
+    ["hourly", () => t("ui.schedule.everyHour")],
+    ["daily", () => t("ui.schedule.everyDay")],
+    ["weekly", () => t("ui.schedule.everyWeek")],
+    ["monthly", () => t("ui.schedule.everyMonth")],
+	["custom", () => t("ui.schedule.everyNMinutes")],
+	["custom-hours", () => t("ui.schedule.everyNHours")],
+	["custom-days", () => t("ui.schedule.everyNDays")],
+	["custom-weeks", () => t("ui.schedule.everyNWeeks")],
+	["custom-months", () => t("ui.schedule.everyNMonths")],
+	["cron", () => t("ui.schedule.cronStyle")],
 ] as const;
 
 const retentionPresets = [
-	["0", "Keep all snapshots"],
-	["10", "Keep 10 latest snapshots"],
-	["50", "Keep 50 latest snapshots"],
-	["100", "Keep 100 latest snapshots"],
-	["1000", "Keep 1,000 latest snapshots"],
-	["custom", "Keep N latest snapshots..."],
+	["0", () => t("ui.retention.keepAll")],
+	["10", () => t("ui.retention.keep10")],
+	["50", () => t("ui.retention.keep50")],
+	["100", () => t("ui.retention.keep100")],
+	["1000", () => t("ui.retention.keep1000")],
+	["custom", () => t("ui.retention.keepN")],
 ] as const;
 
 const fixedRetentionValues = new Set<string>(retentionPresets.slice(0, -1).map(([value]) => value));
@@ -858,10 +866,10 @@ function parsedRetention(value: string, optional = false) {
 }
 
 const careSchedules = [
-    ["manual", "Manual only"],
-    ["daily", "Daily"],
-    ["weekly", "Weekly"],
-    ["monthly", "Monthly"],
+    ["manual", () => t("ui.schedule.manualOnly")],
+    ["daily", () => t("ui.care.daily")],
+    ["weekly", () => t("ui.care.weekly")],
+    ["monthly", () => t("ui.care.monthly")],
 ] as const;
 
 interface JobForm {
@@ -1033,6 +1041,14 @@ function parsedEngineOptions(value: string) {
 	return value.split("\n").map((option) => option.trim()).filter(Boolean);
 }
 
+const retentionTierLabels: Record<string, () => string> = {
+	hourly: () => t("ui.protect.retentionTier.hourly"),
+	daily: () => t("ui.protect.retentionTier.daily"),
+	weekly: () => t("ui.protect.retentionTier.weekly"),
+	monthly: () => t("ui.protect.retentionTier.monthly"),
+	yearly: () => t("ui.protect.retentionTier.yearly"),
+};
+
 function retentionReviewSummary(form: Pick<JobForm, "retention" | "retentionHourly" | "retentionDaily" | "retentionWeekly" | "retentionMonthly" | "retentionYearly">) {
 	const tiers = [
 		["hourly", form.retentionHourly],
@@ -1043,10 +1059,10 @@ function retentionReviewSummary(form: Pick<JobForm, "retention" | "retentionHour
 	].filter(([, value]) => Boolean(value));
 	if (Number(form.retention) === 0) {
 		return tiers.length === 0
-			? "Keep all snapshots. No tier values are configured."
-			: `Keep all snapshots. Configured tier values are inactive while Keep all snapshots is selected: ${tiers.map(([tier, value]) => `${tier} ${value}`).join(", ")}.`;
+			? t("ui.protect.keepAllNoTiers")
+			: t("ui.protect.keepAllInactiveTiers", { tiers: tiers.map(([tier, value]) => `${retentionTierLabels[String(tier)]()} ${value}`).join(", ") });
 	}
-	return `Keep ${form.retention} latest snapshots; ${["hourly", "daily", "weekly", "monthly", "yearly"].map((tier, index) => `${tier} ${[form.retentionHourly, form.retentionDaily, form.retentionWeekly, form.retentionMonthly, form.retentionYearly][index] || "off"}`).join(", ")}.`;
+	return t("ui.protect.retentionSummary", { count: form.retention, tiers: ["hourly", "daily", "weekly", "monthly", "yearly"].map((tier, index) => `${retentionTierLabels[tier]()} ${[form.retentionHourly, form.retentionDaily, form.retentionWeekly, form.retentionMonthly, form.retentionYearly][index] || t("ui.protect.off")}`).join(", ") });
 }
 
 function clonedEngineSettings(job: BackupJob) {
@@ -1166,11 +1182,11 @@ function missingRequiredConnectorOptions(integration: StorageIntegration | undef
 }
 
 function repositoryConnectorLabel(repository: Pick<Repository, "connector" | "connectorLabel" | "location" | "isNetwork" | "coldStorage">) {
-	if (repository.coldStorage) return "Cold Storage";
+	if (repository.coldStorage) return t("ui.protect.coldStorageConnectorLabel");
     if (repository.connector === "s3") return repository.connectorLabel || "s3";
     if (repository.connector !== "fs") return repository.connector;
     const location = repository.location.trim().replace(/\//g, "\\");
-    return repository.isNetwork || location.startsWith("\\\\") ? "Network" : "Local";
+	return repository.isNetwork || location.startsWith("\\\\") ? t("ui.protect.networkConnectorLabel") : t("ui.protect.localConnectorLabel");
 }
 
 function filesystemVaultFolder(location: string) {
@@ -1260,39 +1276,45 @@ function compatibleVaultForm(form: VaultForm): VaultForm {
 }
 
 function IntegrationField({
+    connector,
     option,
     value,
     onChange,
     explanation,
     disabled,
 }: {
+    connector: string;
     option: IntegrationOption;
     value: string;
     onChange: (value: string) => void;
     explanation?: string;
     disabled?: boolean;
 }) {
+    const label = knownMessage(`ui.integration.${connector}.option.${option.key}.label`, option.label);
+    const help = option.help && (connector === "s3" && option.key === "storage_class"
+        ? t("ui.integration.s3.option.storage_class.help", { glacier: "GLACIER", deepArchive: "DEEP_ARCHIVE" })
+        : knownMessage(`ui.integration.${connector}.option.${option.key}.help`, option.help));
     if (option.kind === "boolean") {
         return (
             <div className="advanced-setting">
                 <label className="check">
                     <input type="checkbox" checked={value === "true"} disabled={disabled} onChange={(event) => onChange(String(event.target.checked))} />
-                    {option.label}
+                    {label}
                 </label>
-				{option.help && <small>{option.help}</small>}
+				{help && <small>{help}</small>}
                 {explanation && <small>{explanation}</small>}
             </div>
         );
     }
     return (
 		<label className="field">
-			<span>{option.label}{option.required && option.key !== "access_key" && option.key !== "secret_access_key" ? " *" : ""}</span>
+			<span>{label}{option.required && option.key !== "access_key" && option.key !== "secret_access_key" ? " *" : ""}</span>
 			{option.kind === "textarea" ? (
 				<textarea rows={3} value={value} disabled={disabled} placeholder={examplePlaceholder(option.placeholder)} onChange={(event) => onChange(event.target.value)} />
 			) : (
 				<input type={option.secret ? "password" : "text"} value={value} disabled={disabled} placeholder={examplePlaceholder(option.placeholder)} onChange={(event) => onChange(event.target.value)} />
 			)}
-			{option.help && <small>{option.help}</small>}
+			{help && <small>{help}</small>}
             {explanation && <small>{explanation}</small>}
         </label>
     );
@@ -1542,19 +1564,25 @@ function connectionOptionIsCustom(connector: string, key: string) {
 	return creationOptionIsCustom(connector, key);
 }
 
+function lowercaseEnglishLabel(label: string) {
+	// Keep English's existing label style. Whole-label lowercasing changes nouns
+	// and abbreviations in translated text, so preserve the catalog's casing.
+	return getEffectiveLocale() === "en" ? label.toLowerCase() : label;
+}
+
 function advancedCreationOptionExplanation(connector: string, option: IntegrationOption) {
 	const helpRemoved = connector === "s3" && ["use_tls", "tls_insecure_no_verify", "port", "storage_class"].includes(option.key) ||
 		connector === "sftp" && option.key === "ssh_auth_sock" ||
 		["azblob", "gcs"].includes(connector) && option.key === "endpoint";
-	return helpRemoved ? undefined : `Optional connector-specific setting for ${option.label.toLowerCase()}.`;
+	return helpRemoved ? undefined : t("ui.protect.optionalConnectorSettingHelp", { option: lowercaseEnglishLabel(knownMessage(`ui.integration.${connector}.option.${option.key}.label`, option.label)) });
 }
 
 function vaultEngineHelp(connector: string, coldStorage: boolean) {
-	if (coldStorage) return "Cold storage vaults must use Restic as the engine.";
-	if (connector === "dropbox") return "Dropbox vaults must use Restic as the engine.";
-	if (connector === "google_drive") return "Google Drive vaults must use Restic as the engine.";
-	if (connector === "onedrive") return "OneDrive vaults must use Restic as the engine.";
-	return "The engine for this vault cannot be changed after vault creation. Choose wisely.";
+	if (coldStorage) return t("ui.protect.coldStorageEngineHelp");
+	if (connector === "dropbox") return t("ui.protect.dropboxEngineHelp");
+	if (connector === "google_drive") return t("ui.protect.googleDriveEngineHelp");
+	if (connector === "onedrive") return t("ui.protect.oneDriveEngineHelp");
+	return t("ui.protect.immutableEngineHelp");
 }
 
 function creationOptionLockedForPending(form: VaultForm, option: IntegrationOption) {
@@ -1581,29 +1609,29 @@ function RemoteVaultFields({
     const updateOption = (key: string, value: string) => onChange(updateConnectorOption(form, key, value, Boolean(option("region"))));
     const renderOption = (key: string, displayValue?: string) => {
         const selected = option(key);
-		return selected ? <IntegrationField key={key} option={selected} value={displayValue ?? form.options[key] ?? ""} disabled={Boolean(form.pendingLocation) && !selected.credential} onChange={(value) => updateOption(key, value)} /> : null;
+		return selected ? <IntegrationField key={key} connector={integration.id} option={selected} value={displayValue ?? form.options[key] ?? ""} disabled={Boolean(form.pendingLocation) && !selected.credential} onChange={(value) => updateOption(key, value)} /> : null;
     };
 
 	if (usesRcloneNativeLogin(integration.id)) {
-		return <label className="field"><span>Vault folder name on {integration.label}</span><input aria-label={`Vault folder name on ${integration.label}`} value={form.location} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, location: event.target.value })} /><small>This is the name of the vault&apos;s folder in the Replicaro folder on {integration.label}. Make sure to type it in exactly as you see it.</small></label>;
+		return <label className="field"><span>{t("ui.protect.vaultFolderOnProvider", { provider: knownMessage(`ui.integration.${integration.id}.label`, integration.label) })}</span><input aria-label={t("ui.protect.vaultFolderOnProvider", { provider: knownMessage(`ui.integration.${integration.id}.label`, integration.label) })} value={form.location} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, location: event.target.value })} /><small>{t("ui.protect.vaultFolderExactHelp", { provider: knownMessage(`ui.integration.${integration.id}.label`, integration.label) })}</small></label>;
 	}
 
     switch (integration.id) {
         case "s3":
             return <>
                 {renderOption("endpoint")}
-                <label className="field"><span>Bucket</span><input value={form.bucket} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, bucket: event.target.value })} /></label>
-				<label className="field"><span>Path/prefix (optional)</span><input value={form.prefix} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /></label>
+                <label className="field"><span>{t("ui.pages.protect.bucket")}</span><input value={form.bucket} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, bucket: event.target.value })} /></label>
+				<label className="field"><span>{t("ui.pages.protect.path.prefix.optional")}</span><input value={form.prefix} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /></label>
             </>;
         case "azblob":
             return <>
-                <label className="field"><span>Container</span><input value={form.container} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, container: event.target.value })} /></label>
-				<label className="field"><span>Path/prefix (optional)</span><input value={form.prefix} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /></label>
+                <label className="field"><span>{t("ui.pages.protect.container")}</span><input value={form.container} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, container: event.target.value })} /></label>
+				<label className="field"><span>{t("ui.pages.protect.path.prefix.optional")}</span><input value={form.prefix} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /></label>
             </>;
         case "gcs":
             return <>
-                <label className="field"><span>Bucket</span><input value={form.bucket} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, bucket: event.target.value })} /></label>
-                <label className="field"><span>Path/prefix (optional)</span><input value={form.prefix} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /></label>
+                <label className="field"><span>{t("ui.pages.protect.bucket")}</span><input value={form.bucket} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, bucket: event.target.value })} /></label>
+                <label className="field"><span>{t("ui.pages.protect.path.prefix.optional")}</span><input value={form.prefix} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /></label>
             </>;
         case "sftp": {
             const pendingURL = (() => {
@@ -1617,11 +1645,11 @@ function RemoteVaultFields({
 			const absolutePath = pathMode === "absolute";
 			const supportsPathMode = Boolean(option("path_mode"));
             return <>
-                <label className="field"><span>Host</span><input value={form.host} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, host: event.target.value })} /></label>
+                <label className="field"><span>{t("ui.pages.protect.host")}</span><input value={form.host} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, host: event.target.value })} /></label>
                 {renderOption("port", pendingURL?.port || undefined)}
                 {renderOption("username", pendingURL?.username || undefined)}
-				{supportsPathMode && <label className="field"><span>Vault location on server</span><select value={pathMode} disabled={Boolean(form.pendingLocation)} onChange={(event) => updateOption("path_mode", event.target.value)}><option value="home">SFTP home directory (recommended)</option><option value="absolute">Server filesystem root</option></select></label>}
-				<label className="field"><span>{absolutePath ? "Vault path relative to server filesystem root" : "Vault path relative to SFTP home"}</span><input aria-label={absolutePath ? "Vault path relative to server filesystem root" : "Vault path relative to SFTP home"} value={form.prefix} placeholder={absolutePath ? "example: /srv/backups/vault" : "example: backups/vault"} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /><small>{absolutePath ? "Start with one /; the path begins at the server filesystem root." : "Do not start with /; the path begins in the authenticated user's SFTP home directory."}</small></label>
+				{supportsPathMode && <label className="field"><span>{t("ui.pages.protect.vault.location.on.server")}</span><select value={pathMode} disabled={Boolean(form.pendingLocation)} onChange={(event) => updateOption("path_mode", event.target.value)}><option value="home">{t("ui.pages.protect.sftp.home.directory.recommended")}</option><option value="absolute">{t("ui.pages.protect.server.filesystem.root")}</option></select></label>}
+				<label className="field"><span>{absolutePath ? t("ui.pages.protect.vault.path.relative.to.server.filesystem.root") : t("ui.pages.protect.vault.path.relative.to.sftp.home")}</span><input aria-label={absolutePath ? t("ui.protect.vaultPathServerRoot") : t("ui.protect.vaultPathSftpHome")} value={form.prefix} placeholder={absolutePath ? "example: /srv/backups/vault" : "example: backups/vault"} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /><small>{absolutePath ? t("ui.pages.protect.start.with.one.the.path.begins.at.the.server") : t("ui.pages.protect.do.not.start.with.the.path.begins.in.the")}</small></label>
                 {renderOption("identity")}
             </>;
         }
@@ -1650,15 +1678,15 @@ function VaultCareFields({
 	return (
 		<div className="form-grid two">
 			<label className="field">
-				<span>Integrity check</span>
-				<select disabled={disabled || integrityDisabled || form.coldStorage} value={form.coldStorage ? "manual" : form.checkSchedule} onChange={(event) => onChange({ ...form, checkSchedule: event.target.value })}>{(form.coldStorage ? [["manual", "Disabled"]] as const : careSchedules).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
-				<small>{form.coldStorage ? coldStorageIntegrityHelp : integrityCheckHelp}</small>
+				<span>{t("ui.pages.protect.integrity.check")}</span>
+				<select disabled={disabled || integrityDisabled || form.coldStorage} value={form.coldStorage ? "manual" : form.checkSchedule} onChange={(event) => onChange({ ...form, checkSchedule: event.target.value })}>{(form.coldStorage ? [["manual", () => t("ui.care.disabled")]] as const : careSchedules).map(([value, label]) => <option key={value} value={value}>{label()}</option>)}</select>
+				<small>{form.coldStorage ? coldStorageIntegrityHelp() : integrityCheckHelp()}</small>
 				{integrityDisabled && integrityLockedHelp && <small>{integrityLockedHelp}</small>}
 			</label>
 			<label className="field">
-				<span>Space reclamation</span>
-				<select disabled={disabled || maintenanceDisabled} value={form.maintenanceSchedule} onChange={(event) => onChange({ ...form, maintenanceSchedule: event.target.value })}>{careSchedules.map(([value, label]) => <option key={value} value={value} disabled={!objectLockScheduleEligible(form.objectLock, value)}>{label}</option>)}</select>
-				<small>{form.objectLock.enrolled ? (form.objectLock.paused ? pausedObjectLockMaintenanceHelp : objectLockMaintenanceHelp) : maintenanceHelp}</small>
+				<span>{t("ui.pages.protect.space.reclamation")}</span>
+				<select disabled={disabled || maintenanceDisabled} value={form.maintenanceSchedule} onChange={(event) => onChange({ ...form, maintenanceSchedule: event.target.value })}>{careSchedules.map(([value, label]) => <option key={value} value={value} disabled={!objectLockScheduleEligible(form.objectLock, value)}>{label()}</option>)}</select>
+				<small>{form.objectLock.enrolled ? (form.objectLock.paused ? pausedObjectLockMaintenanceHelp() : objectLockMaintenanceHelp()) : maintenanceHelp()}</small>
 				{maintenanceDisabled && maintenanceLockedHelp && <small>{maintenanceLockedHelp}</small>}
 			</label>
 			<JobSpeedField connector={form.connector} value={form.concurrencyMode} disabled={disabled} onChange={(concurrencyMode) => onChange({ ...form, concurrencyMode })} />
@@ -1680,15 +1708,15 @@ function JobSpeedField({
 	const provider = limitedSpeedProviders[connector];
 	return (
 		<label className="field vault-job-speed-field">
-			<span>Job speed</span>
+			<span>{t("ui.pages.protect.job.speed")}</span>
 			<select disabled={disabled} value={compatibleConcurrencyMode(connector, value)} onChange={(event) => onChange(compatibleConcurrencyMode(connector, event.target.value as VaultForm["concurrencyMode"]))}>
-				<option value="reduced">Slower</option>
-				<option value="native">Normal</option>
-				<option value="increased" disabled={Boolean(provider)}>Faster</option>
-				<option value="maximum" disabled={Boolean(provider)}>Maximum</option>
+				<option value="reduced">{t("ui.pages.protect.slower")}</option>
+				<option value="native">{t("ui.pages.protect.normal")}</option>
+				<option value="increased" disabled={Boolean(provider)}>{t("ui.pages.protect.faster")}</option>
+				<option value="maximum" disabled={Boolean(provider)}>{t("ui.pages.protect.maximum")}</option>
 			</select>
-			<small>Controls how quickly Replicaro finishes backup, restore, integrity check, and space reclamation jobs. Higher speed means higher CPU, memory, disk, and network use. Set higher speeds with caution.</small>
-			{provider && <small>{provider} limits how fast you can connect to your cloud drive, so Faster and Maximum settings are not available for {provider}.</small>}
+			<small>{t("ui.pages.protect.controls.how.quickly.replicaro.finishes.backup.restore.integrity.check")}</small>
+			{provider && <small>{t("ui.protect.providerSpeedLimitHelp", { provider })}</small>}
 		</label>
 	);
 }
@@ -1726,18 +1754,18 @@ function ObjectLockFields({
 	};
 	return <section className="advanced-setting">
 		{creation
-			? <label className="check"><input type="checkbox" checked={form.objectLock.enrolled} disabled={enrollmentLocked} onChange={(event) => updateSettings({ ...form.objectLock, enrolled: event.target.checked, paused: false })} />Enable Object Lock</label>
-			: <div className="object-lock-enrollment-status">Object Lock Status: <strong className={form.objectLock.enrolled ? "enabled" : "disabled"}>{form.objectLock.enrolled ? "Enabled" : "Disabled"}</strong></div>}
-		<small className="object-lock-help">{creation && eligible ? "Protect snapshots from deletion or overwrite for a selected duration." : "Object lock cannot be enabled or disabled after creation."}</small>
+			? <label className="check"><input type="checkbox" checked={form.objectLock.enrolled} disabled={enrollmentLocked} onChange={(event) => updateSettings({ ...form.objectLock, enrolled: event.target.checked, paused: false })} />{t("ui.pages.protect.enable.object.lock")}</label>
+			: <div className="object-lock-enrollment-status">{t("ui.protect.objectLockStatusLabel")} <strong className={form.objectLock.enrolled ? "enabled" : "disabled"}>{form.objectLock.enrolled ? t("ui.protect.enabled") : t("ui.protect.disabled")}</strong></div>}
+		<small className="object-lock-help">{creation && eligible ? t("ui.protect.objectLockProtectionHelp") : t("ui.protect.objectLockImmutableHelp")}</small>
 		{form.objectLock.enrolled && <>
-			{!creation && <label className="field"><span>Object Lock activity</span><select value={form.objectLock.paused ? "paused" : "active"} disabled={disabled} onChange={(event) => updateSettings({ ...form.objectLock, paused: event.target.value === "paused" })}><option value="active">Active</option><option value="paused">Paused</option></select></label>}
+			{!creation && <label className="field"><span>{t("ui.pages.protect.object.lock.activity")}</span><select value={form.objectLock.paused ? "paused" : "active"} disabled={disabled} onChange={(event) => updateSettings({ ...form.objectLock, paused: event.target.value === "paused" })}><option value="active">{t("ui.pages.protect.active")}</option><option value="paused">{t("ui.pages.protect.paused")}</option></select></label>}
 			<div className="form-grid two object-lock-settings-grid">
-				<label className="field"><span>Mode</span><select value={form.objectLock.mode || "compliance"} disabled={settingsDisabled} onChange={(event) => updateSettings({ ...form.objectLock, mode: event.target.value as ObjectLockSettings["mode"] })}><option value="compliance">Compliance{form.connector === "s3" ? " (default)" : ""}</option>{form.connector === "s3" && (creation || originalObjectLock?.mode === "governance") && <option value="governance">Governance</option>}</select></label>
-				<label className="field"><span>Duration</span><div className="form-grid two"><input type="number" min={form.objectLock.durationUnit === "days" ? 2 : 1} step={1} value={form.objectLock.durationValue} disabled={settingsDisabled} onWheel={preventNumberInputWheel} onChange={(event) => updateSettings({ ...form.objectLock, durationValue: Math.max(0, Math.trunc(Number(event.target.value))) })} /><select aria-label="Object Lock duration unit" value={form.objectLock.durationUnit || "days"} disabled={settingsDisabled} onChange={(event) => updateSettings({ ...form.objectLock, durationUnit: event.target.value as ObjectLockSettings["durationUnit"] })}><option value="days">Days</option><option value="weeks">Weeks</option><option value="months">Months</option><option value="years">Years</option></select></div></label>
+				<label className="field"><span>{t("ui.pages.protect.mode")}</span><select value={form.objectLock.mode || "compliance"} disabled={settingsDisabled} onChange={(event) => updateSettings({ ...form.objectLock, mode: event.target.value as ObjectLockSettings["mode"] })}><option value="compliance">{t("ui.pages.protect.compliance")}{form.connector === "s3" ? t("ui.pages.protect.default") : ""}</option>{form.connector === "s3" && (creation || originalObjectLock?.mode === "governance") && <option value="governance">{t("ui.pages.protect.governance")}</option>}</select></label>
+				<label className="field"><span>{t("ui.pages.protect.duration")}</span><div className="form-grid two"><input type="number" min={form.objectLock.durationUnit === "days" ? 2 : 1} step={1} value={form.objectLock.durationValue} disabled={settingsDisabled} onWheel={preventNumberInputWheel} onChange={(event) => updateSettings({ ...form.objectLock, durationValue: Math.max(0, Math.trunc(Number(event.target.value))) })} /><select aria-label={t("ui.pages.protect.object.lock.duration.unit")} value={form.objectLock.durationUnit || "days"} disabled={settingsDisabled} onChange={(event) => updateSettings({ ...form.objectLock, durationUnit: event.target.value as ObjectLockSettings["durationUnit"] })}><option value="days">{t("ui.pages.protect.days")}</option><option value="weeks">{t("ui.pages.protect.weeks")}</option><option value="months">{t("ui.pages.protect.months")}</option><option value="years">{t("ui.pages.protect.years")}</option></select></div></label>
 			</div>
-			{form.objectLock.paused && <small>Resume object lock to change its mode or duration.</small>}
-			{!creation && <small>{objectLockTransitionHelp}</small>}
-			<small className="object-lock-help">{objectLockForwardHelp}</small>
+			{form.objectLock.paused && <small>{t("ui.pages.protect.resume.object.lock.to.change.its.mode.or.duration")}</small>}
+			{!creation && <small>{objectLockTransitionHelp()}</small>}
+			<small className="object-lock-help">{objectLockForwardHelp()}</small>
 		</>}
 	</section>;
 }
@@ -1765,13 +1793,13 @@ function DestinationVaultPicker({
         <div className="destination-picker">
             <div className="destination-picker-selected">
                 <div className="destination-picker-summary">
-                    <span>{selected.length ? `${selected.length} selected` : "No vaults selected"}</span>
-                    {selected.length > 0 && <button type="button" className="text-button" onClick={() => onChange([])}>Clear all</button>}
+                    <span>{selected.length ? t("ui.protect.selectedCount", { count: selected.length }) : t("ui.pages.protect.no.vaults.selected")}</span>
+                    {selected.length > 0 && <button type="button" className="text-button" onClick={() => onChange([])}>{t("ui.pages.protect.clear.all")}</button>}
                 </div>
                 {selected.length > 0 && (
                     <div className="destination-chips">
                         {selected.map((repository) => (
-                            <Tooltip key={repository.id} content={`Remove ${repository.name}`}>
+                            <Tooltip key={repository.id} content={t("ui.protect.removeNamedVault", { name: repository.name })}>
                                 <button
                                     type="button"
                                     className="destination-chip"
@@ -1787,11 +1815,11 @@ function DestinationVaultPicker({
             <input
                 type="search"
                 value={query}
-                placeholder="Search vaults by name or location"
-                aria-label="Search destination vaults"
+                placeholder={t("ui.pages.protect.search.vaults.by.name.or.location")}
+                aria-label={t("ui.pages.protect.search.destination.vaults")}
                 onChange={(event) => setQuery(event.target.value)}
             />
-            <div className="destination-results" role="listbox" aria-label="Available destination vaults">
+            <div className="destination-results" role="listbox" aria-label={t("ui.pages.protect.available.destination.vaults")}>
                 {available.map((repository) => (
                     <button
                         type="button"
@@ -1799,13 +1827,13 @@ function DestinationVaultPicker({
                         key={repository.id}
                         onClick={() => onChange([...selectedIds, repository.id])}
                     >
-                        <span><strong>{repository.name}</strong><small className="mono">{repository.location}</small>{repository.resolvedRepositoryPath && <small className="mono">Last verified at {repository.resolvedRepositoryPath}</small>}</span>
-                        <span className="destination-add"><Icon name="plus" size={12} /> Add</span>
+                        <span><strong>{repository.name}</strong><small className="mono">{repository.location}</small>{repository.resolvedRepositoryPath && <small className="mono">{t("ui.protect.lastVerifiedAtPath", { path: repository.resolvedRepositoryPath })}</small>}</span>
+                        <span className="destination-add"><Icon name="plus" size={12} /> {t("ui.pages.protect.add")}</span>
                     </button>
                 ))}
                 {available.length === 0 && (
                     <div className="destination-results-empty">
-                        {normalizedQuery ? "No matching vaults" : "All available vaults are selected"}
+                        {normalizedQuery ? t("ui.pages.protect.no.matching.vaults") : t("ui.pages.protect.all.available.vaults.are.selected")}
                     </div>
                 )}
             </div>
@@ -1821,7 +1849,7 @@ function readableSize(bytes: number) {
         value /= 1000;
         unit += 1;
     }
-    return `${value >= 10 || unit === 0 ? value.toFixed(0) : value.toFixed(1)} ${units[unit]}`;
+    return `${formatDisplayNumber(value, { minimumFractionDigits: value >= 10 || unit === 0 ? 0 : 1, maximumFractionDigits: value >= 10 || unit === 0 ? 0 : 1 })} ${units[unit]}`;
 }
 
 function vaultSizePresentation(bytes: number) {
@@ -1833,15 +1861,15 @@ function vaultSizePresentation(bytes: number) {
 		decimalValue /= 1000;
 		unit += 1;
 	}
-	const display = `${decimalValue >= 10 || unit === 0 ? decimalValue.toFixed(0) : decimalValue.toFixed(1)} ${decimalUnits[unit]}`;
+	const display = `${formatDisplayNumber(decimalValue, { minimumFractionDigits: decimalValue >= 10 || unit === 0 ? 0 : 1, maximumFractionDigits: decimalValue >= 10 || unit === 0 ? 0 : 1 })} ${decimalUnits[unit]}`;
 	if (unit === 0) {
-		return { display, tooltip: `${display}. Bytes are the same in both unit systems.` };
+		return { display, tooltip: t("ui.protect.bytesUnitTooltip", { display }) };
 	}
 	const binaryValue = bytes / (1024 ** unit);
-	const binary = `${binaryValue >= 10 ? binaryValue.toFixed(0) : binaryValue.toFixed(1)} ${binaryUnits[unit]}`;
+	const binary = `${formatDisplayNumber(binaryValue, { minimumFractionDigits: binaryValue >= 10 ? 0 : 1, maximumFractionDigits: binaryValue >= 10 ? 0 : 1 })} ${binaryUnits[unit]}`;
 	return {
 		display,
-		tooltip: `${binary}. ${decimalUnits[unit]} is smaller than ${binaryUnits[unit]}. Some providers show disk usage in ${decimalUnits[unit]} while others show in ${binaryUnits[unit]}.`,
+		tooltip: t("ui.protect.sizeUnitTooltip", { binary, decimalUnit: decimalUnits[unit], binaryUnit: binaryUnits[unit] }),
 	};
 }
 
@@ -1925,10 +1953,15 @@ export default function Protect() {
 	const [connectChecking, setConnectChecking] = useState(false);
 	const [connectSaving, setConnectSaving] = useState(false);
 	const [vaultProgress, setVaultProgress] = useState<VaultProgressRecord[]>([]);
-	// A small bounded presentation buffer lets users see actual stages and native
-	// output while the existing request remains authoritative. No progress is
-	// invented, persisted, or used to decide whether creation/connection worked.
-	const appendVaultProgress = (record: VaultProgressRecord) => setVaultProgress((current) => [...current.slice(-199), record]);
+	// A small bounded presentation buffer lets users see actual stages while the
+	// existing request remains authoritative. No progress is invented, persisted,
+	// or used to decide whether creation/connection worked.
+	// This bounded state feeds only the stage activity view. Native records stay
+	// in the API/native result capture; admitting them here could evict every
+	// stage during a chatty engine operation without helping this UI.
+	const appendVaultProgress = (record: VaultProgressRecord) => {
+		if (record.type === "stage") setVaultProgress((current) => [...current.slice(-199), record]);
+	};
 	const [connectionIntents, setConnectionIntents] = useState<RepositoryConnectionIntent[]>([]);
 	const [retryConnectionError, setRetryConnectionError] = useState("");
 	const [creationIntents, setCreationIntents] = useState<RepositoryCreationIntent[]>([]);
@@ -2532,12 +2565,12 @@ export default function Protect() {
 	// could redirect the source before that validation sees the entered path.
 	const validateJobSubmission = (sourceDrafts: Array<{ name: string; source: string }>) => {
 	        if (sourceDrafts.some((draft) => !draft.name.trim() || !draft.source) || jobForm.repositoryIds.length === 0) {
-	            toast("error", "A job name and source folder are required for every job, along with at least one vault.");
+	            toast("error", t("ui.protect.jobNameSourceVaultRequired"));
 	            return null;
 	        }
 		const draftNames = sourceDrafts.map((draft) => asciiNoCase(draft.name.trim()));
 		if (new Set(draftNames).size !== draftNames.length) {
-			toast("error", "Every new backup job must have a unique name.");
+			toast("error", t("ui.protect.uniqueJobNameRequired"));
 			return null;
 		}
 		const intervalError = customScheduleError(jobForm);
@@ -2547,7 +2580,7 @@ export default function Protect() {
 		}
 		const schedule = scheduleValue(jobForm);
 		if (schedule == null) {
-			toast("error", "Cron schedule must be a valid five-field expression no longer than 256 characters.");
+			toast("error", t("ui.protect.invalidCronSchedule"));
 			return null;
 		}
 		const retention = parsedRetention(jobForm.retention);
@@ -2557,7 +2590,7 @@ export default function Protect() {
 		const retentionMonthly = parsedRetention(jobForm.retentionMonthly, true);
 		const retentionYearly = parsedRetention(jobForm.retentionYearly, true);
 		if ([retention, retentionHourly, retentionDaily, retentionWeekly, retentionMonthly, retentionYearly].some((value) => value === null)) {
-			toast("error", `Retention values must be whole numbers; optional values must be between 1 and ${MAX_RETENTION_COUNT.toLocaleString()}.`);
+			toast("error", t("ui.protect.retentionValidation", { max: MAX_RETENTION_COUNT.toLocaleString(getEffectiveLocale()) }));
 			return null;
 		}
 		return {
@@ -2618,7 +2651,7 @@ export default function Protect() {
 				};
 				const result = await updateJob(payload);
 				if (result?.job) applySavedJob(result.job);
-				toast(result?.warning ? "info" : "ok", result?.warning ?? `Job "${payload.name}" updated`);
+				toast(result?.warning ? "info" : "ok", result?.warning ?? t("ui.protect.jobUpdated", { name: payload.name }));
 				if (ownsSubmission()) setJobModal(null);
 				load();
 			} else if (sourceDrafts.length === 1) {
@@ -2629,7 +2662,7 @@ export default function Protect() {
 				};
 				const result = await createJob(payload);
 				if (result?.job) applySavedJob(result.job);
-				toast(result?.warning ? "info" : "ok", result?.warning ?? `Job "${payload.name}" created`);
+				toast(result?.warning ? "info" : "ok", result?.warning ?? t("ui.protect.jobCreated", { name: payload.name }));
 				if (ownsSubmission()) setJobModal(null);
 				load();
 			} else {
@@ -2742,12 +2775,12 @@ export default function Protect() {
 
 	const openBulkEdit = () => {
 		if (selectedJobs.length === 0) {
-			toast("error", "Select at least one backup job.");
+			toast("error", t("ui.protect.selectBackupJob"));
 			return;
 		}
 		const active = selectedJobs.filter(selectedJobIsActive);
 		if (active.length > 0) {
-			toast("error", `Wait for these jobs to finish before bulk editing: ${active.map((job) => job.name).join(", ")}.`);
+			toast("error", t("ui.protect.waitForBulkJobs", { jobs: active.map((job) => job.name).join(", ") }));
 			return;
 		}
 		bulkSession.current++;
@@ -2784,7 +2817,7 @@ export default function Protect() {
 
 	const reviewBulkEdit = () => {
 		if (!bulkHasChanges()) {
-			toast("error", "Choose at least one setting to change.");
+			toast("error", t("ui.protect.chooseBulkSetting"));
 			return;
 		}
 		const intervalError = bulkForm.changeSchedule ? customScheduleError(bulkForm) : null;
@@ -2793,7 +2826,7 @@ export default function Protect() {
 			return;
 		}
 		if (bulkForm.changeSchedule && scheduleValue(bulkForm) == null) {
-			toast("error", "Cron schedule must be a valid five-field expression no longer than 256 characters.");
+			toast("error", t("ui.protect.invalidCronSchedule"));
 			return;
 		}
 		if (bulkForm.changeRetention) {
@@ -2806,12 +2839,12 @@ export default function Protect() {
 				parsedRetention(bulkForm.retentionYearly, true),
 			];
 			if (values.some((value) => value === null)) {
-				toast("error", `Retention values must be whole numbers; optional values must be between 1 and ${MAX_RETENTION_COUNT.toLocaleString()}.`);
+				toast("error", t("ui.protect.retentionValidation", { max: MAX_RETENTION_COUNT.toLocaleString(getEffectiveLocale()) }));
 				return;
 			}
 		}
 		if (bulkForm.replaceDestinations && bulkForm.repositoryIds.length === 0) {
-			toast("error", "Select at least one destination vault.");
+			toast("error", t("ui.protect.selectDestinationVault"));
 			return;
 		}
 		setBulkEditStep("review");
@@ -2856,7 +2889,7 @@ export default function Protect() {
 		if (bulkSubmissionOwner.current || selectedJobs.length === 0) return;
 		const active = selectedJobs.filter(selectedJobIsActive);
 		if (active.length > 0) {
-			toast("error", `Bulk edit did not start because these jobs are now active: ${active.map((job) => job.name).join(", ")}.`);
+			toast("error", t("ui.protect.bulkJobsNowActive", { jobs: active.map((job) => job.name).join(", ") }));
 			setBulkEditStep("edit");
 			return;
 		}
@@ -2957,7 +2990,7 @@ export default function Protect() {
 						if (!item.payload) continue;
 						const currentJob = (jobs ?? []).find((job) => job.id === item.jobId);
 						if (currentJob && selectedJobIsActive(currentJob)) {
-							next[index] = { ...item, message: "Wait for this job to finish before retrying its definition update." };
+							next[index] = { ...item, message: t("ui.protect.waitForJobDefinitionUpdate") };
 							setBulkResults({ ...bulkResults, items: [...next] });
 							continue;
 						}
@@ -3119,7 +3152,7 @@ export default function Protect() {
         setJobDeleting(true);
         try {
 			const result = await deleteJob(jobId);
-			toast(result?.warning ? "info" : "ok", result?.warning ?? `Job "${jobName}" deleted`);
+			toast(result?.warning ? "info" : "ok", result?.warning ?? t("ui.protect.jobDeleted", { name: jobName }));
             load();
 			if (ownsSubmission()) setJobDelete(null);
         } catch (error) {
@@ -3167,23 +3200,23 @@ export default function Protect() {
 		if (vaultCreateSubmissionOwner.current?.session === vaultCreateSession.current) return;
         const location = vaultLocation(vaultForm, true);
         if (!vaultForm.name.trim() || !location || !vaultForm.password) {
-            toast("error", "Name, destination, and password are required.");
+            toast("error", t("ui.protect.createVaultRequiredFields"));
             return;
         }
 		if (!validVaultPassword(vaultForm.password)) {
-			toast("error", "Enter a vault password without leading or trailing whitespace, line breaks, or NUL characters.");
+			toast("error", t("ui.protect.invalidVaultPasswordWhitespace"));
 			return;
 		}
 		if (!validVaultName(vaultForm.name)) {
-			toast("error", `Vault names must be ${MAX_VAULT_NAME_CODE_POINTS} characters or fewer.`);
+			toast("error", t("ui.protect.vaultNameLengthValidation", { max: MAX_VAULT_NAME_CODE_POINTS }));
 			return;
 		}
 		if (createMissingRequiredOptions.length > 0) {
-			toast("error", `Enter required connector fields: ${createMissingRequiredOptions.map((option) => option.label).join(", ")}.`);
+			toast("error", t("ui.protect.requiredConnectorFields", { fields: createMissingRequiredOptions.map((option) => knownMessage(`ui.integration.${vaultForm.connector}.option.${option.key}.label`, option.label)).join(", ") }));
 			return;
 		}
         if (vaultForm.password !== vaultForm.passwordConfirmation) {
-            toast("error", "The passwords do not match.");
+            toast("error", t("ui.protect.passwordsDoNotMatch"));
             return;
         }
 			const payload = {
@@ -3240,7 +3273,7 @@ export default function Protect() {
 				setRetryCreationIntentId("");
 				setVaultFormState(emptyVault(integrations.find((item) => item.id === "fs"), defaultEngine));
 				load();
-				toast("info", "Use the pending vault card to retry, cancel, or forget this creation.");
+				toast("info", t("ui.protect.usePendingVaultCard"));
 				return;
 			}
 			const lifecycle = rcloneLifecycleFailure(error);
@@ -3278,17 +3311,17 @@ export default function Protect() {
 		const submittedForm = formOverride ?? connectForm;
 		const location = vaultLocation(submittedForm);
 		if (!location || !submittedForm.password || !connectIntegration) {
-			toast("error", "Storage type, location, and vault password are required.");
+			toast("error", t("ui.protect.connectVaultRequiredFields"));
 			return false;
 		}
 		if (!validVaultPassword(submittedForm.password)) {
-			toast("error", "Enter a vault password without leading or trailing whitespace, line breaks, or NUL characters.");
+			toast("error", t("ui.protect.invalidVaultPasswordWhitespace"));
 			return false;
 		}
 		// The repository validates its existing password directly. Requiring a
 		// second entry here would only duplicate a secret that is not being set.
 		if (connectMissingRequiredOptions.length > 0) {
-			toast("error", `Enter required connector fields: ${connectMissingRequiredOptions.map((option) => option.label).join(", ")}.`);
+			toast("error", t("ui.protect.requiredConnectorFields", { fields: connectMissingRequiredOptions.map((option) => knownMessage(`ui.integration.${connectForm.connector}.option.${option.key}.label`, option.label)).join(", ") }));
 			return false;
 		}
 		const enteredOptions = connectorOptionsWithoutUnchangedDefaults(connectIntegration, connectorOptionsForSubmission(submittedForm, connectIntegration));
@@ -3348,7 +3381,7 @@ export default function Protect() {
 			if (!ownsRequest()) return false;
 			const preview = refiningProfile ? { ...response, profiles: connectPreview?.profiles } : response;
 			if ((preview.profiles ?? []).filter((choice) => choice.localAttachment).length > 1) {
-				throw new Error("Multiple vault profiles are attached to this computer. Connection is blocked until the identity conflict is resolved.");
+				throw new Error(t("ui.protect.multipleProfilesConflict"));
 			}
 			setConnectDetectedEngine(preview.engine);
 			const protectedStorageClass = (preview as ExistingVaultPreview & { storageClass?: string }).storageClass;
@@ -3421,9 +3454,9 @@ export default function Protect() {
 				const availableName = rcloneName || availableImportedVaultName(importedName, preview.profile.vault_uuid, repos);
 				setConnectRcloneNameConflict(hasRcloneConflict);
 				setConnectNameConflictNotice(hasRcloneConflict
-					? `A vault named "${rcloneName}" already exists. Remove the existing local vault before connecting this ${connectIntegration?.label ?? "cloud"} vault.`
+					? t("ui.protect.existingRcloneVaultNameConflict", { name: rcloneName, provider: connectIntegration?.label ?? t("ui.protect.cloudProvider") })
 					: availableName === importedName ? "" :
-						`A vault named "${importedName}" already exists. The imported name was changed to "${availableName}". You can edit it before connecting.`);
+						t("ui.protect.importedVaultNameChanged", { before: importedName, after: availableName }));
 				setConnectForm((current) => ({ ...current, name: availableName, description: preview.profile!.vaultPreferences.description, checkSchedule: current.coldStorage ? "manual" : preview.rootIntegritySchedule ?? "manual", maintenanceSchedule: preview.rootMaintenanceSchedule ?? "manual", concurrencyMode: preview.profile!.vaultPreferences.concurrencyMode }));
 			} else if (chooseJoin && !localAttachmentBecameAuthoritative) {
 				const initial = connectPreviewBaseFields.current ?? reviewedBaseFields;
@@ -3438,7 +3471,7 @@ export default function Protect() {
 				const hasRcloneConflict = (repos ?? []).some((repository) => repository.name.trim().toLowerCase() === rcloneName.toLowerCase());
 				setConnectRcloneNameConflict(hasRcloneConflict);
 				setConnectNameConflictNotice(hasRcloneConflict
-					? `A vault named "${rcloneName}" already exists. Remove the existing local vault before connecting this ${connectIntegration?.label ?? "cloud"} vault.`
+					? t("ui.protect.existingRcloneVaultNameConflict", { name: rcloneName, provider: connectIntegration?.label ?? t("ui.protect.cloudProvider") })
 					: "");
 				setConnectForm((current) => ({ ...current, name: rcloneName }));
 			}
@@ -3476,15 +3509,15 @@ export default function Protect() {
 		if (connectSaving) return;
 		const location = vaultLocation(connectForm);
 		if (!selectedIntentId || !location || !connectForm.password) {
-			toast("error", "Enter the pending destination credentials and vault password.");
+			toast("error", t("ui.protect.pendingConnectionCredentialsRequired"));
 			return;
 		}
 		if (!validVaultPassword(connectForm.password)) {
-			toast("error", "Enter a vault password without leading or trailing whitespace, line breaks, or NUL characters.");
+			toast("error", t("ui.protect.invalidVaultPasswordWhitespace"));
 			return;
 		}
 		if (connectMissingRequiredOptions.length > 0) {
-			toast("error", `Enter required connector fields: ${connectMissingRequiredOptions.map((option) => option.label).join(", ")}.`);
+			toast("error", t("ui.protect.requiredConnectorFields", { fields: connectMissingRequiredOptions.map((option) => knownMessage(`ui.integration.${connectForm.connector}.option.${option.key}.label`, option.label)).join(", ") }));
 			return;
 		}
 		const payload = {
@@ -3540,8 +3573,8 @@ export default function Protect() {
 				if (savedConfigMissing || nativeAdmissionFailed) {
 					setConnectRcloneAuthorizationAction("retry");
 					toast("error", savedConfigMissing
-						? "The saved rclone configuration is unavailable. Authorize rclone to retry this pending connection."
-						: `${error.message} Check the vault password and provider connection. If the saved authorization has expired, authorize rclone and retry.`);
+						? t("ui.protect.savedRcloneConfigUnavailable")
+						: t("ui.protect.nativeAdmissionRetryHelp", { error: error.message }));
 				} else {
 					toast("error", lifecycle.message);
 				}
@@ -3555,9 +3588,9 @@ export default function Protect() {
 		if (connectSaving) return;
 		const preview = connectPreview;
 		const storage = connectReviewedStorage.current;
-		if (!preview || !storage || !validVaultName(connectForm.name)) { toast("error", `Review the vault name and keep it to ${MAX_VAULT_NAME_CODE_POINTS} characters or fewer before connecting.`); return; }
+		if (!preview || !storage || !validVaultName(connectForm.name)) { toast("error", t("ui.protect.reviewVaultNameLength", { max: MAX_VAULT_NAME_CODE_POINTS })); return; }
 		if (preview.existingVault && connectUpdateConfirmedDigest !== connectUpdateReviewDigest) {
-			toast("error", "Review and confirm the exact Update existing vault changes before continuing.");
+			toast("error", t("ui.protect.reviewExistingVaultUpdate"));
 			return;
 		}
 		// The profile and owner controls state the transfer consequences, and the
@@ -3753,7 +3786,7 @@ export default function Protect() {
 			const nextRepos = await getRepositories();
 			if (!protectPageActive.current || !vaultSettingsSessionIsCurrent(session, repositoryId) || !ownsVaultMutation(repositoryId, generation)) return;
 			const repository = nextRepos.find((candidate) => candidate.id === repositoryId);
-			if (!repository) throw new Error("The vault is no longer available.");
+			if (!repository) throw new Error(t("ui.protect.vaultNoLongerAvailable"));
 			++refreshGenerations.current.repositories;
 			setRepos(nextRepos);
 			settleVaultSettingsPresentation(repositoryId, generation);
@@ -3777,7 +3810,7 @@ export default function Protect() {
 			if (connectInitializationGeneration.current !== initialization) return;
 			const integration = connectionIntegrations.find((item) => item.id === fields.connector);
 			if (connectInitializationGeneration.current !== initialization) return;
-			if (!integration) throw new Error("The saved vault's storage type is unavailable for Connect existing vault.");
+			if (!integration) throw new Error(t("ui.protect.savedStorageTypeUnavailable"));
 			const restored = restoreVaultDestinationFields({
 				...emptyVault(integration, repository.engine),
 				connector: fields.connector,
@@ -3887,11 +3920,11 @@ export default function Protect() {
 	const submitVaultPasswordChange = () => {
 		if (!vaultSettings || !vaultOwnership?.isOwner || vaultMutationSnapshot[vaultSettings.id]) return;
 		if (!validVaultPassword(vaultPasswordForm.password)) {
-			toast("error", "Enter a vault password without leading or trailing whitespace, line breaks, or NUL characters.");
+			toast("error", t("ui.protect.invalidVaultPasswordWhitespace"));
 			return;
 		}
 		if (vaultPasswordForm.password !== vaultPasswordForm.confirmation) {
-			toast("error", "The vault passwords do not match.");
+			toast("error", t("ui.protect.vaultPasswordsDoNotMatch"));
 			return;
 		}
 		const submitted = { ...vaultPasswordForm };
@@ -4204,7 +4237,7 @@ export default function Protect() {
 		try {
 			const result = action === "restore" ? await restoreDormantRecoveryJob(repositoryId, jobId) : await discardDormantRecoveryJob(repositoryId, jobId);
 			if (!vaultSettingsSessionIsCurrent(session, repositoryId)) return;
-			toast(result.warning ? "info" : "ok", result.warning ?? `Dormant job ${action === "restore" ? "restored disabled" : "discarded"}`);
+			toast(result.warning ? "info" : "ok", result.warning ?? (action === "restore" ? t("ui.protect.dormantJobRestored") : t("ui.protect.dormantJobDiscarded")));
 			const jobs = await getDormantRecoveryJobs(repositoryId);
 			if (!vaultSettingsSessionIsCurrent(session, repositoryId)) return;
 			setDormantJobs(ownedDormantJobs(repositoryId, jobs));
@@ -4307,21 +4340,21 @@ export default function Protect() {
 	// Updating an existing registration deliberately preserves ownership and has
 	// no takeover control; ordinary profile connection keeps its actionable help.
 	const connectIntegrityLockedHelp = connectPreview?.existingVault
-		? "Only the current vault owner can change or run integrity checks. Updating this existing vault does not take over ownership."
-		: "Only the current vault owner can change or run integrity checks. Take over vault ownership above to enable it on this computer.";
+		? t("ui.protect.existingVaultIntegrityLockedHelp")
+		: t("ui.protect.newVaultIntegrityLockedHelp");
 	const connectMaintenanceLockedHelp = connectPreview?.existingVault
-		? "Only the current vault owner can change or run space reclamation. Updating this existing vault does not take over ownership."
-		: "Only the current vault owner can change or run space reclamation. Take over vault ownership above to enable it on this computer.";
+		? t("ui.protect.existingVaultMaintenanceLockedHelp")
+		: t("ui.protect.newVaultMaintenanceLockedHelp");
 	const existingVaultUpdateChanges = connectPreview?.existingVault ? [
 		...[connectPreview.existingVault.location !== connectReviewedLocation
-			? `Location: ${connectPreview.existingVault.location} → ${connectReviewedLocation}` : "Location: unchanged"],
-		...(connectPreview.existingVault.name !== connectForm.name.trim() ? [`Name: ${connectPreview.existingVault.name} → ${connectForm.name.trim()}`] : []),
+			? t("ui.protect.locationChangeReview", { before: connectPreview.existingVault.location, after: connectReviewedLocation }) : t("ui.protect.locationUnchangedReview")],
+		...(connectPreview.existingVault.name !== connectForm.name.trim() ? [t("ui.protect.nameChangeReview", { before: connectPreview.existingVault.name, after: connectForm.name.trim() })] : []),
 		...(connectPreview.existingVault.description !== connectForm.description.trim() ?
-			[`Description: ${connectPreview.existingVault.description || "(empty)"} → ${connectForm.description.trim() || "(empty)"}`] : []),
-		...(connectPreview.existingVault.checkSchedule !== connectForm.checkSchedule ? [`Integrity checks: ${connectPreview.existingVault.checkSchedule} → ${connectForm.checkSchedule}`] : []),
-		...(connectPreview.existingVault.maintenanceSchedule !== connectForm.maintenanceSchedule ? [`Space reclamation: ${connectPreview.existingVault.maintenanceSchedule} → ${connectForm.maintenanceSchedule}`] : []),
-		...(connectPreview.existingVault.concurrencyMode !== connectForm.concurrencyMode ? [`Vault performance: ${connectPreview.existingVault.concurrencyMode} → ${connectForm.concurrencyMode}`] : []),
-		"Credentials: replace with the successfully validated connection",
+			[t("ui.protect.descriptionChangeReview", { before: connectPreview.existingVault.description || t("ui.protect.emptyReview"), after: connectForm.description.trim() || t("ui.protect.emptyReview") })] : []),
+		...(connectPreview.existingVault.checkSchedule !== connectForm.checkSchedule ? [t("ui.protect.integrityChangeReview", { before: connectPreview.existingVault.checkSchedule, after: connectForm.checkSchedule })] : []),
+		...(connectPreview.existingVault.maintenanceSchedule !== connectForm.maintenanceSchedule ? [t("ui.protect.maintenanceChangeReview", { before: connectPreview.existingVault.maintenanceSchedule, after: connectForm.maintenanceSchedule })] : []),
+		...(connectPreview.existingVault.concurrencyMode !== connectForm.concurrencyMode ? [t("ui.protect.performanceChangeReview", { before: connectPreview.existingVault.concurrencyMode, after: connectForm.concurrencyMode })] : []),
+		t("ui.protect.credentialsChangeReview"),
 	] : [];
 	const connectUpdateReviewDigest = connectPreview?.existingVault ? JSON.stringify({
 		vaultUUID: connectPreview.existingVault.id,
@@ -4335,7 +4368,7 @@ export default function Protect() {
 	const connectReviewedMaintenanceSchedule = connectPreview?.rootMaintenanceSchedule ?? connectForm.maintenanceSchedule;
 	const currentOwnerName = currentConnectOwner?.attachment.display.computerName && currentConnectOwner.attachment.display.operatingSystem
 		? `${currentConnectOwner.attachment.display.computerName}@${currentConnectOwner.attachment.display.operatingSystem}`
-		: connectPreview?.vault_owner_profile_uuid ? `Profile ${connectPreview.vault_owner_profile_uuid}` : "The current profile";
+		: connectPreview?.vault_owner_profile_uuid ? t("ui.protect.profileIdLabel", { id: connectPreview.vault_owner_profile_uuid }) : t("ui.protect.currentProfileLabel");
 	// Pending intent recovery appears only after the user enters its exact
 	// destination. Stale intents no longer occupy the whole reconnect screen;
 	// the server still proves physical identity and the saved review on retry.
@@ -4348,35 +4381,35 @@ export default function Protect() {
     return (
         <div className="page protect-page">
             <header className="page-header simple">
-                <h1 className="page-title">Protect</h1>
-                <p className="page-desc">Backup your data into encrypted vaults.</p>
+                <h1 className="page-title">{t("ui.pages.protect.protect")}</h1>
+                <p className="page-desc">{t("ui.pages.protect.backup.your.data.into.encrypted.vaults")}</p>
             </header>
 
 	            <section id="jobs">
 	                <div className="section-heading">
-	                    <h2>Backup jobs</h2>
+	                    <h2>{t("ui.pages.protect.backup.jobs")}</h2>
 	                    <div className="job-heading-actions">
-						{(jobs?.length ?? 0) > 1 && selectedJobs.length > 0 && <span className="selection-count">{selectedJobs.length} selected</span>}
+						{(jobs?.length ?? 0) > 1 && selectedJobs.length > 0 && <span className="selection-count">{t("ui.protect.selectedCount", { count: selectedJobs.length })}</span>}
 						<button className="btn primary" disabled={!repos?.length} onClick={() => openJob()}>
-							<Icon name="plus" size={14} /> Backup job
+							<Icon name="plus" size={14} /> {t("ui.protect.backupJob")}
 						</button>
 					</div>
 	                </div>
-	                <p className="section-copy">Create snapshots of your data.</p>
+	                <p className="section-copy">{t("ui.pages.protect.create.snapshots.of.your.data")}</p>
 				{jobs !== null && jobs.length > 1 && selectedJobs.length > 0 && <div className="job-bulk-toolbar">
-					<label className="check"><input type="checkbox" aria-label="Select all jobs" checked={selectedJobs.length === jobs.length} disabled={bulkSaving} onChange={() => selectedJobs.length === jobs.length ? setSelectedJobIDs([]) : selectAllJobs()} />Select all jobs</label>
+					<label className="check"><input type="checkbox" aria-label={t("ui.pages.protect.select.all.jobs")} checked={selectedJobs.length === jobs.length} disabled={bulkSaving} onChange={() => selectedJobs.length === jobs.length ? setSelectedJobIDs([]) : selectAllJobs()} />{t("ui.pages.protect.select.all.jobs")}</label>
 					{selectedJobs.length > 1 && <div className="tool-buttons">
-						<button className="btn sm" disabled={bulkSaving} onClick={openBulkEdit}>Edit</button>
-						<button className="btn sm" disabled={bulkSaving} onClick={() => void applyBulkEnabled(true)}>Enable</button>
-						<button className="btn sm" disabled={bulkSaving} onClick={() => void applyBulkEnabled(false)}>Disable</button>
-						<button className="btn sm" disabled={bulkSaving} onClick={() => setSelectedJobIDs([])}>Clear selection</button>
+						<button className="btn sm" disabled={bulkSaving} onClick={openBulkEdit}>{t("ui.pages.protect.edit")}</button>
+						<button className="btn sm" disabled={bulkSaving} onClick={() => void applyBulkEnabled(true)}>{t("ui.pages.protect.enable")}</button>
+						<button className="btn sm" disabled={bulkSaving} onClick={() => void applyBulkEnabled(false)}>{t("ui.pages.protect.disable")}</button>
+						<button className="btn sm" disabled={bulkSaving} onClick={() => setSelectedJobIDs([])}>{t("ui.pages.protect.clear.selection")}</button>
 					</div>}
 				</div>}
 
                 {jobs === null && <Loading />}
                 {jobs !== null && jobs.length === 0 && (
-                    <EmptyState icon="jobs" title={repos?.length ? "No backup jobs" : "Add a vault first"}>
-                        <p>{repos?.length ? "Create a job to protect a source directory." : "Jobs need a vault for their backup data."}</p>
+                    <EmptyState icon="jobs" title={repos?.length ? t("ui.protect.noBackupJobs") : t("ui.protect.addVaultFirst")}>
+                        <p>{repos?.length ? t("ui.pages.protect.create.a.job.to.protect.a.source.directory") : t("ui.pages.protect.jobs.need.a.vault.for.their.backup.data")}</p>
                     </EmptyState>
                 )}
 
@@ -4392,18 +4425,18 @@ export default function Protect() {
                         const fullyProtected = job.targets.length > 0 && successfulTargets.length === job.targets.length;
                         const partiallyProtected = successfulTargets.length > 0 && !fullyProtected;
                         const tone = !job.enabled ? "idle" : isRunning ? "accent" : sourceUnavailable || vaultUnavailable || failedTargets.length > 0 ? "danger" : issueTargets.length > 0 ? "warn" : fullyProtected ? "ok" : "warn";
-                        const status = !job.enabled ? "Paused" : isRunning ? `${activeTargets.length} queued/running` : sourceUnavailable ? "Source unavailable" : vaultUnavailable ? "Vault unavailable" : failedTargets.length > 0 ? `${failedTargets.length} failed` : issueTargets.length > 0 ? "Completed with issues" : fullyProtected ? "Protected" : partiallyProtected ? "Partially protected" : "Not run yet";
+                        const status = !job.enabled ? t("ui.jobStatus.paused") : isRunning ? t("ui.jobStatus.queuedRunning", { count: activeTargets.length }) : sourceUnavailable ? t("ui.jobStatus.sourceUnavailable") : vaultUnavailable ? t("ui.jobStatus.vaultUnavailable") : failedTargets.length > 0 ? t("ui.jobStatus.failedCount", { count: failedTargets.length }) : issueTargets.length > 0 ? t("ui.jobStatus.completedWithIssues") : fullyProtected ? t("ui.jobStatus.protected") : partiallyProtected ? t("ui.jobStatus.partiallyProtected") : t("ui.jobStatus.notRunYet");
                         const destinationStatus = activeTargets.length > 0
-                            ? "running"
+                            ? t("ui.destinationStatus.running")
                             : failedTargets.length > 0
-                                ? "failure"
+                                ? t("ui.destinationStatus.failure")
                                 : issueTargets.length > 0
-                                    ? "protected · completed with issues"
+                                    ? t("ui.destinationStatus.completedWithIssues")
                                     : fullyProtected
-                                        ? "successful"
+                                        ? t("ui.destinationStatus.successful")
                                         : partiallyProtected
-                                            ? `${successfulTargets.length} of ${job.targets.length} successful`
-                                            : "not run";
+                                            ? t("ui.destinationStatus.successfulCount", { successful: successfulTargets.length, total: job.targets.length })
+                                            : t("ui.destinationStatus.notRun");
                         const targetDetails = job.targets.map((target) =>
                             `${target.repositoryName}: ${target.lastStatus === "completed_with_issues" ? "completed with issues" : target.lastStatus === "reconnect_required" ? "reconnect required" : target.lastStatus || "not run"}`
                         ).join(" · ");
@@ -4411,19 +4444,19 @@ export default function Protect() {
                         return (
 	                            <article key={job.id} className={`job-flow ${tone}${selectedJobIDs.includes(job.id) ? " selected" : ""}`}>
 								<div className="job-leading-controls">
-									{(jobs?.length ?? 0) > 1 && <input type="checkbox" aria-label={`Select ${job.name}`} checked={selectedJobIDs.includes(job.id)} disabled={bulkSaving} onChange={() => toggleJobSelection(job.id)} />}
-									<button className={`toggle${job.enabled ? " on" : ""}`} disabled={Boolean(jobToggleBusy) || bulkSaving} onClick={() => void toggle(job)} aria-label={`${job.enabled ? "Disable" : "Enable"} ${job.name}`}><span /></button>
+									{(jobs?.length ?? 0) > 1 && <input type="checkbox" aria-label={t("ui.protect.selectNamedJob", { name: job.name })} checked={selectedJobIDs.includes(job.id)} disabled={bulkSaving} onChange={() => toggleJobSelection(job.id)} />}
+									<button className={`toggle${job.enabled ? " on" : ""}`} disabled={Boolean(jobToggleBusy) || bulkSaving} onClick={() => void toggle(job)} aria-label={job.enabled ? t("ui.protect.disableNamedJob", { name: job.name }) : t("ui.protect.enableNamedJob", { name: job.name })}><span /></button>
 								</div>
                                 <div className="flow-source">
                                     <strong>{job.name}</strong>
 									<Tooltip content={displayPath(job.source)}>
-										<span className="flow-source-path"><span className="flow-source-path-text"><b>Source</b> {displayPath(job.source)}</span></span>
+										<span className="flow-source-path"><span className="flow-source-path-text"><b>{t("ui.pages.protect.source")}</b> {displayPath(job.source)}</span></span>
 									</Tooltip>
-									{job.resolvedSourcePath && <span className="flow-source-path"><span className="flow-source-path-text"><b>Last verified at</b> {displayPath(job.resolvedSourcePath)}</span></span>}
-									<span><b>Size</b> {job.sizeBytes == null ? "Not measured yet" : readableSize(job.sizeBytes)}</span>
+									{job.resolvedSourcePath && <span className="flow-source-path"><span className="flow-source-path-text"><b>{t("ui.pages.protect.last.verified.at")}</b> {displayPath(job.resolvedSourcePath)}</span></span>}
+									<span><b>{t("ui.pages.protect.size")}</b> {job.sizeBytes == null ? t("ui.pages.protect.not.measured.yet") : readableSize(job.sizeBytes)}</span>
                                 </div>
                                 <div className="flow-glyph">
-                                    <span className="flow-status">{status === "Partially protected" ? <>Partially <br />protected</> : status}</span>
+                                    <span className="flow-status">{status === t("ui.jobStatus.partiallyProtected") ? renderMessage("ui.jobStatus.partiallyProtectedBreak", { break: <br /> }) : status}</span>
                                     <svg className="flow-arrow-horizontal" viewBox="0 0 120 10" aria-hidden="true">
                                         <line x1="0" y1="5" x2="112" y2="5" />
                                         <path d="M112 1.5L119 5l-7 3.5z" />
@@ -4432,29 +4465,29 @@ export default function Protect() {
                                         <line x1="5" y1="0" x2="5" y2="28" />
                                         <path d="M1.5 28L5 35l3.5-7z" />
                                     </svg>
-									<Tooltip content={nextSnapshotTooltip(job)}><span>{scheduleLabel(job.schedule).toLowerCase()}</span></Tooltip>
+									<Tooltip content={nextSnapshotTooltip(job)}><span>{lowercaseEnglishLabel(scheduleLabel(job.schedule))}</span></Tooltip>
                                 </div>
                                 <div className="flow-vault">
                                     <strong>{job.targets.map((target) => target.repositoryName).join(", ")}</strong>
                                     <Tooltip content={targetDetails}>
                                         <span className="flow-vault-status">
-                                            <b>Vault{job.targets.length === 1 ? "" : "s"}</b> {job.targets.length} vault{job.targets.length === 1 ? "" : "s"} · {destinationStatus}
+                                            <b>{t("ui.protect.vaultLabel", { count: job.targets.length })}</b> {t("ui.protect.vaultCount", { count: job.targets.length })} · {destinationStatus}
                                         </span>
                                     </Tooltip>
-                                    {pendingCatchUpTargets.length > 0 && <span className="recovery-warning"><b>Scheduled catch-up pending</b> for {pendingCatchUpTargets.map((target) => `${target.repositoryName} (${target.coalescedMissedCount} coalesced miss${target.coalescedMissedCount === 1 ? "" : "es"})`).join(", ")}</span>}
+                                    {pendingCatchUpTargets.length > 0 && <span className="recovery-warning">{renderMessage("ui.protect.catchUpPendingForTargets", { status: <b>{t("ui.pages.protect.scheduled.catch.up.pending")}</b>, targets: pendingCatchUpTargets.map((target) => t("ui.protect.catchUpTarget", { vault: target.repositoryName, count: target.coalescedMissedCount })).join(", ") })}</span>}
                                 </div>
                                 <div className="row-actions">
-                                    <Tooltip content="Run job">
-                                        <button className="btn ghost-icon job-action-run" aria-label={`Run job ${job.name}`} disabled={Boolean(runActiveJobID) || job.targets.every(backupTargetIsActive)} onClick={() => job.targets.length > 1 ? openRunReview(job.id) : void startRun(job)}>{(isRunning || runActiveJobID === job.id) ? <span className="spinner" /> : <Icon name="play" size={14} />}</button>
+                                    <Tooltip content={t("ui.pages.protect.run.job")}>
+                                        <button className="btn ghost-icon job-action-run" aria-label={t("ui.protect.runNamedJobAction", { name: job.name })} disabled={Boolean(runActiveJobID) || job.targets.every(backupTargetIsActive)} onClick={() => job.targets.length > 1 ? openRunReview(job.id) : void startRun(job)}>{(isRunning || runActiveJobID === job.id) ? <span className="spinner" /> : <Icon name="play" size={14} />}</button>
                                     </Tooltip>
-									<Tooltip content="Copy job">
-                                        <button className="btn ghost-icon" aria-label={`Copy job ${job.name}`} onClick={() => copyJob(job)}><Icon name="copy" size={15} /></button>
+									<Tooltip content={t("ui.pages.protect.copy.job")}>
+                                        <button className="btn ghost-icon" aria-label={t("ui.protect.copyNamedJob", { name: job.name })} onClick={() => copyJob(job)}><Icon name="copy" size={15} /></button>
                                     </Tooltip>
-                                    <Tooltip content="Job settings">
-                                        <button className="btn ghost-icon" disabled={isRunning} aria-label={`Edit ${job.name}`} onClick={() => openJob(job)}><Icon name="edit" size={14} /></button>
+                                    <Tooltip content={t("ui.pages.protect.job.settings")}>
+                                        <button className="btn ghost-icon" disabled={isRunning} aria-label={t("ui.protect.editNamedJob", { name: job.name })} onClick={() => openJob(job)}><Icon name="edit" size={14} /></button>
                                     </Tooltip>
-                                    <Tooltip content="Delete job">
-                                        <button className="btn ghost-icon danger-hover" aria-label={`Delete ${job.name}`} onClick={() => openJobDelete(job)}><Icon name="trash" size={14} /></button>
+                                    <Tooltip content={t("ui.pages.protect.delete.job")}>
+                                        <button className="btn ghost-icon danger-hover" aria-label={t("ui.protect.deleteNamedJob", { name: job.name })} onClick={() => openJobDelete(job)}><Icon name="trash" size={14} /></button>
                                     </Tooltip>
                                 </div>
                             </article>
@@ -4463,14 +4496,14 @@ export default function Protect() {
                 </div>
                 {jobs !== null && jobs.length > 0 && (
                     <ListControls
-                        label="jobs"
+                        label={t("ui.pages.protect.jobs.2")}
                         total={jobs.length}
                         defaultPageSize={JOB_PAGE_SIZE}
                         page={safeJobPage}
                         pageSize={jobPageSize}
                         pageSizeOptions={JOB_PAGE_SIZE_OPTIONS}
                         sort={jobSort}
-                        sortOptions={JOB_SORT_OPTIONS}
+                        sortOptions={JOB_SORT_OPTIONS.map(({ value, label }) => ({ value, label: label() }))}
                         onPage={setJobPage}
                         onPageSize={changeJobPageSize}
                         onSort={changeJobSort}
@@ -4480,14 +4513,14 @@ export default function Protect() {
 
             <section className="vault-section" id="vaults">
                 <div className="section-heading">
-                    <h2>Vaults</h2>
-                    <button className="btn" onClick={() => setShowVaultChoice(true)}><Icon name="plus" size={14} /> Vault</button>
+                    <h2>{t("ui.pages.protect.vaults")}</h2>
+                    <button className={`btn${repos !== null && repos.length === 0 ? " primary" : ""}`} onClick={() => setShowVaultChoice(true)}><Icon name="plus" size={14} /> {t("ui.pages.protect.vault")}</button>
                 </div>
-                <p className="section-copy">Where snapshots live.</p>
+                <p className="section-copy">{t("ui.pages.protect.where.snapshots.live")}</p>
 
                 {repos === null && <Loading />}
                 {repos !== null && repos.length === 0 && creationIntents.length === 0 && (
-                    <EmptyState icon="vault" title="No vaults yet"><p>Add a local or remote vault to get started.</p></EmptyState>
+                    <EmptyState icon="vault" title={t("ui.pages.protect.no.vaults.yet")}><p>{t("ui.pages.protect.add.a.local.or.remote.vault.to.get.started")}</p></EmptyState>
                 )}
 
                 <div className="vault-list">
@@ -4497,7 +4530,7 @@ export default function Protect() {
 								<div className="vault-card-head">
 									<span className="vault-glyph"><Icon name="shield" size={18} /></span>
 									<span className="vault-chips">
-										<span className="connector-chip">Creation pending</span>
+										<span className="connector-chip">{t("ui.pages.protect.creation.pending")}</span>
 										<span className="connector-chip">{intent.engine}</span>
 									</span>
 								</div>
@@ -4506,17 +4539,17 @@ export default function Protect() {
 									<span className="vault-location"><span className="vault-location-text">{intent.location}</span></span>
 								</Tooltip>
 							</div>
-							<div className="vault-stat"><strong>Not measured yet</strong><span>Vault Size</span></div>
+							<div className="vault-stat"><strong>{t("ui.pages.protect.not.measured.yet")}</strong><span>{t("ui.pages.protect.vault.size")}</span></div>
 							<div className="row-actions vault-actions failed-vault-actions">
-									<button className="btn sm" onClick={() => retryCreation(intent)}>Retry</button>
-								<button className="btn sm" onClick={() => setCreationErrorView(intent)}>View error</button>
+									<button className="btn sm" onClick={() => retryCreation(intent)}>{t("ui.pages.protect.retry")}</button>
+								<button className="btn sm" onClick={() => setCreationErrorView(intent)}>{t("ui.pages.protect.view.error")}</button>
 								<button
 									className="btn sm danger-outline"
 									disabled={Boolean(creationRemovalBusy)}
 										onClick={() => void removePendingCreation(intent)}
 								>
 									{creationRemovalBusy === intent.id && <span className="spinner" />}
-										{intent.phase === "prepared" ? "Cancel" : "Forget"}
+										{intent.phase === "prepared" ? t("ui.pages.protect.cancel") : t("ui.protect.forget")}
 								</button>
 							</div>
 						</article>
@@ -4529,7 +4562,7 @@ export default function Protect() {
 						const sizePresentation = stats.vaultSizeBytes == null ? null : vaultSizePresentation(stats.vaultSizeBytes);
 						const pendingProfile = profileSync[repo.id];
 						const statsActive = stats.running || stats.pending;
-						const statsStatus = stats.paused ? "Refresh paused due to active jobs…" : "Refreshing stats…";
+						const statsStatus = stats.paused ? t("ui.protect.statsRefreshPaused") : t("ui.protect.statsRefreshing");
 						const reconnectRequired = Boolean(reconnectRequiredVaults[repo.id]);
                         return (
 							<article key={repo.id} className="vault-row" data-vault-id={repo.id}>
@@ -4547,32 +4580,33 @@ export default function Protect() {
 											<span className="vault-location"><span className="vault-location-text">{repositoryLocationLabel(repo)}</span></span>
 										</Tooltip>
 									{pendingProfile?.lastError && (
-									<span className="recovery-warning profile-sync-warning">Vault profile update pending: {pendingProfile.lastError} {pendingProfile.nextAttemptAt ? `· retry ${timeAgo(pendingProfile.nextAttemptAt)}` : ""} <button className="btn sm" disabled={cardBlocked} onClick={() => void retryProfile(repo.id)}>Retry now</button></span>
+									<span className="recovery-warning profile-sync-warning">{t("ui.protect.profileUpdatePending", { error: pendingProfile.lastError })} {pendingProfile.nextAttemptAt ? t("ui.protect.retryAfter", { time: timeAgo(pendingProfile.nextAttemptAt) }) : ""} <button className="btn sm" disabled={cardBlocked} onClick={() => void retryProfile(repo.id)}>{t("ui.pages.protect.retry.now")}</button></span>
 									)}
-									{reconnectRequired && <span className="recovery-warning">Reconnect is required before this vault can run backups.</span>}
+									{reconnectRequired && <span className="recovery-warning">{t("ui.pages.protect.reconnect.is.required.before.this.vault.can.run.backups")}</span>}
                                 </div>
 								<div className={`vault-stat vault-size-stat${statsActive ? " is-refreshing" : ""}`} inert={cardBlocked || undefined}>
-									<div className="vault-size-summary">{sizePresentation ? <Tooltip content={sizePresentation.tooltip}><span className="vault-size-value" aria-label={sizePresentation.display}><strong>{sizePresentation.display}</strong></span></Tooltip> : <strong>Not measured yet</strong>}<span>Vault Size</span></div>
-									<div className="vault-size-meta"><small>Size Stats Updated: {stats.vaultSizeMeasuredAt ? timeAgo(stats.vaultSizeMeasuredAt) : "Not measured yet"}.</small><Tooltip content="Replicaro periodically refreshes vault size stats. You can force a refresh immediately. Your backed up files are not changed. Forced refreshes read from the vault's destination and may take time to complete."><button className="vault-stats-refresh" aria-label="Refresh stats now" disabled={cardBlocked} onClick={() => refreshVaultSize(repo.id)}>Refresh stats now</button></Tooltip></div>
-									{statsActive && <span className="vault-stats-refreshing">{!stats.paused && <span className="spinner" />}<span><strong>{statsStatus}</strong><span>You can safely close this page if you need to. Refreshing will resume in the background.</span></span></span>}
+									<div className="vault-size-summary">{sizePresentation ? <Tooltip content={sizePresentation.tooltip}><span className="vault-size-value" aria-label={sizePresentation.display}><strong>{sizePresentation.display}</strong></span></Tooltip> : <strong>{t("ui.pages.protect.not.measured.yet")}</strong>}<span>{t("ui.pages.protect.vault.size")}</span></div>
+									<div className="vault-size-meta"><small>{t("ui.protect.sizeStatsUpdated", { time: stats.vaultSizeMeasuredAt ? timeAgo(stats.vaultSizeMeasuredAt) : t("ui.protect.notMeasuredYet") })}</small><Tooltip content={t("ui.pages.protect.replicaro.periodically.refreshes.vault.size.stats.you.can.force.a.refr")}><button className="vault-stats-refresh" aria-label={t("ui.pages.protect.refresh.stats.now")} disabled={cardBlocked} onClick={() => refreshVaultSize(repo.id)}>{t("ui.pages.protect.refresh.stats.now")}</button></Tooltip></div>
+									{statsActive && <span className="vault-stats-refreshing">{!stats.paused && <span className="spinner" />}<span><strong>{statsStatus}</strong><span>{t("ui.pages.protect.you.can.safely.close.this.page.if.you.need.to.refreshing.will.resume.i")}</span></span></span>}
 									{stats.failure && <small className="recovery-warning">{stats.failure}</small>}
 								</div>
 								<div className="row-actions vault-actions" inert={cardBlocked || undefined}>
-									{reconnectRequired && <button className="btn sm danger" disabled={cardBlocked} onClick={() => void openSavedVaultReconnect(repo)}>Reconnect</button>}
-									<Link className="btn sm" to={`/restore/${repo.id}`} tabIndex={cardBlocked ? -1 : undefined} aria-disabled={cardBlocked} onClick={(event) => { if (cardBlocked) event.preventDefault(); }}>Browse</Link>
-                                    <Tooltip content="Vault settings">
-										<button className="btn ghost-icon" aria-label={`Edit ${repo.name}`} disabled={cardBlocked} onClick={() => openVaultSettings(repo)}><Icon name="edit" size={14} /></button>
+									{reconnectRequired && <button className="btn sm danger" disabled={cardBlocked} onClick={() => void openSavedVaultReconnect(repo)}>{t("ui.pages.protect.reconnect")}</button>}
+									<Link className="btn sm" to={`/restore/${repo.id}`} tabIndex={cardBlocked ? -1 : undefined} aria-disabled={cardBlocked} onClick={(event) => { if (cardBlocked) event.preventDefault(); }}>{t("ui.pages.protect.browse")}</Link>
+                                    <Tooltip content={t("ui.pages.protect.vault.settings")}>
+											<button className="btn ghost-icon" aria-label={t("ui.protect.editNamedVault", { name: repo.name })} disabled={cardBlocked} onClick={() => openVaultSettings(repo)}><Icon name="edit" size={14} /></button>
                                     </Tooltip>
-                                    <Tooltip content="Delete vault">
-										<button className="btn ghost-icon danger-hover" aria-label={`Delete ${repo.name}`} disabled={cardBlocked} onClick={() => openVaultDelete(repo)}><Icon name="trash" size={14} /></button>
+                                    <Tooltip content={t("ui.pages.protect.delete.vault")}>
+											<button className="btn ghost-icon danger-hover" aria-label={t("ui.protect.deleteNamedVault", { name: repo.name })} disabled={cardBlocked} onClick={() => openVaultDelete(repo)}><Icon name="trash" size={14} /></button>
                                     </Tooltip>
                                 </div>
 								{removal && <div className="vault-removal-overlay" role="status" aria-live="polite">
-									{removal.phase === "removing" ? <><span className="spinner" aria-hidden="true" /><strong>Vault is being removed...</strong><span>You can continue using Replicaro while this finishes.</span></> : <>
-										<strong>{removal.phase === "profile_error" ? "The recovery profile could not be updated." : "The vault could not be removed."}</strong>
+									<VaultOverlayIdentity name={repo.name} />
+									{removal.phase === "removing" ? <><strong className="vault-overlay-status">{t("ui.pages.protect.vault.is.being.removed")}</strong><span>{t("ui.pages.protect.you.can.continue.using.replicaro.while.this.finishes")}</span><span className="spinner" aria-hidden="true" /></> : <>
+										<strong>{removal.phase === "profile_error" ? t("ui.pages.protect.the.recovery.profile.could.not.be.updated") : t("ui.pages.protect.the.vault.could.not.be.removed")}</strong>
 										<span>{removal.message}</span>
-										{removal.phase === "profile_error" && <span>Removing it anyway leaves the remote recovery profile unchanged. The vault's backed up data will remain untouched.</span>}
-										<div className="vault-removal-actions"><button className="btn sm" onClick={() => setVaultRemoval((current) => { const next = { ...current }; delete next[repo.id]; return next; })}>Keep vault</button><button className="btn sm danger-outline" onClick={() => void removeVault(repo, removal.phase === "profile_error")}>{removal.phase === "profile_error" ? "Remove anyway" : "Retry removal"}</button></div>
+										{removal.phase === "profile_error" && <span>{t("ui.pages.protect.removing.it.anyway.leaves.the.remote.recovery.profile.unchanged.the.va")}</span>}
+										<div className="vault-removal-actions"><button className="btn sm" onClick={() => setVaultRemoval((current) => { const next = { ...current }; delete next[repo.id]; return next; })}>{t("ui.pages.protect.keep.vault")}</button><button className="btn sm danger-outline" onClick={() => void removeVault(repo, removal.phase === "profile_error")}>{removal.phase === "profile_error" ? t("ui.pages.protect.remove.anyway") : t("ui.pages.protect.retry.removal")}</button></div>
 									</>}
 								</div>}
 								{mutation && !removal && <VaultMutationOverlay mutation={mutation} onReopenSettings={(repositoryId, generation) => { void reopenVaultSettings(repositoryId, generation); }} />}
@@ -4582,14 +4616,14 @@ export default function Protect() {
                 </div>
                 {repos !== null && repos.length > 0 && (
                     <ListControls
-                        label="vaults"
+                        label={t("ui.pages.protect.vaults.2")}
                         total={repos.length}
                         defaultPageSize={VAULT_PAGE_SIZE}
                         page={safeVaultPage}
                         pageSize={vaultPageSize}
                         pageSizeOptions={VAULT_PAGE_SIZE_OPTIONS}
                         sort={vaultSort}
-                        sortOptions={VAULT_SORT_OPTIONS}
+                        sortOptions={VAULT_SORT_OPTIONS.map(({ value, label }) => ({ value, label: label() }))}
                         onPage={setVaultPage}
                         onPageSize={changeVaultPageSize}
                         onSort={changeVaultSort}
@@ -4598,158 +4632,158 @@ export default function Protect() {
             </section>
 
 	            {jobModal && (
-	                <Modal title={jobModal === "new" ? "New backup job" : "Edit job"} wide onClose={closeJob}>
+	                <Modal title={jobModal === "new" ? t("ui.protect.newBackupJob") : t("ui.protect.editJob")} wide onClose={closeJob}>
 					<fieldset className="modal-workflow-fields" disabled={jobSaving}>
 	                    <div className="modal-form">
 							{jobModal === "new" && !jobCopyDraft ? <>
-								<p className="muted modal-intro">You can add one or more source data to back up. Each source data will get its own job, and each job will get the same job settings you set here.</p>
-								<label className="field"><span>Name</span><input autoFocus value={jobForm.name} placeholder="example: Documents nightly" onChange={(event) => setJobForm({ ...jobForm, name: event.target.value })} /></label>
-								<label className="field"><span>Source data</span><DirectoryField ariaLabel="Source data" value={jobForm.source} onChange={(source) => setJobForm({ ...jobForm, source })} /><small>Must be a local folder, mounted share, mapped drive, or network path. External, portable, and flash drives are supported. Source cannot be changed after job is created.</small></label>
+								<p className="muted modal-intro">{t("ui.pages.protect.you.can.add.one.or.more.source.data.to.back.up.each.source.data.will.g")}</p>
+								<label className="field"><span>{t("ui.pages.protect.name")}</span><input autoFocus value={jobForm.name} placeholder={t("ui.pages.protect.example.documents.nightly")} onChange={(event) => setJobForm({ ...jobForm, name: event.target.value })} /></label>
+								<label className="field"><span>{t("ui.pages.protect.source.data")}</span><DirectoryField ariaLabel={t("ui.pages.protect.source.data")} value={jobForm.source} onChange={(source) => setJobForm({ ...jobForm, source })} /><small>{t("ui.pages.protect.must.be.a.local.folder.mounted.share.mapped.drive.or.network.path.exte")}</small></label>
 								{jobAdditionalSources.map((source, index) => <div className="field job-additional-source" key={index}>
-									<span>Source data</span>
+									<span>{t("ui.pages.protect.source.data")}</span>
 									<div className="job-additional-source-controls">
-										<DirectoryField ariaLabel={`Source data ${index + 2}`} value={source} onChange={(nextSource) => setJobAdditionalSources((current) => current.map((item, itemIndex) => itemIndex === index ? nextSource : item))} />
-										<button type="button" className="btn sm danger-outline remove-source" aria-label={`Remove source ${index + 2}`} onClick={() => setJobAdditionalSources((current) => current.filter((_, itemIndex) => itemIndex !== index))}>Remove source</button>
+										<DirectoryField ariaLabel={t("ui.protect.numberedSourceData", { number: index + 2 })} value={source} onChange={(nextSource) => setJobAdditionalSources((current) => current.map((item, itemIndex) => itemIndex === index ? nextSource : item))} />
+										<button type="button" className="btn sm danger-outline remove-source" aria-label={t("ui.protect.removeNumberedSource", { number: index + 2 })} onClick={() => setJobAdditionalSources((current) => current.filter((_, itemIndex) => itemIndex !== index))}>{t("ui.pages.protect.remove.source")}</button>
 									</div>
-									<small>Must be a local folder, mounted share, mapped drive, or network path. External, portable, and flash drives are supported. Source cannot be changed after job is created.</small>
+									<small>{t("ui.pages.protect.must.be.a.local.folder.mounted.share.mapped.drive.or.network.path.exte")}</small>
 								</div>)}
-								<button type="button" className="btn" onClick={() => setJobAdditionalSources((current) => [...current, ""])}><Icon name="plus" size={14} /> Add source</button>
+								<button type="button" className="btn" onClick={() => setJobAdditionalSources((current) => [...current, ""])}><Icon name="plus" size={14} /> {t("ui.pages.protect.add.source")}</button>
 							</> : <>
-								<label className="field"><span>Name</span><input autoFocus={!jobCopyDraft} value={jobForm.name} placeholder="example: Documents nightly" onChange={(event) => setJobForm({ ...jobForm, name: event.target.value })} /></label>
+								<label className="field"><span>{t("ui.pages.protect.name")}</span><input autoFocus={!jobCopyDraft} value={jobForm.name} placeholder={t("ui.pages.protect.example.documents.nightly")} onChange={(event) => setJobForm({ ...jobForm, name: event.target.value })} /></label>
 								{/* Keep existing sources read-only, including unbound imports. The backend
 								    permits source updates before local binding, but exposing that here would
 								    let users point the same job ID at different data and alter native retention
 								    scope. Backend mutability does not imply an editable source field. */}
-								<label className="field"><span>Source data</span><DirectoryField ariaLabel="Source data" value={jobForm.source} readOnly={jobModal !== "new"} autoFocus={jobCopyDraft} onChange={(source) => setJobForm({ ...jobForm, source })} /><small>Must be a local folder, mounted share, mapped drive, or network path. External, portable, and flash drives are supported. Source cannot be changed after job is created.</small></label>
+								<label className="field"><span>{t("ui.pages.protect.source.data")}</span><DirectoryField ariaLabel={t("ui.pages.protect.source.data")} value={jobForm.source} readOnly={jobModal !== "new"} autoFocus={jobCopyDraft} onChange={(source) => setJobForm({ ...jobForm, source })} /><small>{jobModal === "new" ? t("ui.pages.protect.must.be.a.local.folder.mounted.share.mapped.drive.or.network.path.exte") : t("ui.protect.editSourceImmutableHelp")}</small></label>
 							</>}
-                        <div className="field"><span>Destination vaults</span><DestinationVaultPicker repositories={repos ?? []} selectedIds={jobForm.repositoryIds} onChange={(repositoryIds) => setJobForm({ ...jobForm, repositoryIds })} /><small>Select one or more vaults. Backups for all vaults are managed by this job, but the backup for each vault runs and reports independently.</small></div>
-                        <label className="field"><span>Schedule</span><select aria-label="Schedule" value={jobForm.schedule} onChange={(event) => setJobForm({ ...jobForm, schedule: event.target.value })}>{schedulePresets.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small>{scheduleHelp(jobForm.schedule)}</small></label>
-                        {customScheduleUnits[jobForm.schedule] && <label className="field compact-field"><span>{customScheduleUnits[jobForm.schedule]!.label}</span><input type="number" min={1} max={customScheduleUnits[jobForm.schedule]!.max} value={jobForm.customInterval} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, customInterval: event.target.value })} /></label>}
-						{jobForm.schedule === "cron" && <label className="field"><span>Cron expression</span><input className="mono" value={jobForm.cronExpression} placeholder="0 2 * * *" maxLength={MAX_CRON_EXPRESSION_LENGTH} onChange={(event) => setJobForm({ ...jobForm, cronExpression: event.target.value })} /><small>{cronScheduleHelp}</small></label>}
-						<label className="field"><span>Retention policy</span><select aria-label="Retention policy" value={retentionPreset(jobForm.retention)} onChange={(event) => setJobForm({ ...jobForm, retention: event.target.value === "custom" ? (retentionPreset(jobForm.retention) === "custom" ? jobForm.retention : "") : event.target.value })}>{retentionPresets.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
+                        <div className="field"><span>{t("ui.pages.protect.destination.vaults")}</span><DestinationVaultPicker repositories={repos ?? []} selectedIds={jobForm.repositoryIds} onChange={(repositoryIds) => setJobForm({ ...jobForm, repositoryIds })} /><small>{t("ui.pages.protect.select.one.or.more.vaults.backups.for.all.vaults.are.managed.by.this.j")}</small></div>
+                        <label className="field"><span>{t("ui.pages.protect.schedule")}</span><select aria-label={t("ui.pages.protect.schedule")} value={jobForm.schedule} onChange={(event) => setJobForm({ ...jobForm, schedule: event.target.value })}>{schedulePresets.map(([value, label]) => <option key={value} value={value}>{label()}</option>)}</select><small>{scheduleHelp(jobForm.schedule)}</small></label>
+                        {customScheduleUnits[jobForm.schedule] && <label className="field compact-field"><span>{customScheduleUnits[jobForm.schedule]!.label()}</span><input type="number" min={1} max={customScheduleUnits[jobForm.schedule]!.max} value={jobForm.customInterval} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, customInterval: event.target.value })} /></label>}
+						{jobForm.schedule === "cron" && <label className="field"><span>{t("ui.pages.protect.cron.expression")}</span><input className="mono" value={jobForm.cronExpression} placeholder="0 2 * * *" maxLength={MAX_CRON_EXPRESSION_LENGTH} onChange={(event) => setJobForm({ ...jobForm, cronExpression: event.target.value })} /><small>{cronScheduleHelp()}</small></label>}
+						<label className="field"><span>{t("ui.pages.protect.retention.policy")}</span><select aria-label={t("ui.pages.protect.retention.policy")} value={retentionPreset(jobForm.retention)} onChange={(event) => setJobForm({ ...jobForm, retention: event.target.value === "custom" ? (retentionPreset(jobForm.retention) === "custom" ? jobForm.retention : "") : event.target.value })}>{retentionPresets.map(([value, label]) => <option key={value} value={value}>{label()}</option>)}</select>
 							{/* Deliberate simplification: 100 snapshots do not guarantee 100 distinct versions for every file. Do not change this help text. */}
-							<small>How many versions of your files do you want to keep in the backup? 100 snapshots = 100 file versions.</small></label>
-						{retentionPreset(jobForm.retention) === "custom" && <label className="field compact-field"><span>Number of latest snapshots to keep</span><input aria-label="Number of latest snapshots to keep" type="number" min={1} max={MAX_MAIN_RETENTION_COUNT} value={jobForm.retention} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retention: event.target.value })} /></label>}
-                        <button className="btn advanced-toggle" onClick={() => setJobAdvanced((value) => !value)}><Icon name="settings" size={14} />{jobAdvanced ? "Hide advanced settings" : "Advanced settings"}</button>
+							<small>{t("ui.pages.protect.how.many.versions.of.your.files.do.you.want.to.keep.in.the.backup.100")}</small></label>
+						{retentionPreset(jobForm.retention) === "custom" && <label className="field compact-field"><span>{t("ui.pages.protect.number.of.latest.snapshots.to.keep")}</span><input aria-label={t("ui.pages.protect.number.of.latest.snapshots.to.keep")} type="number" min={1} max={MAX_MAIN_RETENTION_COUNT} value={jobForm.retention} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retention: event.target.value })} /></label>}
+                        <button className="btn advanced-toggle" onClick={() => setJobAdvanced((value) => !value)}><Icon name="settings" size={14} />{jobAdvanced ? t("ui.pages.protect.hide.advanced.settings") : t("ui.pages.protect.advanced.settings")}</button>
                         {jobAdvanced && (
                             <div className="advanced-panel">
 								<div className="engine-settings">
-									<div className="engine-settings-heading"><strong>More retention options (optional)</strong><small>Advanced retention policies are evaluated together with the main retention policy. A snapshot is deleted when it falls out of range of all the enabled retention rules.<br /><br />For example, if the main retention policy keeps the latest 100 snapshots and the daily policy keeps 10 daily snapshots, Replicaro keeps the latest 100 plus any older snapshots that qualify as being one of the 10 latest daily snapshots.<br /><br />Leave blank any retention tier that you do not want to use.</small></div>
-									<label className="field"><span>Keep N latest hourly snapshots</span><input aria-label="Keep N latest hourly snapshots" type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionHourly} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionHourly: event.target.value })} /></label>
-									<label className="field"><span>Keep N latest daily snapshots</span><input aria-label="Keep N latest daily snapshots" type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionDaily} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionDaily: event.target.value })} /></label>
-									<label className="field"><span>Keep N latest weekly snapshots</span><input aria-label="Keep N latest weekly snapshots" type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionWeekly} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionWeekly: event.target.value })} /></label>
-									<label className="field"><span>Keep N latest monthly snapshots</span><input aria-label="Keep N latest monthly snapshots" type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionMonthly} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionMonthly: event.target.value })} /></label>
-									<label className="field"><span>Keep N latest yearly snapshots</span><input aria-label="Keep N latest yearly snapshots" type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionYearly} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionYearly: event.target.value })} /></label>
+									<div className="engine-settings-heading"><strong>{t("ui.pages.protect.more.retention.options.optional")}</strong><small>{t("ui.protect.advancedRetentionHelp")}<br /><br />{t("ui.protect.advancedRetentionExample")}<br /><br />{t("ui.protect.leaveTierBlankHelp")}</small></div>
+									<label className="field"><span>{t("ui.pages.protect.keep.n.latest.hourly.snapshots")}</span><input aria-label={t("ui.pages.protect.keep.n.latest.hourly.snapshots")} type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionHourly} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionHourly: event.target.value })} /></label>
+									<label className="field"><span>{t("ui.pages.protect.keep.n.latest.daily.snapshots")}</span><input aria-label={t("ui.pages.protect.keep.n.latest.daily.snapshots")} type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionDaily} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionDaily: event.target.value })} /></label>
+									<label className="field"><span>{t("ui.pages.protect.keep.n.latest.weekly.snapshots")}</span><input aria-label={t("ui.pages.protect.keep.n.latest.weekly.snapshots")} type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionWeekly} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionWeekly: event.target.value })} /></label>
+									<label className="field"><span>{t("ui.pages.protect.keep.n.latest.monthly.snapshots")}</span><input aria-label={t("ui.pages.protect.keep.n.latest.monthly.snapshots")} type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionMonthly} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionMonthly: event.target.value })} /></label>
+									<label className="field"><span>{t("ui.pages.protect.keep.n.latest.yearly.snapshots")}</span><input aria-label={t("ui.pages.protect.keep.n.latest.yearly.snapshots")} type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionYearly} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionYearly: event.target.value })} /></label>
 								</div>
-	                                <label className="field"><span>Exclude patterns (optional)</span><textarea className="mono" rows={3} value={jobForm.excludes} placeholder={"example: *.tmp\nexample: node_modules"} onChange={(event) => setJobForm({ ...jobForm, excludes: event.target.value })} /><small>One pattern per line for files/folders this job should skip.</small></label>
-								<label className="field"><span>Tag (optional)</span><input value={jobForm.tag} onChange={(event) => setJobForm({ ...jobForm, tag: event.target.value })} /><small>Optional label applied to snapshots created by this job.</small></label>
+	                                <label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" rows={3} value={jobForm.excludes} placeholder={"example: *.tmp\nexample: node_modules"} onChange={(event) => setJobForm({ ...jobForm, excludes: event.target.value })} /><small>{t("ui.pages.protect.one.pattern.per.line.for.files.folders.this.job.should.skip")}</small></label>
+								<label className="field"><span>{t("ui.pages.protect.tag.optional")}</span><input value={jobForm.tag} onChange={(event) => setJobForm({ ...jobForm, tag: event.target.value })} /><small>{t("ui.pages.protect.optional.label.applied.to.snapshots.created.by.this.job")}</small></label>
                                 <div className="engine-settings">
-									<div className="engine-settings-heading"><strong>Engine-specific settings (optional)</strong><small>These settings apply only to the selected vault engines.</small></div>
-                                    {selectedEngines.length === 0 && <p className="engine-settings-empty">Select a destination vault to configure its engine.</p>}
+									<div className="engine-settings-heading"><strong>{t("ui.pages.protect.engine.specific.settings.optional")}</strong><small>{t("ui.pages.protect.these.settings.apply.only.to.the.selected.vault.engines")}</small></div>
+                                    {selectedEngines.length === 0 && <p className="engine-settings-empty">{t("ui.pages.protect.select.a.destination.vault.to.configure.its.engine")}</p>}
                                     {selectedEngines.map((engine) => (
                                         <section className="engine-settings-group" key={engine}>
                                             <h3>{engine[0].toUpperCase() + engine.slice(1)}</h3>
-											<label className="field"><span>Advanced CLI options</span><textarea className="mono" rows={3} value={jobForm.engineOptions[engine] ?? ""} placeholder={engine === "kopia" ? "example: --fail-fast" : "example: --verbose"} onChange={(event) => setJobForm({ ...jobForm, engineOptions: { ...jobForm.engineOptions, [engine]: event.target.value } })} /><small>One option per line. Each line is tokenized as CLI options, so a flag and its value may share a line. Replicaro rejects positional arguments, shell syntax, secrets, and protected repository settings.</small></label>
+											<label className="field"><span>{t("ui.pages.protect.advanced.cli.options")}</span><textarea className="mono" rows={3} value={jobForm.engineOptions[engine] ?? ""} placeholder={engine === "kopia" ? "example: --fail-fast" : "example: --verbose"} onChange={(event) => setJobForm({ ...jobForm, engineOptions: { ...jobForm.engineOptions, [engine]: event.target.value } })} /><small>{t("ui.pages.protect.one.option.per.line.each.line.is.tokenized.as.cli.options.so.a.flag.an")}</small></label>
                                         </section>
                                     ))}
 								</div>
 								<JobScriptFields value={jobForm} onChange={(scripts) => setJobForm({ ...jobForm, ...scripts })} />
                             </div>
                         )}
-						{jobModal === "new" && <label className="check"><input type="checkbox" checked={jobForm.enabled} onChange={(event) => setJobForm({ ...jobForm, enabled: event.target.checked })} />Enabled — the scheduler will run this job</label>}
+						{jobModal === "new" && <label className="check"><input type="checkbox" checked={jobForm.enabled} onChange={(event) => setJobForm({ ...jobForm, enabled: event.target.checked })} />{t("ui.pages.protect.enabled.the.scheduler.will.run.this.job")}</label>}
                     </div>
-						<div className="modal-footer"><button className="btn" disabled={jobSaving} onClick={closeJob}>Cancel</button><button className="btn primary" disabled={jobSaving} onClick={() => void saveJob()}>{jobSaving && <span className="spinner" />}{jobModal === "new" ? "Create job" : "Save changes"}</button></div>
+						<div className="modal-footer"><button className="btn" disabled={jobSaving} onClick={closeJob}>{t("ui.pages.protect.cancel")}</button><button className="btn primary" disabled={jobSaving} onClick={() => void saveJob()}>{jobSaving && <span className="spinner" />}{jobModal === "new" ? t("ui.pages.protect.create.job") : t("ui.pages.protect.save.changes")}</button></div>
 					</fieldset>
 	                </Modal>
 	            )}
 
-			{jobCreationResults && <Modal title="Backup job creation results" onClose={dismissJobCreationResults}>
-				<p className="muted modal-intro">Each source got its own job. These are independent jobs that you can edit individually or together using bulk edit. Any failed job can be retried here or created again manually.</p>
+			{jobCreationResults && <Modal title={t("ui.pages.protect.backup.job.creation.results")} onClose={dismissJobCreationResults}>
+				<p className="muted modal-intro">{t("ui.pages.protect.each.source.got.its.own.job.these.are.independent.jobs.that.you.can.ed")}</p>
 				<div className="mutation-results">{jobCreationResults.map((item, index) => <div className={`mutation-result ${item.status}`} key={`${item.name}:${index}`}>
 					<strong>{item.name}</strong>
 					<span>{item.status[0].toUpperCase() + item.status.slice(1)}</span>
-					{item.source && <small className="mono mutation-result-source">Source: {item.source}</small>}
+					{item.source && <small className="mono mutation-result-source">{t("ui.protect.sourcePath", { path: item.source })}</small>}
 					<small>{item.message}</small>
 				</div>)}</div>
 				<div className="modal-footer">
-					{jobCreationResults.some((item) => item.status === "failed") && <button className="btn" disabled={jobCreationRetrying} onClick={() => void retryFailedJobCreations()}>{jobCreationRetrying && <span className="spinner" />}Retry failed jobs</button>}
-					<button className="btn primary" disabled={jobCreationRetrying} onClick={dismissJobCreationResults}>Close</button>
+					{jobCreationResults.some((item) => item.status === "failed") && <button className="btn" disabled={jobCreationRetrying} onClick={() => void retryFailedJobCreations()}>{jobCreationRetrying && <span className="spinner" />}{t("ui.pages.protect.retry.failed.jobs")}</button>}
+					<button className="btn primary" disabled={jobCreationRetrying} onClick={dismissJobCreationResults}>{t("ui.pages.protect.close")}</button>
 				</div>
 			</Modal>}
 
-			{bulkEditOpen && <Modal title={bulkEditStep === "edit" ? "Bulk edit jobs" : "Review bulk changes"} wide onClose={dismissBulkEdit}>
+			{bulkEditOpen && <Modal title={bulkEditStep === "edit" ? t("ui.protect.bulkEditJobs") : t("ui.protect.reviewBulkChanges")} wide onClose={dismissBulkEdit}>
 				{bulkEditStep === "edit" ? <fieldset className="modal-workflow-fields" disabled={bulkSaving}>
-					<p className="muted modal-intro">{selectedJobs.length} selected job{selectedJobs.length === 1 ? "" : "s"}. Names and source directories will remain unchanged.</p>
+					<p className="muted modal-intro">{t("ui.protect.bulkSelectedJobsHelp", { count: selectedJobs.length })}</p>
 					<div className="modal-form bulk-edit-form">
 						<section className="bulk-setting">
-							<label className="check"><input type="checkbox" checked={bulkForm.changeSchedule} onChange={(event) => setBulkForm({ ...bulkForm, changeSchedule: event.target.checked })} />Change schedule</label>
-							{bulkForm.changeSchedule && <div className="bulk-setting-fields"><label className="field"><span>Schedule</span><select aria-label="Schedule" value={bulkForm.schedule} onChange={(event) => setBulkForm({ ...bulkForm, schedule: event.target.value })}>{schedulePresets.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small>{scheduleHelp(bulkForm.schedule)}</small></label>{customScheduleUnits[bulkForm.schedule] && <label className="field compact-field"><span>{customScheduleUnits[bulkForm.schedule]!.label}</span><input type="number" min={1} max={customScheduleUnits[bulkForm.schedule]!.max} value={bulkForm.customInterval} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, customInterval: event.target.value })} /></label>}{bulkForm.schedule === "cron" && <label className="field"><span>Cron expression</span><input className="mono" value={bulkForm.cronExpression} placeholder="0 2 * * *" maxLength={MAX_CRON_EXPRESSION_LENGTH} onChange={(event) => setBulkForm({ ...bulkForm, cronExpression: event.target.value })} /><small>{cronScheduleHelp}</small></label>}</div>}
+							<label className="check"><input type="checkbox" checked={bulkForm.changeSchedule} onChange={(event) => setBulkForm({ ...bulkForm, changeSchedule: event.target.checked })} />{t("ui.pages.protect.change.schedule")}</label>
+							{bulkForm.changeSchedule && <div className="bulk-setting-fields"><label className="field"><span>{t("ui.pages.protect.schedule")}</span><select aria-label={t("ui.pages.protect.schedule")} value={bulkForm.schedule} onChange={(event) => setBulkForm({ ...bulkForm, schedule: event.target.value })}>{schedulePresets.map(([value, label]) => <option key={value} value={value}>{label()}</option>)}</select><small>{scheduleHelp(bulkForm.schedule)}</small></label>{customScheduleUnits[bulkForm.schedule] && <label className="field compact-field"><span>{customScheduleUnits[bulkForm.schedule]!.label()}</span><input type="number" min={1} max={customScheduleUnits[bulkForm.schedule]!.max} value={bulkForm.customInterval} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, customInterval: event.target.value })} /></label>}{bulkForm.schedule === "cron" && <label className="field"><span>{t("ui.pages.protect.cron.expression")}</span><input className="mono" value={bulkForm.cronExpression} placeholder="0 2 * * *" maxLength={MAX_CRON_EXPRESSION_LENGTH} onChange={(event) => setBulkForm({ ...bulkForm, cronExpression: event.target.value })} /><small>{cronScheduleHelp()}</small></label>}</div>}
 						</section>
 						<section className="bulk-setting">
-							<label className="check"><input type="checkbox" checked={bulkForm.changeRetention} onChange={(event) => setBulkForm({ ...bulkForm, changeRetention: event.target.checked })} />Change retention</label>
-							{bulkForm.changeRetention && <div className="bulk-setting-fields"><label className="field"><span>Retention policy</span><select aria-label="Bulk retention policy" value={retentionPreset(bulkForm.retention)} onChange={(event) => setBulkForm({ ...bulkForm, retention: event.target.value === "custom" ? (retentionPreset(bulkForm.retention) === "custom" ? bulkForm.retention : "") : event.target.value })}>{retentionPresets.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>{retentionPreset(bulkForm.retention) === "custom" && <label className="field compact-field"><span>Number of latest snapshots to keep</span><input type="number" min={1} max={MAX_MAIN_RETENTION_COUNT} value={bulkForm.retention} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retention: event.target.value })} /></label>}<div className="form-grid two"><label className="field"><span>Keep N latest hourly snapshots</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionHourly} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionHourly: event.target.value })} /></label><label className="field"><span>Keep N latest daily snapshots</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionDaily} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionDaily: event.target.value })} /></label><label className="field"><span>Keep N latest weekly snapshots</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionWeekly} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionWeekly: event.target.value })} /></label><label className="field"><span>Keep N latest monthly snapshots</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionMonthly} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionMonthly: event.target.value })} /></label><label className="field"><span>Keep N latest yearly snapshots</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionYearly} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionYearly: event.target.value })} /></label></div></div>}
+							<label className="check"><input type="checkbox" checked={bulkForm.changeRetention} onChange={(event) => setBulkForm({ ...bulkForm, changeRetention: event.target.checked })} />{t("ui.pages.protect.change.retention")}</label>
+							{bulkForm.changeRetention && <div className="bulk-setting-fields"><label className="field"><span>{t("ui.pages.protect.retention.policy")}</span><select aria-label={t("ui.pages.protect.bulk.retention.policy")} value={retentionPreset(bulkForm.retention)} onChange={(event) => setBulkForm({ ...bulkForm, retention: event.target.value === "custom" ? (retentionPreset(bulkForm.retention) === "custom" ? bulkForm.retention : "") : event.target.value })}>{retentionPresets.map(([value, label]) => <option key={value} value={value}>{label()}</option>)}</select></label>{retentionPreset(bulkForm.retention) === "custom" && <label className="field compact-field"><span>{t("ui.pages.protect.number.of.latest.snapshots.to.keep")}</span><input type="number" min={1} max={MAX_MAIN_RETENTION_COUNT} value={bulkForm.retention} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retention: event.target.value })} /></label>}<div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.keep.n.latest.hourly.snapshots")}</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionHourly} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionHourly: event.target.value })} /></label><label className="field"><span>{t("ui.pages.protect.keep.n.latest.daily.snapshots")}</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionDaily} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionDaily: event.target.value })} /></label><label className="field"><span>{t("ui.pages.protect.keep.n.latest.weekly.snapshots")}</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionWeekly} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionWeekly: event.target.value })} /></label><label className="field"><span>{t("ui.pages.protect.keep.n.latest.monthly.snapshots")}</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionMonthly} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionMonthly: event.target.value })} /></label><label className="field"><span>{t("ui.pages.protect.keep.n.latest.yearly.snapshots")}</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionYearly} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionYearly: event.target.value })} /></label></div></div>}
 						</section>
 						<section className="bulk-setting">
-							<label className="check"><input type="checkbox" checked={bulkForm.changeExcludes} onChange={(event) => setBulkForm({ ...bulkForm, changeExcludes: event.target.checked })} />Change exclude patterns</label>
-							{bulkForm.changeExcludes && <div className="bulk-setting-fields"><label className="field"><span>Exclude patterns (optional)</span><textarea className="mono" rows={3} value={bulkForm.excludes} placeholder={"example: *.tmp\nexample: node_modules"} onChange={(event) => setBulkForm({ ...bulkForm, excludes: event.target.value })} /><small>One pattern per line for files/folders these jobs should skip.</small></label></div>}
+							<label className="check"><input type="checkbox" checked={bulkForm.changeExcludes} onChange={(event) => setBulkForm({ ...bulkForm, changeExcludes: event.target.checked })} />{t("ui.pages.protect.change.exclude.patterns")}</label>
+							{bulkForm.changeExcludes && <div className="bulk-setting-fields"><label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" rows={3} value={bulkForm.excludes} placeholder={"example: *.tmp\nexample: node_modules"} onChange={(event) => setBulkForm({ ...bulkForm, excludes: event.target.value })} /><small>{t("ui.pages.protect.one.pattern.per.line.for.files.folders.these.jobs.should.skip")}</small></label></div>}
 						</section>
 						<section className="bulk-setting">
-							<label className="check"><input type="checkbox" checked={bulkForm.changeTag} onChange={(event) => setBulkForm({ ...bulkForm, changeTag: event.target.checked })} />Change tag</label>
-							{bulkForm.changeTag && <div className="bulk-setting-fields"><label className="field"><span>Tag (optional)</span><input value={bulkForm.tag} onChange={(event) => setBulkForm({ ...bulkForm, tag: event.target.value })} /><small>Optional label applied to snapshots created by these jobs.</small></label></div>}
+							<label className="check"><input type="checkbox" checked={bulkForm.changeTag} onChange={(event) => setBulkForm({ ...bulkForm, changeTag: event.target.checked })} />{t("ui.pages.protect.change.tag")}</label>
+							{bulkForm.changeTag && <div className="bulk-setting-fields"><label className="field"><span>{t("ui.pages.protect.tag.optional")}</span><input value={bulkForm.tag} onChange={(event) => setBulkForm({ ...bulkForm, tag: event.target.value })} /><small>{t("ui.pages.protect.optional.label.applied.to.snapshots.created.by.these.jobs")}</small></label></div>}
 						</section>
 						<section className="bulk-setting">
-							<label className="check"><input type="checkbox" checked={bulkForm.changeScripts} onChange={(event) => setBulkForm({ ...bulkForm, changeScripts: event.target.checked })} />Change scripts</label>
+							<label className="check"><input type="checkbox" checked={bulkForm.changeScripts} onChange={(event) => setBulkForm({ ...bulkForm, changeScripts: event.target.checked })} />{t("ui.pages.protect.change.scripts")}</label>
 							{bulkForm.changeScripts && <div className="bulk-setting-fields"><JobScriptFields value={bulkForm} onChange={(scripts) => setBulkForm({ ...bulkForm, ...scripts })} /></div>}
 						</section>
 						<section className="bulk-setting">
-							<label className="check"><input type="checkbox" checked={bulkForm.replaceDestinations} onChange={(event) => setBulkForm({ ...bulkForm, replaceDestinations: event.target.checked, repositoryIds: event.target.checked ? bulkForm.repositoryIds : [], engineOptions: event.target.checked ? bulkForm.engineOptions : {} })} />Replace destination vaults</label>
-							{bulkForm.replaceDestinations && <div className="bulk-setting-fields"><div className="field"><span>Destination vaults</span><DestinationVaultPicker repositories={repos ?? []} selectedIds={bulkForm.repositoryIds} onChange={(repositoryIds) => setBulkForm({ ...bulkForm, repositoryIds })} /><small>Selected vaults will replace the complete destination list for every selected job.</small></div><div className="engine-settings"><div className="engine-settings-heading"><strong>Engine-specific settings (optional)</strong><small>These options replace the active engine options for every selected job. Leave blank to use no advanced options.</small></div>{bulkSelectedEngines.map((engine) => <section className="engine-settings-group" key={engine}><h3>{engine[0].toUpperCase() + engine.slice(1)}</h3><label className="field"><span>Advanced CLI options</span><textarea className="mono" rows={3} value={bulkForm.engineOptions[engine] ?? ""} placeholder={engine === "kopia" ? "example: --fail-fast" : "example: --verbose"} onChange={(event) => setBulkForm({ ...bulkForm, engineOptions: { ...bulkForm.engineOptions, [engine]: event.target.value } })} /><small>One option per line. Each line is tokenized as CLI options, so a flag and its value may share a line. Replicaro rejects positional arguments, shell syntax, secrets, and protected repository settings.</small></label></section>)}</div></div>}
+							<label className="check"><input type="checkbox" checked={bulkForm.replaceDestinations} onChange={(event) => setBulkForm({ ...bulkForm, replaceDestinations: event.target.checked, repositoryIds: event.target.checked ? bulkForm.repositoryIds : [], engineOptions: event.target.checked ? bulkForm.engineOptions : {} })} />{t("ui.pages.protect.replace.destination.vaults")}</label>
+							{bulkForm.replaceDestinations && <div className="bulk-setting-fields"><div className="field"><span>{t("ui.pages.protect.destination.vaults")}</span><DestinationVaultPicker repositories={repos ?? []} selectedIds={bulkForm.repositoryIds} onChange={(repositoryIds) => setBulkForm({ ...bulkForm, repositoryIds })} /><small>{t("ui.pages.protect.selected.vaults.will.replace.the.complete.destination.list.for.every.s")}</small></div><div className="engine-settings"><div className="engine-settings-heading"><strong>{t("ui.pages.protect.engine.specific.settings.optional")}</strong><small>{t("ui.pages.protect.these.options.replace.the.active.engine.options.for.every.selected.job")}</small></div>{bulkSelectedEngines.map((engine) => <section className="engine-settings-group" key={engine}><h3>{engine[0].toUpperCase() + engine.slice(1)}</h3><label className="field"><span>{t("ui.pages.protect.advanced.cli.options")}</span><textarea className="mono" rows={3} value={bulkForm.engineOptions[engine] ?? ""} placeholder={engine === "kopia" ? "example: --fail-fast" : "example: --verbose"} onChange={(event) => setBulkForm({ ...bulkForm, engineOptions: { ...bulkForm.engineOptions, [engine]: event.target.value } })} /><small>{t("ui.pages.protect.one.option.per.line.each.line.is.tokenized.as.cli.options.so.a.flag.an")}</small></label></section>)}</div></div>}
 						</section>
 					</div>
-					<div className="modal-footer"><button className="btn" onClick={dismissBulkEdit}>Cancel</button><button className="btn primary" onClick={reviewBulkEdit}>Review changes</button></div>
+					<div className="modal-footer"><button className="btn" onClick={dismissBulkEdit}>{t("ui.pages.protect.cancel")}</button><button className="btn primary" onClick={reviewBulkEdit}>{t("ui.pages.protect.review.changes")}</button></div>
 				</fieldset> : <fieldset className="modal-workflow-fields" disabled={bulkSaving}>
-					<p className="muted modal-intro">Apply these changes to the {selectedJobs.length} selected job{selectedJobs.length === 1 ? "" : "s"}.</p>
+					<p className="muted modal-intro">{t("ui.protect.applyBulkChangesQuestion", { count: selectedJobs.length })}</p>
 					<div className="bulk-review">
-						<div><strong>Jobs</strong><span>{selectedJobs.map((job) => job.name).join(", ")}</span></div>
-						<div><strong>Settings</strong><span>{[
-							bulkForm.changeSchedule && "Schedule",
-							bulkForm.changeRetention && "Retention",
-							bulkForm.changeExcludes && "Exclude patterns",
-							bulkForm.changeTag && "Tag",
-							bulkForm.changeScripts && "Scripts",
-							bulkForm.replaceDestinations && "Destination vaults and active engine options",
+						<div><strong>{t("ui.pages.protect.jobs")}</strong><span>{selectedJobs.map((job) => job.name).join(", ")}</span></div>
+						<div><strong>{t("ui.pages.protect.settings")}</strong><span>{[
+							bulkForm.changeSchedule && t("ui.pages.protect.schedule"),
+							bulkForm.changeRetention && t("ui.pages.protect.retention"),
+							bulkForm.changeExcludes && t("ui.pages.protect.exclude.patterns"),
+							bulkForm.changeTag && t("ui.pages.protect.tag"),
+							bulkForm.changeScripts && t("ui.pages.protect.scripts"),
+							bulkForm.replaceDestinations && t("ui.protect.destinationVaultsAndEngineOptions"),
 						].filter(Boolean).join(", ")}</span></div>
-						{bulkForm.changeSchedule && <div><strong>Schedule</strong><span>{scheduleLabel(scheduleValue(bulkForm) ?? "")}</span></div>}
-						{bulkForm.changeRetention && <div><strong>Retention</strong><span>{retentionReviewSummary(bulkForm)}</span></div>}
-						{bulkForm.changeExcludes && <div><strong>Exclude patterns</strong><span className="mono review-verbatim">{bulkForm.excludes || "None"}</span></div>}
-						{bulkForm.changeTag && <div><strong>Tag</strong><span>{bulkForm.tag.trim() || "None"}</span></div>}
-						{bulkForm.changeScripts && <div><strong>Scripts</strong><span>Before: {bulkForm.beforeScriptPath || "None"}{bulkForm.beforeScriptMustSucceed ? " (must succeed)" : ""}; after: {bulkForm.afterScriptPath || "None"}{bulkForm.afterScriptMustSucceed ? " (must succeed)" : ""}.</span></div>}
-						{bulkForm.replaceDestinations && <div><strong>Destination vaults</strong><span>{bulkForm.repositoryIds.map((id) => repos?.find((repo) => repo.id === id)?.name ?? id).join(", ")} · {selectedJobs.filter((job) => sameStringSet(job.targets.map((target) => target.repositoryId), bulkForm.repositoryIds)).length} already identical</span></div>}
-						{bulkForm.replaceDestinations && <div><strong>Advanced engine options</strong><span className="mono review-verbatim">{bulkSelectedEngines.map((engine) => `${engine}:\n${parsedEngineOptions(bulkForm.engineOptions[engine] ?? "").join("\n") || "None"}`).join("\n\n")}</span></div>}
-						{bulkForm.changeScripts && <div><strong>Script executions</strong><span>Scripts remain configured to run once per independent job/vault target ({selectedJobs.reduce((count, job) => count + (bulkForm.replaceDestinations ? bulkForm.repositoryIds.length : job.targets.length), 0)} targets after this change).</span></div>}
+						{bulkForm.changeSchedule && <div><strong>{t("ui.pages.protect.schedule")}</strong><span>{scheduleLabel(scheduleValue(bulkForm) ?? "")}</span></div>}
+						{bulkForm.changeRetention && <div><strong>{t("ui.pages.protect.retention")}</strong><span>{retentionReviewSummary(bulkForm)}</span></div>}
+						{bulkForm.changeExcludes && <div><strong>{t("ui.pages.protect.exclude.patterns")}</strong><span className="mono review-verbatim">{bulkForm.excludes || t("ui.protect.none")}</span></div>}
+						{bulkForm.changeTag && <div><strong>{t("ui.pages.protect.tag")}</strong><span>{bulkForm.tag.trim() || t("ui.protect.none")}</span></div>}
+						{bulkForm.changeScripts && <div><strong>{t("ui.pages.protect.scripts")}</strong><span>{t("ui.protect.bulkScriptSummary", { before: bulkForm.beforeScriptPath || t("ui.protect.none"), beforeRequirement: bulkForm.beforeScriptMustSucceed ? t("ui.protect.mustSucceed") : "", after: bulkForm.afterScriptPath || t("ui.protect.none"), afterRequirement: bulkForm.afterScriptMustSucceed ? t("ui.protect.mustSucceed") : "" })}</span></div>}
+						{bulkForm.replaceDestinations && <div><strong>{t("ui.pages.protect.destination.vaults")}</strong><span>{bulkForm.repositoryIds.map((id) => repos?.find((repo) => repo.id === id)?.name ?? id).join(", ")} · {t("ui.protect.alreadyIdentical", { count: selectedJobs.filter((job) => sameStringSet(job.targets.map((target) => target.repositoryId), bulkForm.repositoryIds)).length })}</span></div>}
+						{bulkForm.replaceDestinations && <div><strong>{t("ui.pages.protect.advanced.engine.options")}</strong><span className="mono review-verbatim">{bulkSelectedEngines.map((engine) => `${engine}:\n${parsedEngineOptions(bulkForm.engineOptions[engine] ?? "").join("\n") || t("ui.protect.none")}`).join("\n\n")}</span></div>}
+						{bulkForm.changeScripts && <div><strong>{t("ui.pages.protect.script.executions")}</strong><span>{t("ui.protect.scriptExecutionsAfterChange", { count: selectedJobs.reduce((count, job) => count + (bulkForm.replaceDestinations ? bulkForm.repositoryIds.length : job.targets.length), 0) })}</span></div>}
 					</div>
-					<div className="modal-footer"><button className="btn" disabled={bulkSaving} onClick={() => setBulkEditStep("edit")}>Back</button><button className="btn primary" disabled={bulkSaving} onClick={() => void applyBulkEdit()}>{bulkSaving && <span className="spinner" />}Apply changes</button></div>
+					<div className="modal-footer"><button className="btn" disabled={bulkSaving} onClick={() => setBulkEditStep("edit")}>{t("ui.pages.protect.back")}</button><button className="btn primary" disabled={bulkSaving} onClick={() => void applyBulkEdit()}>{bulkSaving && <span className="spinner" />}{t("ui.pages.protect.apply.changes")}</button></div>
 				</fieldset>}
 			</Modal>}
 
-			{bulkResults && <Modal title="Bulk edit results" onClose={dismissBulkResults}>
-				<p className="muted modal-intro">Every selected job is listed separately.</p>
+			{bulkResults && <Modal title={t("ui.pages.protect.bulk.edit.results")} onClose={dismissBulkResults}>
+				<p className="muted modal-intro">{t("ui.pages.protect.every.selected.job.is.listed.separately")}</p>
 				<div className="mutation-results">{bulkResults.items.map((item) => <div className={`mutation-result ${item.status}`} key={item.jobId ?? item.name}>
 					<strong>{item.name}</strong>
 					<span>{item.status[0].toUpperCase() + item.status.slice(1)}</span>
 					<small>{item.message}</small>
 				</div>)}</div>
 				<div className="modal-footer">
-					{bulkResults.items.some((item) => item.status === "failed") && <button className="btn" disabled={bulkRetrying} onClick={() => void retryFailedBulkJobs()}>{bulkRetrying && <span className="spinner" />}Retry failed jobs</button>}
-					<button className="btn primary" disabled={bulkRetrying} onClick={dismissBulkResults}>Close</button>
+					{bulkResults.items.some((item) => item.status === "failed") && <button className="btn" disabled={bulkRetrying} onClick={() => void retryFailedBulkJobs()}>{bulkRetrying && <span className="spinner" />}{t("ui.pages.protect.retry.failed.jobs")}</button>}
+					<button className="btn primary" disabled={bulkRetrying} onClick={dismissBulkResults}>{t("ui.pages.protect.close")}</button>
 				</div>
 			</Modal>}
 
-				{jobDelete && <ConfirmDialog title={`Delete "${jobDelete.name}"?`} message="Its run history is kept, but no further backups will run. Existing backup data is untouched." confirmLabel="Delete job" busy={jobDeleting} onConfirm={() => void removeJob()} onCancel={dismissJobDelete} />}
+				{jobDelete && <ConfirmDialog title={t("ui.protect.deleteNamedJobQuestion", { name: jobDelete.name })} message={t("ui.pages.protect.its.run.history.is.kept.but.no.further.backups.will.run.existing.backu")} confirmLabel={t("ui.pages.protect.delete.job")} busy={jobDeleting} onConfirm={() => void removeJob()} onCancel={dismissJobDelete} />}
             {selectedRunJob && (
-                <Modal title={`Run "${selectedRunJob.name}"`} onClose={dismissRunReview}>
-					{runResults ? <article aria-label="Manual backup admission results">
-						<p className="muted modal-intro">Every requested destination is listed separately.</p>
+                <Modal title={t("ui.protect.runNamedJob", { name: selectedRunJob.name })} onClose={dismissRunReview}>
+					{runResults ? <article aria-label={t("ui.pages.protect.manual.backup.admission.results")}>
+						<p className="muted modal-intro">{t("ui.pages.protect.every.requested.destination.is.listed.separately")}</p>
 						<div className="unowned-snapshots">{runResults.map((result) => {
 							const target = selectedRunJob.targets.find((candidate) => candidate.repositoryId === result.repositoryId);
 							return <div className="unowned-snapshot" key={result.repositoryId}>
@@ -4758,79 +4792,79 @@ export default function Protect() {
 							</div>;
 						})}</div>
 					</article> : <>
-						<p className="muted modal-intro">Choose which destination vault to back up to.</p>
+						<p className="muted modal-intro">{t("ui.pages.protect.choose.which.destination.vault.to.back.up.to")}</p>
 						<BackupRunPicker job={selectedRunJob} busy={runBusy} onRun={(repositoryId) => void startRun(selectedRunJob, repositoryId)} />
 					</>}
                 </Modal>
             )}
 
             {showVaultChoice && (
-				<Modal title="Add a vault" onClose={() => setShowVaultChoice(false)}>
+				<Modal title={t("ui.pages.protect.add.a.vault")} onClose={() => setShowVaultChoice(false)}>
 					<div className="vault-choice-grid">
-						<button className="vault-choice" onClick={() => openVaultCreate()}><Icon name="plus" size={22} /><span><strong>Create new vault</strong><small>Create a new encrypted backup destination.</small></span></button>
-						<button className="vault-choice" onClick={() => { resetConnectWorkflow(); setShowVaultChoice(false); setShowVaultConnect(true); refreshConnectionIntents(); }}><Icon name="restore" size={22} /><span><strong>Connect existing vault</strong><small>Reconnect an existing Replicaro vault or import an existing Restic or Kopia vault.<br /><br />Imported Restic/Kopia vaults are converted to Replicaro vaults without deleting or modifying your backed up data.</small></span></button>
+						<button className="vault-choice" onClick={() => openVaultCreate()}><Icon name="plus" size={22} /><span><strong>{t("ui.pages.protect.create.new.vault")}</strong><small>{t("ui.pages.protect.create.a.new.encrypted.backup.destination")}</small></span></button>
+						<button className="vault-choice" onClick={() => { resetConnectWorkflow(); setShowVaultChoice(false); setShowVaultConnect(true); refreshConnectionIntents(); }}><Icon name="restore" size={22} /><span><strong>{t("ui.pages.protect.connect.existing.vault")}</strong><small>{t("ui.protect.connectExistingHelp")}<br /><br />{t("ui.protect.importNativeVaultHelp")}</small></span></button>
 					</div>
 				</Modal>
 			)}
 
 			{showVaultConnect && !connectRcloneAuthorizationAction && (
-				<Modal title="Connect existing vault" wide onClose={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>
+				<Modal title={t("ui.pages.protect.connect.existing.vault")} wide onClose={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>
 					<fieldset className="modal-form modal-workflow-fields" disabled={connectSaving}>
 						{/* Discovery inputs are intentionally unmounted after a successful
 						    preview so credentials and already-reviewed destination details do
 						    not compete with the attachment decisions. Check another vault
 						    restores a clean discovery form. */}
 						{!connectPreview && <>
-							<p className="section-copy">Enter the existing vault&apos;s details. Replicaro detects the vault&apos;s engine automatically.</p>
-						<label className="field"><span>Storage type</span><select value={connectForm.coldStorage ? "cold_s3" : connectForm.connector} disabled={Boolean(connectPreview || retryConnectionIntentId)} onChange={(event) => { if (connectRcloneAuth?.sessionId) void closeRcloneAuthorization(connectRcloneAuth.sessionId); setConnectRcloneAuth(null); const coldStorage = event.target.value === "cold_s3"; const connector = coldStorage ? "s3" : event.target.value; const selected = connectionIntegrations.find((item) => item.id === connector); invalidateConnectPreview(); setConnectForm((current) => ({ ...current, engine: coldStorage ? "restic" : current.engine, connector, coldStorage, archiveWriteClass: "GLACIER", checkSchedule: coldStorage ? "manual" : current.checkSchedule, location: "", pendingLocation: "", options: integrationDefaults(selected), objectLock: emptyObjectLock() })); }}>{connectionIntegrations.flatMap((item) => [<option key={item.id} value={item.id}>{item.label}</option>, ...(item.id === "s3" ? [<option key="cold_s3" value="cold_s3">Cold Storage [Must Be S3 Compatible]</option>] : [])])}</select>{connectIntegration && <small>{connectForm.coldStorage ? "Supports all S3-compatible cold object storage that accept GLACIER or DEEP_ARCHIVE storage class." : connectIntegrationDescription}</small>}</label>
-						{(!connectPreview || !connectUsesRcloneLogin) && (connectIntegration?.localBrowser ? <label className="field"><span>Location</span><DirectoryField value={connectForm.location} disabled={Boolean(retryConnectionIntentId)} placeholder={examplePlaceholder(connectIntegration.placeholder)} onChange={(location) => { invalidateConnectPreview(); setConnectForm((current) => ({ ...current, location, pendingLocation: "" })); }} /></label> : connectIntegration ? <RemoteVaultFields form={connectForm} integration={connectIntegration} onChange={(next) => { if (!retryConnectionIntentId) invalidateConnectPreview(); setConnectForm(next); }} /> : null)}
-						{!connectUsesRcloneLogin && connectOrderedOptions.filter((option) => !option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}
-							{(!connectPreview || !connectUsesRcloneLogin) && <label className="field"><span>Vault encryption password</span><input type="password" value={connectForm.password} onChange={(event) => { if (!retryConnectionIntentId) invalidateConnectPreview(); setConnectForm((current) => ({ ...current, password: event.target.value })); }} /><small>The password is used to decrypt and validate the vault. The password is never stored in the vault, and the password never leaves your computer.</small></label>}
+							<p className="section-copy">{t("ui.protect.enterExistingDetailsHelp")}</p>
+						<label className="field"><span>{t("ui.pages.protect.storage.type")}</span><select value={connectForm.coldStorage ? "cold_s3" : connectForm.connector} disabled={Boolean(connectPreview || retryConnectionIntentId)} onChange={(event) => { if (connectRcloneAuth?.sessionId) void closeRcloneAuthorization(connectRcloneAuth.sessionId); setConnectRcloneAuth(null); const coldStorage = event.target.value === "cold_s3"; const connector = coldStorage ? "s3" : event.target.value; const selected = connectionIntegrations.find((item) => item.id === connector); invalidateConnectPreview(); setConnectForm((current) => ({ ...current, engine: coldStorage ? "restic" : current.engine, connector, coldStorage, archiveWriteClass: "GLACIER", checkSchedule: coldStorage ? "manual" : current.checkSchedule, location: "", pendingLocation: "", options: integrationDefaults(selected), objectLock: emptyObjectLock() })); }}>{connectionIntegrations.flatMap((item) => [<option key={item.id} value={item.id}>{knownMessage(`ui.integration.${item.id}.label`, item.label)}</option>, ...(item.id === "s3" ? [<option key="cold_s3" value="cold_s3">{t("ui.pages.protect.cold.storage.must.be.s3.compatible")}</option>] : [])])}</select>{connectIntegration && <small>{connectForm.coldStorage ? t("ui.protect.coldS3CompatibilityHelp", { glacier: "GLACIER", deepArchive: "DEEP_ARCHIVE" }) : connectIntegrationDescription}</small>}</label>
+						{(!connectPreview || !connectUsesRcloneLogin) && (connectIntegration?.localBrowser ? <label className="field"><span>{t("ui.pages.protect.location")}</span><DirectoryField value={connectForm.location} disabled={Boolean(retryConnectionIntentId)} placeholder={examplePlaceholder(connectIntegration.placeholder)} onChange={(location) => { invalidateConnectPreview(); setConnectForm((current) => ({ ...current, location, pendingLocation: "" })); }} /></label> : connectIntegration ? <RemoteVaultFields form={connectForm} integration={connectIntegration} onChange={(next) => { if (!retryConnectionIntentId) invalidateConnectPreview(); setConnectForm(next); }} /> : null)}
+						{!connectUsesRcloneLogin && connectOrderedOptions.filter((option) => !option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={connectForm.connector} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}
+							{(!connectPreview || !connectUsesRcloneLogin) && <label className="field"><span>{t("ui.pages.protect.vault.encryption.password")}</span><input type="password" value={connectForm.password} onChange={(event) => { if (!retryConnectionIntentId) invalidateConnectPreview(); setConnectForm((current) => ({ ...current, password: event.target.value })); }} /><small>{t("ui.pages.protect.the.password.is.used.to.decrypt.and.validate.the.vault.the.password.is")}</small></label>}
 						{matchingConnectionIntent && <section className="recovery-warning recovery-fallback-message" role="status">
-							<p><strong>{retryConnectionError ? "The previous connection could not be completed." : matchingConnectionIntent.state === "prepared" ? "An earlier connection was saved for this destination." : "An unfinished connection was found for this destination."}</strong></p>
-							<p>{retryConnectionError ? "The saved attempt is still available. Check the destination and password, then try again." : matchingConnectionIntent.state === "prepared" ? "It stopped before Replicaro published changes to the vault. Continue it, or cancel it and check these details again. Replicaro will verify the vault identity before continuing." : "Replicaro may have updated the vault's recovery profile. Continue the saved attempt; Replicaro will verify the vault identity and credentials before attaching it here."}</p>
+							<p><strong>{retryConnectionError ? t("ui.protect.previousConnectionIncomplete") : matchingConnectionIntent.state === "prepared" ? t("ui.protect.earlierConnectionSaved") : t("ui.protect.unfinishedConnectionFound")}</strong></p>
+							<p>{retryConnectionError ? t("ui.protect.savedAttemptAvailable") : matchingConnectionIntent.state === "prepared" ? t("ui.protect.prePublicationAttemptHelp") : t("ui.protect.profileUpdatedAttemptHelp")}</p>
 							{retryConnectionError && <p>{retryConnectionError}</p>}
-							<div className="vault-removal-actions">{!retryConnectionIntentId && <button className="btn primary" disabled={connectChecking || connectSaving} onClick={() => selectConnectionIntent(matchingConnectionIntent)}>Continue previous connection</button>}{matchingConnectionIntent.state === "prepared" && <button className="btn" disabled={connectChecking || connectSaving || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => void startNewConnectionCheck(matchingConnectionIntent)}>Start a new check</button>}</div>
+							<div className="vault-removal-actions">{!retryConnectionIntentId && <button className="btn primary" disabled={connectChecking || connectSaving} onClick={() => selectConnectionIntent(matchingConnectionIntent)}>{t("ui.pages.protect.continue.previous.connection")}</button>}{matchingConnectionIntent.state === "prepared" && <button className="btn" disabled={connectChecking || connectSaving || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => void startNewConnectionCheck(matchingConnectionIntent)}>{t("ui.pages.protect.start.a.new.check")}</button>}</div>
 						</section>}
-						{connectForm.coldStorage && <div className="recovery-warning">{coldStorageProviderGuidance.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>}
-						{!connectUsesRcloneLogin && connectOrderedOptions.some((option) => option.advanced) && <button className="btn advanced-toggle" onClick={() => setConnectAdvanced((value) => !value)}><Icon name="settings" size={14} />{connectAdvanced ? "Hide advanced settings" : "Advanced settings"}</button>}
-						{!connectUsesRcloneLogin && connectAdvanced && <div className="advanced-panel">{connectOrderedOptions.filter((option) => option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}</div>}
-						<div className="modal-footer"><button className="btn" disabled={connectSaving} onClick={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>Cancel</button>
-										{matchingConnectionIntent && retryConnectionIntentId ? <button className="btn primary" disabled={connectChecking || connectSaving || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => void retryPendingConnection()}>{connectSaving && <span className="spinner" />}{retryConnectionError ? "Retry connection" : "Continue previous connection"}</button> : (!matchingConnectionIntent || canCheckAnotherRcloneAccount) && <button className="btn primary" disabled={connectChecking || !vaultLocation(connectForm) || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => { if (connectUsesRcloneLogin) setConnectRcloneAuthorizationAction("check"); else void checkExistingVault(); }}>{connectChecking && <span className="spinner" />}Check existing vault</button>}
+						{connectForm.coldStorage && <div className="recovery-warning">{coldStorageProviderGuidance().map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>}
+						{!connectUsesRcloneLogin && connectOrderedOptions.some((option) => option.advanced) && <button className="btn advanced-toggle" onClick={() => setConnectAdvanced((value) => !value)}><Icon name="settings" size={14} />{connectAdvanced ? t("ui.pages.protect.hide.advanced.settings") : t("ui.pages.protect.advanced.settings")}</button>}
+						{!connectUsesRcloneLogin && connectAdvanced && <div className="advanced-panel">{connectOrderedOptions.filter((option) => option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={connectForm.connector} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}</div>}
+						<div className="modal-footer"><button className="btn" disabled={connectSaving} onClick={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>{t("ui.pages.protect.cancel")}</button>
+										{matchingConnectionIntent && retryConnectionIntentId ? <button className="btn primary" disabled={connectChecking || connectSaving || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => void retryPendingConnection()}>{connectSaving && <span className="spinner" />}{retryConnectionError ? t("ui.protect.retryConnection") : t("ui.protect.continuePreviousConnection")}</button> : (!matchingConnectionIntent || canCheckAnotherRcloneAccount) && <button className="btn primary" disabled={connectChecking || !vaultLocation(connectForm) || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => { if (connectUsesRcloneLogin) setConnectRcloneAuthorizationAction("check"); else void checkExistingVault(); }}>{connectChecking && <span className="spinner" />}{t("ui.pages.protect.check.existing.vault")}</button>}
 						</div>
 						</>}
 						{connectPreview && <>
 							{connectPreview.existingVault ? <div className="recovery-warning recovery-fallback-message">
-									<p><strong>Registered vault found: {connectPreview.existingVault.name}</strong></p>
-									<p>This is the same protected vault UUID as the existing registration. Replicaro will update that one vault; it will not add a duplicate or import jobs from this copy.</p>
-									<p>All current local backup jobs, job UUIDs, sources, target memberships, and source bindings will remain unchanged.</p>
+									<p><strong>{t("ui.protect.registeredVaultFound", { vault: connectPreview.existingVault.name })}</strong></p>
+									<p>{t("ui.pages.protect.this.is.the.same.protected.vault.uuid.as.the.existing.registration.rep")}</p>
+									<p>{t("ui.pages.protect.all.current.local.backup.jobs.job.uuids.sources.target.memberships.and")}</p>
 								</div> : connectPreview.mode === "fallback" ? <div className="recovery-warning recovery-fallback-message">
-									<p>Existing {connectPreview.engine[0].toUpperCase() + connectPreview.engine.slice(1)} vault found. Replicaro will import this vault and convert it into a Replicaro vault. Your backed up data will not be modified.</p>
-									<p>Replicaro allows you to browse, restore, and delete snapshots that already exist in this vault, but Replicaro will not apply any retention policies to those snapshots. Retention policies will apply to all new snapshots going forward.</p>
-									<p>Replicaro automatically creates backup jobs of all the backed up sources in your {connectPreview.engine[0].toUpperCase() + connectPreview.engine.slice(1)} snapshots. The jobs will be disabled, and you will need to manually enable them if you want to run them; or, you can delete the jobs if you do not want them.</p>
-									<p>Remember to disable {connectPreview.engine[0].toUpperCase() + connectPreview.engine.slice(1)} (and any other software aside from Replicaro) from accessing this vault. Only Replicaro should now be using this vault.</p>
+									<p>{t("ui.protect.nativeVaultFoundImportHelp", { engine: connectPreview.engine[0].toUpperCase() + connectPreview.engine.slice(1) })}</p>
+									<p>{t("ui.pages.protect.replicaro.allows.you.to.browse.restore.and.delete.snapshots.that.alrea")}</p>
+									<p>{t("ui.protect.importedJobsHelp", { engine: connectPreview.engine[0].toUpperCase() + connectPreview.engine.slice(1) })}</p>
+									<p>{t("ui.protect.disableOtherWritersHelp", { engine: connectPreview.engine[0].toUpperCase() + connectPreview.engine.slice(1) })}</p>
 								</div> : <div className="recovery-warning recovery-fallback-message">
-									<p>Existing Replicaro vault found. The vault uses {connectPreview.engine[0].toUpperCase() + connectPreview.engine.slice(1)} as the engine.</p>
-									{!connectProfileUUID && <p>{connectProfileChoiceMade ? "Replicaro will join this vault as a new profile." : "Choose how this computer will join the vault."}</p>}
-									{connectProfileUUID && <p>Replicaro will import all vault settings, backup jobs, and snapshots from the selected profile. All imported jobs are initially disabled. {connectAccessReminder}</p>}
-									{!connectProfileUUID && <p>{connectAccessReminder}</p>}
+									<p>{t("ui.protect.existingReplicaroEngine", { engine: connectPreview.engine[0].toUpperCase() + connectPreview.engine.slice(1) })}</p>
+									{!connectProfileUUID && <p>{connectProfileChoiceMade ? t("ui.protect.joinNewProfileHelp") : t("ui.protect.chooseProfileHelp")}</p>}
+									{connectProfileUUID && <p>{t("ui.protect.importSelectedProfileHelp")}</p>}
+									{!connectProfileUUID && <p>{connectAccessReminder()}</p>}
 								</div>}
-							{connectPreview.profileDegraded && <p className="recovery-warning">The canonical recovery profile is damaged or missing. A verified previous generation was used and will be repaired during connection.</p>}
+							{connectPreview.profileDegraded && <p className="recovery-warning">{t("ui.pages.protect.the.canonical.recovery.profile.is.damaged.or.missing.a.verified.previo")}</p>}
 							{connectProfileSelectionVisible && <fieldset className="connection-decision field multi-computer-field" aria-busy={Boolean(connectPendingProfileChoice)}>
-								<legend>Do you want to join this vault as a new profile or use an existing profile? Using an existing profile allows you to import that profile&apos;s jobs and take control of the profile&apos;s backed up snapshots. Using an existing profile takes it over; Replicaro on the other computer can no longer use that profile unless it reconnects or joins with another profile.</legend>
+								<legend>{t("ui.protect.profileChoiceLegend")}</legend>
 								<div className="radio-options">
-									<label><input type="radio" name="connect-profile" disabled={connectChecking} checked={connectPendingProfileChoice ? connectPendingProfileChoice.join : connectProfileChoiceMade && connectProfileAction === "join"} onChange={() => void checkExistingVault("", true)} />Join vault as new profile</label>
-									{(connectPreview.profiles ?? []).map((profile) => <label key={profile.profile_uuid}><input type="radio" name="connect-profile" disabled={connectChecking} checked={connectPendingProfileChoice ? !connectPendingProfileChoice.join && connectPendingProfileChoice.profileUUID === profile.profile_uuid : connectProfileUUID === profile.profile_uuid} onChange={() => void checkExistingVault(profile.profile_uuid)} />Use profile from {profile.attachment.display.computerName || "Unknown computer"}@{profile.attachment.display.operatingSystem || "unknown"} — Created {profileDateLabel(profile.createdAt)}{profile.vaultOwner ? " — Current vault owner" : ""}</label>)}
+									<label><input type="radio" name="connect-profile" disabled={connectChecking} checked={connectPendingProfileChoice ? connectPendingProfileChoice.join : connectProfileChoiceMade && connectProfileAction === "join"} onChange={() => void checkExistingVault("", true)} />{t("ui.pages.protect.join.vault.as.new.profile")}</label>
+									{(connectPreview.profiles ?? []).map((profile) => <label key={profile.profile_uuid}><input type="radio" name="connect-profile" disabled={connectChecking} checked={connectPendingProfileChoice ? !connectPendingProfileChoice.join && connectPendingProfileChoice.profileUUID === profile.profile_uuid : connectProfileUUID === profile.profile_uuid} onChange={() => void checkExistingVault(profile.profile_uuid)} />{(profile.vaultOwner ? t("ui.protect.ownerProfileChoice", { computer: profile.attachment.display.computerName || t("ui.protect.unknownComputer"), os: profile.attachment.display.operatingSystem || t("ui.protect.unknown"), created: profileDateLabel(profile.createdAt) }) : t("ui.protect.profileChoice", { computer: profile.attachment.display.computerName || t("ui.protect.unknownComputer"), os: profile.attachment.display.operatingSystem || t("ui.protect.unknown"), created: profileDateLabel(profile.createdAt) }))}</label>)}
 								</div>
-								{connectPendingProfileChoice && <p className="connection-profile-loading" role="status" aria-live="polite"><span className="spinner" aria-hidden="true" />{connectPendingProfileChoice.join ? "Hang on, Replicaro is creating a new profile for you..." : "Hang on, Replicaro is grabbing the profile you selected..."}</p>}
+								{connectPendingProfileChoice && <p className="connection-profile-loading" role="status" aria-live="polite"><span className="spinner" aria-hidden="true" />{connectPendingProfileChoice.join ? t("ui.protect.creatingProfileStatus") : t("ui.protect.grabbingProfileStatus")}</p>}
 								{/* Vault ownership follows the selected owner profile. Asking for a
 								    second owner decision would suggest a separate root transfer that
 								    this attachment transition neither needs nor performs. */}
-								{selectedProfileIsOwner && <p className="connection-decision-note">{currentOwnerName} is the current vault owner. Vault owners are responsible for running integrity checks and space reclamation on a vault, and only vault owners can change the vault&apos;s encryption password. By selecting the {currentOwnerName} profile, you will also take over as vault owner.</p>}
+								{selectedProfileIsOwner && <p className="connection-decision-note">{t("ui.protect.ownerProfileTakeoverHelp", { owner: currentOwnerName })}</p>}
 							</fieldset>}
-							{connectPreview.mode === "profile" && !connectPreview.existingVault && selectedConnectProfile?.localAttachment && <p className="connection-decision-note">This computer already has a profile in this vault, so Replicaro will reconnect it automatically.</p>}
+							{connectPreview.mode === "profile" && !connectPreview.existingVault && selectedConnectProfile?.localAttachment && <p className="connection-decision-note">{t("ui.pages.protect.this.computer.already.has.a.profile.in.this.vault.so.replicaro.will.re")}</p>}
 							{connectPreview.mode === "profile" && !connectPreview.existingVault && connectProfileChoiceMade && !selectedProfileIsOwner && <fieldset className="connection-decision field multi-computer-field">
-								<legend>{currentOwnerName} is the current vault owner. Vault owners are responsible for running integrity checks and space reclamation on a vault, and only vault owners can change the vault&apos;s encryption password. Do you want to take over as vault owner?</legend>
+								<legend>{t("ui.protect.takeoverChoiceLegend", { owner: currentOwnerName })}</legend>
 								<div className="radio-options">
 									<label><input type="radio" name="connect-owner" checked={!selectedProfileIsOwner && connectOwnerChoiceMade && connectOwnerAction === "keep"} disabled={connectChecking || selectedProfileIsOwner} onChange={() => {
 										// Relocking an owner-only field must restore the reviewed root value;
@@ -4838,99 +4872,99 @@ export default function Protect() {
 										setConnectForm((current) => ({ ...current, checkSchedule: current.coldStorage ? "manual" : connectReviewedIntegritySchedule, maintenanceSchedule: connectReviewedMaintenanceSchedule }));
 										setConnectOwnerAction("keep");
 										setConnectOwnerChoiceMade(true);
-									}} />No, leave {currentOwnerName} as the vault owner</label>
-									<label><input type="radio" name="connect-owner" checked={selectedProfileIsOwner || connectOwnerChoiceMade && connectOwnerAction === "takeover"} disabled={connectChecking || selectedProfileIsOwner} onChange={() => { setConnectOwnerAction("takeover"); setConnectOwnerChoiceMade(true); }} />Yes, make me vault owner</label>
+									}} />{t("ui.protect.leaveCurrentOwner", { owner: currentOwnerName })}</label>
+									<label><input type="radio" name="connect-owner" checked={selectedProfileIsOwner || connectOwnerChoiceMade && connectOwnerAction === "takeover"} disabled={connectChecking || selectedProfileIsOwner} onChange={() => { setConnectOwnerAction("takeover"); setConnectOwnerChoiceMade(true); }} />{t("ui.pages.protect.yes.make.me.vault.owner")}</label>
 								</div>
 							</fieldset>}
 							{connectNameConflictNotice && <div className="recovery-warning recovery-fallback-message"><p>{connectNameConflictNotice}</p></div>}
 							{connectPreview.mode === "fallback" && connectPreview.objectLockEnrollmentAvailable && <ObjectLockFields form={connectForm} creation onChange={setConnectForm} />}
-							<div className="form-grid two"><label className="field"><span>Vault name</span><input aria-label="Vault name" disabled={connectUsesRcloneLogin} value={connectForm.name} onChange={(event) => setConnectForm({ ...connectForm, name: event.target.value })} /><small>{connectUsesRcloneLogin ? `This name cannot be changed from the existing vault name on ${connectIntegration?.label}.` : connectPreview.existingVault ? "Review the saved name for this existing vault." : "Vault names cannot be changed after initial connection. Choose wisely."}</small></label><label className="field"><span>Description (optional)</span><input value={connectForm.description} onChange={(event) => setConnectForm({ ...connectForm, description: event.target.value })} /></label></div>
+							<div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.vault.name")}</span><input aria-label={t("ui.pages.protect.vault.name")} disabled={connectUsesRcloneLogin} value={connectForm.name} onChange={(event) => setConnectForm({ ...connectForm, name: event.target.value })} /><small>{connectUsesRcloneLogin ? t("ui.protect.rcloneNameImmutableHelp", { provider: connectIntegration ? knownMessage(`ui.integration.${connectIntegration.id}.label`, connectIntegration.label) : "" }) : connectPreview.existingVault ? t("ui.protect.reviewSavedName") : t("ui.protect.nameImmutableHelp")}</small></label><label className="field"><span>{t("ui.pages.protect.description.optional")}</span><input value={connectForm.description} onChange={(event) => setConnectForm({ ...connectForm, description: event.target.value })} /></label></div>
 							<VaultCareFields form={connectForm} integrityDisabled={connectIntegrityLocked} maintenanceDisabled={connectMaintenanceLocked} integrityLockedHelp={connectIntegrityLockedHelp} maintenanceLockedHelp={connectMaintenanceLockedHelp} onChange={setConnectForm} />
 							{connectPreview.existingVault && <fieldset className="connection-decision field">
-								<legend>Exact Update existing vault changes</legend>
+								<legend>{t("ui.pages.protect.exact.update.existing.vault.changes")}</legend>
 								<ul>{existingVaultUpdateChanges.map((change) => <li key={change}>{change}</li>)}</ul>
-								<label><input type="checkbox" checked={connectUpdateConfirmedDigest === connectUpdateReviewDigest} onChange={(event) => setConnectUpdateConfirmedDigest(event.target.checked ? connectUpdateReviewDigest : "")} />Update this existing vault registration with exactly these reviewed changes</label>
+								<label><input type="checkbox" checked={connectUpdateConfirmedDigest === connectUpdateReviewDigest} onChange={(event) => setConnectUpdateConfirmedDigest(event.target.checked ? connectUpdateReviewDigest : "")} />{t("ui.pages.protect.update.this.existing.vault.registration.with.exactly.these.reviewed.ch")}</label>
 							</fieldset>}
 						</>}
 					</fieldset>
-					{connectPreview && <div className="modal-footer"><button className="btn" disabled={connectSaving} onClick={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>Cancel</button><button className="btn" disabled={connectSaving} onClick={resetConnectForNewAttempt}>Check another vault</button><button className="btn primary" disabled={connectSaving || connectChecking || connectRcloneNameConflict || !validVaultName(connectForm.name) || !connectProfileReady || !connectOwnerReady || Boolean(connectPreview.existingVault && connectUpdateConfirmedDigest !== connectUpdateReviewDigest) || !validObjectLockSettings(connectForm.objectLock, connectForm.maintenanceSchedule, connectPreview.mode === "profile")} onClick={() => void saveExistingVault()}>{connectSaving && <span className="spinner" />}{connectPreview.existingVault ? "Update existing vault" : "Connect vault"}</button></div>}
-					{(connectChecking || connectSaving) && vaultProgress.length > 0 && <VaultActivityLog records={vaultProgress} />}
+					{connectPreview && <div className="modal-footer"><button className="btn" disabled={connectSaving} onClick={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>{t("ui.pages.protect.cancel")}</button><button className="btn" disabled={connectSaving} onClick={resetConnectForNewAttempt}>{t("ui.pages.protect.check.another.vault")}</button><button className="btn primary" disabled={connectSaving || connectChecking || connectRcloneNameConflict || !validVaultName(connectForm.name) || !connectProfileReady || !connectOwnerReady || Boolean(connectPreview.existingVault && connectUpdateConfirmedDigest !== connectUpdateReviewDigest) || !validObjectLockSettings(connectForm.objectLock, connectForm.maintenanceSchedule, connectPreview.mode === "profile")} onClick={() => void saveExistingVault()}>{connectSaving && <span className="spinner" />}{connectPreview.existingVault ? t("ui.protect.updateExistingVault") : t("ui.protect.connectVault")}</button></div>}
+					{(connectChecking || connectSaving) && <VaultActivityLog records={vaultProgress} />}
 				</Modal>
 			)}
 
 			{showVaultConnect && connectRcloneAuthorizationAction && connectIntegration && (
-				<Modal title={`Connect ${connectIntegration.label}`} onClose={closeConnectRcloneAuthorization}>
+				<Modal title={t("ui.rclone.connectProvider", { provider: knownMessage(`ui.integration.${connectIntegration.id}.label`, connectIntegration.label) })} onClose={closeConnectRcloneAuthorization}>
 					<div className="modal-form">
-						<p>Replicaro uses open source <a href="https://github.com/rclone/rclone" target="_blank" rel="noreferrer">rclone</a> to connect to {connectIntegration.label}. You need to authorize rclone with your {connectIntegration.label} account in order to create backups. You can revoke access at any time, and only Replicaro will be able to use this rclone access. Click the connect button below to get started.</p>
-						<RcloneAuthorization provider={connectForm.connector} label={connectIntegration.label} readyAction="check existing vault" value={connectRcloneAuth} disabled={connectChecking || connectSaving} closeOnUnmount={false} showDescription={false} onChange={setConnectRcloneAuth} onError={(message) => toast("error", message)} />
+						<p>{renderMessage("ui.rclone.authorizationDescription", { provider: knownMessage(`ui.integration.${connectIntegration.id}.label`, connectIntegration.label), rcloneLink: <a href="https://github.com/rclone/rclone" target="_blank" rel="noreferrer">{t("ui.pages.protect.rclone")}</a> })}</p>
+						<RcloneAuthorization provider={connectForm.connector} label={knownMessage(`ui.integration.${connectIntegration.id}.label`, connectIntegration.label)} readyAction="check existing vault" value={connectRcloneAuth} disabled={connectChecking || connectSaving} closeOnUnmount={false} showDescription={false} onChange={setConnectRcloneAuth} onError={(message) => toast("error", message)} />
 					</div>
 					<div className="modal-footer">
-						<button className="btn" disabled={connectChecking || connectSaving} onClick={closeConnectRcloneAuthorization}>Back</button>
+						<button className="btn" disabled={connectChecking || connectSaving} onClick={closeConnectRcloneAuthorization}>{t("ui.pages.protect.back")}</button>
 						{connectRcloneAuth?.status === "ready" && <button className="btn primary" disabled={connectChecking || connectSaving} onClick={() => {
 							if (connectRcloneAuthorizationAction === "retry") void retryPendingConnection();
 							else void checkExistingVault().then((succeeded) => { if (succeeded) setConnectRcloneAuthorizationAction(null); });
-						}}>{(connectChecking || connectSaving) && <span className="spinner" />}{connectRcloneAuthorizationAction === "retry" ? "Retry connection" : "Check existing vault"}</button>}
+						}}>{(connectChecking || connectSaving) && <span className="spinner" />}{connectRcloneAuthorizationAction === "retry" ? t("ui.pages.protect.retry.connection") : t("ui.pages.protect.check.existing.vault")}</button>}
 					</div>
-					{(connectChecking || connectSaving) && vaultProgress.length > 0 && <VaultActivityLog records={vaultProgress} />}
+					{(connectChecking || connectSaving) && <VaultActivityLog records={vaultProgress} />}
 				</Modal>
 			)}
 
             {showVaultCreate && !showCreateRcloneAuthorization && (
-				<Modal title="Add a vault" wide onClose={closeVaultCreate}>
+				<Modal title={t("ui.pages.protect.add.a.vault")} wide onClose={closeVaultCreate}>
 					<fieldset className="modal-workflow-fields" disabled={vaultSaving}>
 					<div className="modal-form">
-						<p className="section-copy">Encryption, compression, and deduplication are automatically applied to all vaults. All fields are required except ones marked as optional.</p>
-						<label className="field"><span>Storage type</span><select autoFocus value={vaultForm.coldStorage ? "cold_s3" : vaultForm.connector} disabled={Boolean(vaultForm.pendingLocation)} onChange={(event) => { if (createRcloneAuth?.sessionId) void closeRcloneAuthorization(createRcloneAuth.sessionId); setCreateRcloneAuth(null); setShowCreateRcloneAuthorization(false); const coldStorage = event.target.value === "cold_s3"; const connector = coldStorage ? "s3" : event.target.value; const selected = vaultStorageIntegrations.find((item) => item.id === connector); const eligible = engineCatalog.filter((descriptor) => descriptor.installed && descriptor.providers.some((provider) => provider.id === connector && provider.supported)); const engine = coldStorage ? "restic" : eligible.some((descriptor) => descriptor.id === vaultForm.engine) ? vaultForm.engine : (eligible.find((descriptor) => descriptor.id === "restic")?.id ?? eligible[0]?.id ?? vaultForm.engine) as VaultForm["engine"]; setVaultForm({ ...vaultForm, engine, connector, coldStorage, archiveWriteClass: "GLACIER", checkSchedule: coldStorage ? "manual" : vaultForm.checkSchedule, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "", options: integrationOptionsForEngine(selected, engine, engineCatalog), objectLock: objectLockForSelection(vaultForm.objectLock, engine, connector) }); }}>{vaultStorageIntegrations.flatMap((item) => [<option key={item.id} value={item.id}>{item.label}</option>, ...(item.id === "s3" ? [<option key="cold_s3" value="cold_s3">Cold Storage [Must Be S3 Compatible]</option>] : [])])}</select>{integration && <small>{vaultForm.coldStorage ? "Supports all S3-compatible cold object storage that accept GLACIER or DEEP_ARCHIVE storage class." : createIntegrationDescription}</small>}</label>
-						<label className="field"><span>Vault name</span><input aria-label="Vault name" disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.name} placeholder="example: Work archive" onChange={(event) => setVaultForm({ ...vaultForm, name: event.target.value })} /><small>Vault names cannot be changed after creation and are limited to {MAX_VAULT_NAME_CODE_POINTS} characters. Choose wisely.</small></label>
-							{createUsesRcloneLogin && <><label className="field"><span>Description (optional)</span><input disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.description} onChange={(event) => setVaultForm({ ...vaultForm, description: event.target.value })} /></label><div className="form-grid two"><label className="field"><span>Encryption password</span><input type="password" value={vaultForm.password} onChange={(event) => setVaultForm({ ...vaultForm, password: event.target.value })} /><small>{vaultPasswordHelp}</small></label><label className="field"><span>Confirm encryption password</span><input type="password" value={vaultForm.passwordConfirmation} onChange={(event) => setVaultForm({ ...vaultForm, passwordConfirmation: event.target.value })} /></label></div>{vaultForm.password && vaultForm.passwordConfirmation && vaultForm.password !== vaultForm.passwordConfirmation && <small className="inline-error" role="alert">The passwords do not match.</small>}</>}
-						{integration?.localBrowser ? <label className="field"><span>Location</span><DirectoryField value={vaultForm.location} disabled={Boolean(vaultForm.pendingLocation)} placeholder={examplePlaceholder(integration.placeholder)} onChange={(location) => setVaultForm({ ...vaultForm, location })} /></label> : integration && !createUsesRcloneLogin ? <RemoteVaultFields form={vaultForm} integration={integration} onChange={setVaultForm} /> : null}
+						<p className="section-copy">{t("ui.pages.protect.encryption.compression.and.deduplication.are.automatically.applied.to")}</p>
+						<label className="field"><span>{t("ui.pages.protect.storage.type")}</span><select autoFocus value={vaultForm.coldStorage ? "cold_s3" : vaultForm.connector} disabled={Boolean(vaultForm.pendingLocation)} onChange={(event) => { if (createRcloneAuth?.sessionId) void closeRcloneAuthorization(createRcloneAuth.sessionId); setCreateRcloneAuth(null); setShowCreateRcloneAuthorization(false); const coldStorage = event.target.value === "cold_s3"; const connector = coldStorage ? "s3" : event.target.value; const selected = vaultStorageIntegrations.find((item) => item.id === connector); const eligible = engineCatalog.filter((descriptor) => descriptor.installed && descriptor.providers.some((provider) => provider.id === connector && provider.supported)); const engine = coldStorage ? "restic" : eligible.some((descriptor) => descriptor.id === vaultForm.engine) ? vaultForm.engine : (eligible.find((descriptor) => descriptor.id === "restic")?.id ?? eligible[0]?.id ?? vaultForm.engine) as VaultForm["engine"]; setVaultForm({ ...vaultForm, engine, connector, coldStorage, archiveWriteClass: "GLACIER", checkSchedule: coldStorage ? "manual" : vaultForm.checkSchedule, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "", options: integrationOptionsForEngine(selected, engine, engineCatalog), objectLock: objectLockForSelection(vaultForm.objectLock, engine, connector) }); }}>{vaultStorageIntegrations.flatMap((item) => [<option key={item.id} value={item.id}>{knownMessage(`ui.integration.${item.id}.label`, item.label)}</option>, ...(item.id === "s3" ? [<option key="cold_s3" value="cold_s3">{t("ui.pages.protect.cold.storage.must.be.s3.compatible")}</option>] : [])])}</select>{integration && <small>{vaultForm.coldStorage ? t("ui.pages.protect.supports.all.s3.compatible.cold.object.storage.that.accept", { glacier: "GLACIER", deepArchive: "DEEP_ARCHIVE" }) : createIntegrationDescription}</small>}</label>
+						<label className="field"><span>{t("ui.pages.protect.vault.name")}</span><input aria-label={t("ui.pages.protect.vault.name")} disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.name} placeholder={t("ui.pages.protect.example.work.archive")} onChange={(event) => setVaultForm({ ...vaultForm, name: event.target.value })} /><small>{t("ui.protect.vaultNameLengthHelp", { count: MAX_VAULT_NAME_CODE_POINTS })}</small></label>
+							{createUsesRcloneLogin && <><label className="field"><span>{t("ui.pages.protect.description.optional")}</span><input disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.description} onChange={(event) => setVaultForm({ ...vaultForm, description: event.target.value })} /></label><div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.encryption.password")}</span><input type="password" value={vaultForm.password} onChange={(event) => setVaultForm({ ...vaultForm, password: event.target.value })} /><small>{vaultPasswordHelp()}</small></label><label className="field"><span>{t("ui.pages.protect.confirm.encryption.password")}</span><input type="password" value={vaultForm.passwordConfirmation} onChange={(event) => setVaultForm({ ...vaultForm, passwordConfirmation: event.target.value })} /></label></div>{vaultForm.password && vaultForm.passwordConfirmation && vaultForm.password !== vaultForm.passwordConfirmation && <small className="inline-error" role="alert">{t("ui.pages.protect.the.passwords.do.not.match")}</small>}</>}
+						{integration?.localBrowser ? <label className="field"><span>{t("ui.pages.protect.location")}</span><DirectoryField value={vaultForm.location} disabled={Boolean(vaultForm.pendingLocation)} placeholder={examplePlaceholder(integration.placeholder)} onChange={(location) => setVaultForm({ ...vaultForm, location })} /></label> : integration && !createUsesRcloneLogin ? <RemoteVaultFields form={vaultForm} integration={integration} onChange={setVaultForm} /> : null}
 						{/* Connection has no archive-class choice: managed Cold vaults recover the
 						    protected class, and native Cold imports start from the GLACIER default. */}
-						{vaultCreateError.includes("connect existing vault") && <div className="recovery-warning"><p>{vaultCreateError}</p><button className="btn sm" onClick={() => { if (!closeVaultCreate()) return; invalidateConnectPreview(); setRetryConnectionIntentId(""); setConnectForm((current) => restoreVaultDestinationFields({ ...current, connector: vaultForm.connector, coldStorage: vaultForm.coldStorage, archiveWriteClass: "GLACIER", checkSchedule: vaultForm.coldStorage ? "manual" : current.checkSchedule, location: vaultLocation(vaultForm, true), options: { ...vaultForm.options }, password: vaultForm.password })); setShowVaultConnect(true); refreshConnectionIntents(); }}>Connect to existing vault</button></div>}
-						{vaultCreateError.includes("selected location is not empty") && <div className="recovery-warning"><p>{vaultCreateError}</p><div className="tool-buttons"><button className="btn sm" onClick={() => { setVaultCreateError(""); setVaultForm({ ...vaultForm, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "" }); }}>Select empty subfolder</button><button className="btn sm" onClick={() => { setVaultCreateError(""); setVaultForm({ ...vaultForm, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "" }); }}>Select different destination</button></div></div>}
-						{!createUsesRcloneLogin && createOrderedOptions.filter((option) => !option.advanced && !creationOptionIsCustom(vaultForm.connector, option.key)).map((option) => <IntegrationField key={option.key} option={option} value={vaultForm.options[option.key] ?? ""} disabled={creationOptionLockedForPending(vaultForm, option)} onChange={(value) => setVaultForm(updateConnectorOption(vaultForm, option.key, value))} />)}
-							{!createUsesRcloneLogin && <><label className="field"><span>Description (optional)</span><input disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.description} onChange={(event) => setVaultForm({ ...vaultForm, description: event.target.value })} /></label><div className="form-grid two"><label className="field"><span>Encryption password</span><input type="password" value={vaultForm.password} onChange={(event) => setVaultForm({ ...vaultForm, password: event.target.value })} /><small>{vaultPasswordHelp}</small></label><label className="field"><span>Confirm encryption password</span><input type="password" value={vaultForm.passwordConfirmation} onChange={(event) => setVaultForm({ ...vaultForm, passwordConfirmation: event.target.value })} /></label></div>{vaultForm.password && vaultForm.passwordConfirmation && vaultForm.password !== vaultForm.passwordConfirmation && <small className="inline-error" role="alert">The passwords do not match.</small>}</>}
-						{vaultForm.coldStorage && <div className="recovery-warning">{coldStorageProviderGuidance.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>}
-                        <button className="btn advanced-toggle" onClick={() => setVaultAdvanced((value) => !value)}><Icon name="settings" size={14} />{vaultAdvanced ? "Hide advanced settings" : "Advanced settings"}</button>
+						{vaultCreateError.includes("connect existing vault") && <div className="recovery-warning"><p>{vaultCreateError}</p><button className="btn sm" onClick={() => { if (!closeVaultCreate()) return; invalidateConnectPreview(); setRetryConnectionIntentId(""); setConnectForm((current) => restoreVaultDestinationFields({ ...current, connector: vaultForm.connector, coldStorage: vaultForm.coldStorage, archiveWriteClass: "GLACIER", checkSchedule: vaultForm.coldStorage ? "manual" : current.checkSchedule, location: vaultLocation(vaultForm, true), options: { ...vaultForm.options }, password: vaultForm.password })); setShowVaultConnect(true); refreshConnectionIntents(); }}>{t("ui.pages.protect.connect.to.existing.vault")}</button></div>}
+						{vaultCreateError.includes("selected location is not empty") && <div className="recovery-warning"><p>{vaultCreateError}</p><div className="tool-buttons"><button className="btn sm" onClick={() => { setVaultCreateError(""); setVaultForm({ ...vaultForm, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "" }); }}>{t("ui.pages.protect.select.empty.subfolder")}</button><button className="btn sm" onClick={() => { setVaultCreateError(""); setVaultForm({ ...vaultForm, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "" }); }}>{t("ui.pages.protect.select.different.destination")}</button></div></div>}
+						{!createUsesRcloneLogin && createOrderedOptions.filter((option) => !option.advanced && !creationOptionIsCustom(vaultForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={vaultForm.connector} option={option} value={vaultForm.options[option.key] ?? ""} disabled={creationOptionLockedForPending(vaultForm, option)} onChange={(value) => setVaultForm(updateConnectorOption(vaultForm, option.key, value))} />)}
+							{!createUsesRcloneLogin && <><label className="field"><span>{t("ui.pages.protect.description.optional")}</span><input disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.description} onChange={(event) => setVaultForm({ ...vaultForm, description: event.target.value })} /></label><div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.encryption.password")}</span><input type="password" value={vaultForm.password} onChange={(event) => setVaultForm({ ...vaultForm, password: event.target.value })} /><small>{vaultPasswordHelp()}</small></label><label className="field"><span>{t("ui.pages.protect.confirm.encryption.password")}</span><input type="password" value={vaultForm.passwordConfirmation} onChange={(event) => setVaultForm({ ...vaultForm, passwordConfirmation: event.target.value })} /></label></div>{vaultForm.password && vaultForm.passwordConfirmation && vaultForm.password !== vaultForm.passwordConfirmation && <small className="inline-error" role="alert">{t("ui.pages.protect.the.passwords.do.not.match")}</small>}</>}
+						{vaultForm.coldStorage && <div className="recovery-warning">{coldStorageProviderGuidance().map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>}
+                        <button className="btn advanced-toggle" onClick={() => setVaultAdvanced((value) => !value)}><Icon name="settings" size={14} />{vaultAdvanced ? t("ui.pages.protect.hide.advanced.settings") : t("ui.pages.protect.advanced.settings")}</button>
 						{vaultAdvanced && (
 							<div className="advanced-panel">
 								<ObjectLockFields form={vaultForm} creation creationAvailable={createObjectLockAvailable} disabled={Boolean(vaultForm.pendingLocation)} onChange={updateCreateObjectLock} />
-								<label className="field"><span>Vault engine</span><select value={vaultForm.engine} disabled={vaultForm.objectLock.enrolled || vaultForm.coldStorage || createUsesRcloneLogin || Boolean(vaultForm.pendingLocation)} onChange={(event) => { const engine = event.target.value as VaultForm["engine"]; const selected = vaultStorageIntegrations.find((item) => item.id === vaultForm.connector); setVaultForm({ ...vaultForm, engine, options: integrationOptionsForEngine(selected, engine, engineCatalog, vaultForm.options), objectLock: objectLockForSelection(vaultForm.objectLock, engine, vaultForm.connector) }); }}>{engineCatalog.filter((item) => vaultForm.coldStorage ? item.id === "restic" : !createUsesRcloneLogin || item.id === "restic").map((item) => <option key={item.id} value={item.id} disabled={!item.installed || !item.providers.some((provider) => provider.id === vaultForm.connector && provider.supported)}>{item.name}</option>)}</select><small>{vaultForm.objectLock.enrolled ? "Kopia is the required engine when object locking is enabled." : vaultEngineHelp(vaultForm.connector, vaultForm.coldStorage)}</small></label>
-								{vaultForm.coldStorage && <label className="field"><span>Storage class</span><select value={vaultForm.archiveWriteClass} disabled={Boolean(vaultForm.pendingLocation)} onChange={(event) => setVaultForm({ ...vaultForm, archiveWriteClass: event.target.value as VaultForm["archiveWriteClass"] })}><option value="GLACIER">GLACIER (default)</option><option value="DEEP_ARCHIVE">DEEP_ARCHIVE</option></select><small>{coldStorageArchiveClassHelp}</small></label>}
-							{!createUsesRcloneLogin && createOrderedOptions.filter((option) => option.advanced && !creationOptionIsCustom(vaultForm.connector, option.key)).map((option) => <IntegrationField key={option.key} option={option} value={vaultForm.options[option.key] ?? ""} disabled={creationOptionLockedForPending(vaultForm, option)} explanation={advancedCreationOptionExplanation(vaultForm.connector, option)} onChange={(value) => setVaultForm(updateConnectorOption(vaultForm, option.key, value))} />)}
+								<label className="field"><span>{t("ui.pages.protect.vault.engine")}</span><select value={vaultForm.engine} disabled={vaultForm.objectLock.enrolled || vaultForm.coldStorage || createUsesRcloneLogin || Boolean(vaultForm.pendingLocation)} onChange={(event) => { const engine = event.target.value as VaultForm["engine"]; const selected = vaultStorageIntegrations.find((item) => item.id === vaultForm.connector); setVaultForm({ ...vaultForm, engine, options: integrationOptionsForEngine(selected, engine, engineCatalog, vaultForm.options), objectLock: objectLockForSelection(vaultForm.objectLock, engine, vaultForm.connector) }); }}>{engineCatalog.filter((item) => vaultForm.coldStorage ? item.id === "restic" : !createUsesRcloneLogin || item.id === "restic").map((item) => <option key={item.id} value={item.id} disabled={!item.installed || !item.providers.some((provider) => provider.id === vaultForm.connector && provider.supported)}>{item.name}</option>)}</select><small>{vaultForm.objectLock.enrolled ? t("ui.pages.protect.kopia.is.the.required.engine.when.object.locking.is") : vaultEngineHelp(vaultForm.connector, vaultForm.coldStorage)}</small></label>
+								{vaultForm.coldStorage && <label className="field"><span>{t("ui.pages.protect.storage.class")}</span><select value={vaultForm.archiveWriteClass} disabled={Boolean(vaultForm.pendingLocation)} onChange={(event) => setVaultForm({ ...vaultForm, archiveWriteClass: event.target.value as VaultForm["archiveWriteClass"] })}><option value="GLACIER">{t("ui.pages.protect.glacier.default", { glacier: "GLACIER" })}</option><option value="DEEP_ARCHIVE">{t("ui.pages.protect.deep.archive", { deepArchive: "DEEP_ARCHIVE" })}</option></select><small>{coldStorageArchiveClassHelp()}</small></label>}
+							{!createUsesRcloneLogin && createOrderedOptions.filter((option) => option.advanced && !creationOptionIsCustom(vaultForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={vaultForm.connector} option={option} value={vaultForm.options[option.key] ?? ""} disabled={creationOptionLockedForPending(vaultForm, option)} explanation={advancedCreationOptionExplanation(vaultForm.connector, option)} onChange={(value) => setVaultForm(updateConnectorOption(vaultForm, option.key, value))} />)}
 								<VaultCareFields form={vaultForm} disabled={Boolean(vaultForm.pendingLocation)} onChange={setVaultForm} />
                             </div>
                         )}
                     </div>
-					<div className="modal-footer"><button className="btn" disabled={vaultSaving} onClick={closeVaultCreate}>Cancel</button><button className="btn primary" disabled={vaultSaving || !integration || !validVaultName(vaultForm.name) || !vaultLocation(vaultForm, true) || !validVaultPassword(vaultForm.password) || vaultForm.password !== vaultForm.passwordConfirmation || createMissingRequiredOptions.length > 0 || !validObjectLockSettings(vaultForm.objectLock, vaultForm.maintenanceSchedule)} onClick={() => { if (createUsesRcloneLogin && !createRcloneAuth && !retryCreationIntentId) setShowCreateRcloneAuthorization(true); else void saveVault(); }}>{vaultSaving && <span className="spinner" />}{vaultSaving ? "Creating…" : retryCreationIntentId ? "Retry creation" : "Create vault"}</button></div>
+					<div className="modal-footer"><button className="btn" disabled={vaultSaving} onClick={closeVaultCreate}>{t("ui.pages.protect.cancel")}</button><button className="btn primary" disabled={vaultSaving || !integration || !validVaultName(vaultForm.name) || !vaultLocation(vaultForm, true) || !validVaultPassword(vaultForm.password) || vaultForm.password !== vaultForm.passwordConfirmation || createMissingRequiredOptions.length > 0 || !validObjectLockSettings(vaultForm.objectLock, vaultForm.maintenanceSchedule)} onClick={() => { if (createUsesRcloneLogin && !createRcloneAuth && !retryCreationIntentId) setShowCreateRcloneAuthorization(true); else void saveVault(); }}>{vaultSaving && <span className="spinner" />}{vaultSaving ? t("ui.pages.protect.creating") : retryCreationIntentId ? t("ui.pages.protect.retry.creation") : t("ui.pages.protect.create.vault")}</button></div>
 					</fieldset>
-					{vaultSaving && vaultProgress.length > 0 && <VaultActivityLog records={vaultProgress} />}
+					{vaultSaving && <VaultActivityLog records={vaultProgress} />}
                 </Modal>
             )}
 
 			{showVaultCreate && showCreateRcloneAuthorization && integration && (
-				<Modal title={`Connect ${integration.label}`} onClose={closeCreateRcloneAuthorization}>
+				<Modal title={t("ui.rclone.connectProvider", { provider: knownMessage(`ui.integration.${integration.id}.label`, integration.label) })} onClose={closeCreateRcloneAuthorization}>
 					<div className="modal-form">
-						<p>Replicaro uses open source <a href="https://github.com/rclone/rclone" target="_blank" rel="noreferrer">rclone</a> to connect to {integration.label}. You need to authorize rclone with your {integration.label} account in order to create backups. You can revoke access at any time, and only Replicaro will be able to use this rclone access. Click the connect button below to get started.</p>
+						<p>{renderMessage("ui.rclone.authorizationDescription", { provider: knownMessage(`ui.integration.${integration.id}.label`, integration.label), rcloneLink: <a href="https://github.com/rclone/rclone" target="_blank" rel="noreferrer">{t("ui.pages.protect.rclone")}</a> })}</p>
 						{vaultCreateError && <div className="inline-error" role="alert">{vaultCreateError}</div>}
-						<RcloneAuthorization provider={vaultForm.connector} label={integration.label} readyAction="create vault" value={createRcloneAuth} disabled={vaultSaving} closeOnUnmount={false} showDescription={false} onChange={setCreateRcloneAuth} onError={(message) => toast("error", message)} />
+						<RcloneAuthorization provider={vaultForm.connector} label={knownMessage(`ui.integration.${integration.id}.label`, integration.label)} readyAction="create vault" value={createRcloneAuth} disabled={vaultSaving} closeOnUnmount={false} showDescription={false} onChange={setCreateRcloneAuth} onError={(message) => toast("error", message)} />
 					</div>
 					<div className="modal-footer">
-						<button className="btn" disabled={vaultSaving} onClick={closeCreateRcloneAuthorization}>Back</button>
-						{createRcloneAuth?.status === "ready" && <button className="btn primary" disabled={vaultSaving} onClick={() => void saveVault()}>{vaultSaving && <span className="spinner" />}{vaultSaving ? "Creating…" : "Create vault"}</button>}
+						<button className="btn" disabled={vaultSaving} onClick={closeCreateRcloneAuthorization}>{t("ui.pages.protect.back")}</button>
+						{createRcloneAuth?.status === "ready" && <button className="btn primary" disabled={vaultSaving} onClick={() => void saveVault()}>{vaultSaving && <span className="spinner" />}{vaultSaving ? t("ui.pages.protect.creating") : t("ui.pages.protect.create.vault")}</button>}
 					</div>
-					{vaultSaving && vaultProgress.length > 0 && <VaultActivityLog records={vaultProgress} />}
+					{vaultSaving && <VaultActivityLog records={vaultProgress} />}
 				</Modal>
 			)}
 
 			{creationErrorView && (
-					<Modal title={`Pending creation: ${creationErrorView.name}`} onClose={() => setCreationErrorView(null)}>
+					<Modal title={t("ui.protect.pendingCreationTitle", { name: creationErrorView.name })} onClose={() => setCreationErrorView(null)}>
 					<div className="modal-form">
-						<p className="section-copy">Replicaro kept the recovery record so this destination cannot be created over accidentally.</p>
-						<div className="inline-error" role="alert">{creationErrorView.lastError || "Vault creation did not finish."}</div>
+						<p className="section-copy">{t("ui.pages.protect.replicaro.kept.the.recovery.record.so.this.destination.cannot.be.creat")}</p>
+						<div className="inline-error" role="alert">{creationErrorView.lastError || t("ui.pages.protect.vault.creation.did.not.finish")}</div>
 					</div>
 					<div className="modal-footer">
-						<button className="btn" onClick={() => setCreationErrorView(null)}>Close</button>
+						<button className="btn" onClick={() => setCreationErrorView(null)}>{t("ui.pages.protect.close")}</button>
 					</div>
 				</Modal>
 			)}
@@ -4940,22 +4974,22 @@ export default function Protect() {
 					<div className="vault-settings-content" aria-busy={vaultWorkState !== "idle"}>
 						{vaultWorkState !== "idle" && <div className="vault-work-overlay" role="status" aria-live="polite">
 							<p><span>{vaultWorkState === "running"
-								? "Vault work is currently running. Vault settings cannot be changed while vault work is running. Please wait..."
+								? t("ui.pages.protect.vault.work.is.currently.running.vault.settings.cannot.be")
 								: vaultWorkState === "unavailable"
-									? "Vault work status could not be checked. Vault settings cannot be changed right now. Please wait..."
-									: "Checking whether vault work is running. Vault settings cannot be changed until this check finishes."}</span><span className="spinner" aria-hidden="true" /></p>
-							{toolBusy === "maintenance" && vaultSettings.coldStorage && <button className="btn" onClick={cancelColdMaintenance}>Cancel reclamation</button>}
+									? t("ui.pages.protect.vault.work.status.could.not.be.checked.vault.settings")
+									: t("ui.pages.protect.checking.whether.vault.work.is.running.vault.settings.cannot")}</span><span className="spinner" aria-hidden="true" /></p>
+							{toolBusy === "maintenance" && vaultSettings.coldStorage && <button className="btn" onClick={cancelColdMaintenance}>{t("ui.pages.protect.cancel.reclamation")}</button>}
 						</div>}
 						<div inert={vaultWorkState !== "idle" ? true : undefined}>
 					<div className="modal-location mono">{vaultSettings.engine} · {vaultSettings.location}</div>
-					<div className="modal-section-label">Vault care</div>
-					{vaultOwnershipPresentation === "checking" && <section className="recovery-warning vault-owner-status checking" role="status"><span className="spinner" aria-hidden="true" />Checking vault ownership status…</section>}
-					{vaultOwnershipPresentation === "unverified" && <section className="recovery-warning vault-owner-status" role="alert"><p>Vault ownership status could not be verified. Vault-owner actions are disabled.</p><button className="btn" onClick={() => detectVaultOwnership(vaultSettings, vaultSettingsSession.current)}>Detect vault owner status</button></section>}
-					{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && vaultOwnership && <section className="recovery-warning vault-owner-status"><p>{vaultOwnership.message}</p>{vaultOwnershipPresentation === "nonowner" && <><p>{vaultOwnership.takeoverExplanation}</p><button className="btn danger" disabled={vaultOwnershipBusy} onClick={() => void takeOverVaultOwnership()}>{vaultOwnershipBusy && <span className="spinner" />}Click here to take over vault ownership</button></>}</section>}
+					<div className="modal-section-label">{t("ui.pages.protect.vault.care")}</div>
+					{vaultOwnershipPresentation === "checking" && <section className="recovery-warning vault-owner-status checking" role="status"><span className="spinner" aria-hidden="true" />{t("ui.pages.protect.checking.vault.ownership.status")}</section>}
+					{vaultOwnershipPresentation === "unverified" && <section className="recovery-warning vault-owner-status" role="alert"><p>{t("ui.pages.protect.vault.ownership.status.could.not.be.verified.vault.owner.actions.are.d")}</p><button className="btn" onClick={() => detectVaultOwnership(vaultSettings, vaultSettingsSession.current)}>{t("ui.pages.protect.detect.vault.owner.status")}</button></section>}
+					{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && vaultOwnership && <section className="recovery-warning vault-owner-status"><p>{vaultOwnership.message}</p>{vaultOwnershipPresentation === "nonowner" && <><p>{vaultOwnership.takeoverExplanation}</p><button className="btn danger" disabled={vaultOwnershipBusy} onClick={() => void takeOverVaultOwnership()}>{vaultOwnershipBusy && <span className="spinner" />}{t("ui.pages.protect.click.here.to.take.over.vault.ownership")}</button></>}</section>}
 					<div className="form-grid two vault-care-fields">
-						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <label className="field"><span>Integrity check</span><select value={vaultSettings.coldStorage ? "manual" : checkSchedule} disabled={vaultSettings.coldStorage || vaultOwnershipPresentation !== "owner"} onChange={(event) => setCheckSchedule(event.target.value)}>{(vaultSettings.coldStorage ? [["manual", "Disabled"]] as const : careSchedules).map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select><small>{vaultSettings.coldStorage ? coldStorageIntegrityHelp : integrityCheckHelp}</small>{vaultOwnershipPresentation === "nonowner" && <small>Only the current vault owner can change or run integrity checks. Take over vault ownership above to enable it on this computer.</small>}<small>Last: {vaultSettings.lastCheck ? `${timeAgo(vaultSettings.lastCheck)} (${vaultSettings.lastCheckStatus})` : "never"}{vaultSettings.nextCheck ? ` · next ${timeAgo(vaultSettings.nextCheck)}` : ""}</small></label>}
-						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <label className="field"><span>Space reclamation</span><select value={maintenanceSchedule} disabled={vaultOwnershipPresentation !== "owner"} onChange={(event) => setMaintenanceSchedule(event.target.value)}>{careSchedules.map(([value, label]) => <option key={value} value={value} disabled={!objectLockScheduleEligible(objectLock, value)}>{label}</option>)}</select><small>{objectLock.enrolled ? (objectLock.paused ? pausedObjectLockMaintenanceHelp : objectLockMaintenanceHelp) : maintenanceHelp}</small>{vaultOwnershipPresentation === "nonowner" && <small>Only the current vault owner can change or run space reclamation. Take over vault ownership above to enable it on this computer.</small>}<small>Last: {vaultSettings.lastMaintenance ? `${timeAgo(vaultSettings.lastMaintenance)} (${vaultSettings.lastMaintenanceStatus})` : "never"}{vaultSettings.nextMaintenance ? ` · next ${timeAgo(vaultSettings.nextMaintenance)}` : ""}</small></label>}
-						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <div className="vault-care-actions"><div className="vault-care-action"><button className="btn" disabled={vaultSettings.coldStorage || vaultOwnershipPresentation !== "owner" || Boolean(toolBusy)} onClick={() => void runTool("check")}>{toolBusy === "check" && <span className="spinner" />}Run check now</button></div><div className="vault-care-action"><button className="btn" disabled={vaultOwnershipPresentation !== "owner" || Boolean(toolBusy)} onClick={() => void runTool("maintenance")}>{toolBusy === "maintenance" && <span className="spinner" />}Run reclamation now</button>{vaultSettings.coldStorage && toolBusy === "maintenance" && <button className="btn" onClick={cancelColdMaintenance}>Cancel reclamation</button>}</div></div>}
+						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <label className="field"><span>{t("ui.pages.protect.integrity.check")}</span><select value={vaultSettings.coldStorage ? "manual" : checkSchedule} disabled={vaultSettings.coldStorage || vaultOwnershipPresentation !== "owner"} onChange={(event) => setCheckSchedule(event.target.value)}>{(vaultSettings.coldStorage ? [["manual", () => t("ui.care.disabled")]] as const : careSchedules).map(([value, label]) => <option key={value} value={value}>{label()}</option>)}</select><small>{vaultSettings.coldStorage ? coldStorageIntegrityHelp() : integrityCheckHelp()}</small>{vaultOwnershipPresentation === "nonowner" && <small>{t("ui.pages.protect.only.the.current.vault.owner.can.change.or.run.integrity.checks.take.o")}</small>}<small>{t("ui.protect.lastCareRun", { last: vaultSettings.lastCheck ? `${timeAgo(vaultSettings.lastCheck)} (${vaultSettings.lastCheckStatus})` : t("ui.protect.never"), next: vaultSettings.nextCheck ? t("ui.protect.nextCareRun", { time: timeAgo(vaultSettings.nextCheck) }) : "" })}</small></label>}
+						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <label className="field"><span>{t("ui.pages.protect.space.reclamation")}</span><select value={maintenanceSchedule} disabled={vaultOwnershipPresentation !== "owner"} onChange={(event) => setMaintenanceSchedule(event.target.value)}>{careSchedules.map(([value, label]) => <option key={value} value={value} disabled={!objectLockScheduleEligible(objectLock, value)}>{label()}</option>)}</select><small>{objectLock.enrolled ? (objectLock.paused ? pausedObjectLockMaintenanceHelp() : objectLockMaintenanceHelp()) : maintenanceHelp()}</small>{vaultOwnershipPresentation === "nonowner" && <small>{t("ui.pages.protect.only.the.current.vault.owner.can.change.or.run.space.reclamation.take")}</small>}<small>{t("ui.protect.lastCareRun", { last: vaultSettings.lastMaintenance ? `${timeAgo(vaultSettings.lastMaintenance)} (${vaultSettings.lastMaintenanceStatus})` : t("ui.protect.never"), next: vaultSettings.nextMaintenance ? t("ui.protect.nextCareRun", { time: timeAgo(vaultSettings.nextMaintenance) }) : "" })}</small></label>}
+						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <div className="vault-care-actions"><div className="vault-care-action"><button className="btn" disabled={vaultSettings.coldStorage || vaultOwnershipPresentation !== "owner" || Boolean(toolBusy)} onClick={() => void runTool("check")}>{toolBusy === "check" && <span className="spinner" />}{t("ui.pages.protect.run.check.now")}</button></div><div className="vault-care-action"><button className="btn" disabled={vaultOwnershipPresentation !== "owner" || Boolean(toolBusy)} onClick={() => void runTool("maintenance")}>{toolBusy === "maintenance" && <span className="spinner" />}{t("ui.pages.protect.run.reclamation.now")}</button>{vaultSettings.coldStorage && toolBusy === "maintenance" && <button className="btn" onClick={cancelColdMaintenance}>{t("ui.pages.protect.cancel.reclamation")}</button>}</div></div>}
 						<JobSpeedField connector={vaultSettings.connector} value={concurrencyMode} onChange={(mode) => setConcurrencyMode(compatibleConcurrencyMode(vaultSettings.connector, mode))} />
 					</div>
 					<ObjectLockFields
@@ -4964,60 +4998,60 @@ export default function Protect() {
 						originalObjectLock={vaultSettings.objectLock}
 						onChange={(next) => { setObjectLock(next.objectLock); setMaintenanceSchedule(next.maintenanceSchedule); }}
 					/>
-					{vaultSettings.coldStorage && <p><strong>Archive write class:</strong> {vaultSettings.archiveWriteClass} (read-only)</p>}
-					{vaultSettings.coldStorage && <div className="recovery-warning">{coldStorageProviderGuidance.map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>}
-					{vaultSettings.coldStorage && toolBusy === "maintenance" && <p className="recovery-warning">Cold storage retrieval can take hours or days. Replicaro will continue to wait for native Restic. {coldStorageCancellationGuidance}</p>}
+					{vaultSettings.coldStorage && <p><strong>{t("ui.pages.protect.archive.write.class")}</strong> {vaultSettings.archiveWriteClass} {t("ui.protect.readOnly")}</p>}
+					{vaultSettings.coldStorage && <div className="recovery-warning">{coldStorageProviderGuidance().map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>}
+					{vaultSettings.coldStorage && toolBusy === "maintenance" && <p className="recovery-warning">{t("ui.protect.coldMaintenanceWait")}</p>}
                     {toolOutput && <>
-                        <button type="button" className="text-button" aria-pressed={showRawToolLog} onClick={() => setShowRawToolLog((raw) => !raw)}>{showRawToolLog ? "Show readable log" : "Show raw log"}</button>
+                        <button type="button" className="text-button" aria-pressed={showRawToolLog} onClick={() => setShowRawToolLog((raw) => !raw)}>{showRawToolLog ? t("ui.pages.protect.show.readable.log") : t("ui.pages.protect.show.raw.log")}</button>
                         <pre className="output tool-output">{showRawToolLog ? toolOutput : formatNativeLogText(vaultSettings.engine, "care", toolOutput)}</pre>
                     </>}
 					{vaultSettings.engine === "restic" && <>
-						<button className="btn advanced-toggle vault-settings-advanced-toggle" onClick={() => setVaultSettingsAdvanced((value) => !value)}><Icon name="settings" size={14} />{vaultSettingsAdvanced ? "Hide advanced settings" : "Advanced settings"}</button>
-						{vaultSettingsAdvanced && <div className="advanced-panel"><div className="advanced-setting"><label className="check"><input type="checkbox" checked={autoUnlock} onChange={(event) => setAutoUnlock(event.target.checked)} />Auto Unlock for Stuck Vaults</label><small>Restic will sometimes block use of a vault when running an operation. The vault remains blocked if the operation crashes. Auto unlock safely removes that block. Keep this option enabled unless you specifically understand what disabling this option means.</small></div></div>}
+						<button className="btn advanced-toggle vault-settings-advanced-toggle" onClick={() => setVaultSettingsAdvanced((value) => !value)}><Icon name="settings" size={14} />{vaultSettingsAdvanced ? t("ui.pages.protect.hide.advanced.settings") : t("ui.pages.protect.advanced.settings")}</button>
+						{vaultSettingsAdvanced && <div className="advanced-panel"><div className="advanced-setting"><label className="check"><input type="checkbox" checked={autoUnlock} onChange={(event) => setAutoUnlock(event.target.checked)} />{t("ui.pages.protect.auto.unlock.for.stuck.vaults")}</label><small>{t("ui.pages.protect.restic.will.sometimes.block.use.of.a.vault.when.running.an.operation.t")}</small></div></div>}
 					</>}
 					<section className="advanced-panel vault-password-panel">
-						<div className="modal-section-label">Change vault password</div>
-						{vaultOwnershipPresentation === "owner" && <p className="vault-password-intro">If you are backing up other computers to this vault, you will need to reconnect those computers to the vault after a password change.</p>}
-						{vaultOwnershipPresentation === "nonowner" && <p>Only the current vault owner can change this vault password. {currentVaultOwner} is the current vault owner.</p>}
+						<div className="modal-section-label">{t("ui.pages.protect.change.vault.password")}</div>
+						{vaultOwnershipPresentation === "owner" && <p className="vault-password-intro">{t("ui.pages.protect.if.you.are.backing.up.other.computers.to.this.vault.you.will.need.to.r")}</p>}
+						{vaultOwnershipPresentation === "nonowner" && <p>{t("ui.protect.currentOwnerPasswordHelp", { owner: currentVaultOwner })}</p>}
 						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <>
 							<div className="form-grid two vault-password-fields">
-								<label className="field"><span>New vault password</span><input type="password" autoComplete="new-password" disabled={vaultOwnershipPresentation !== "owner" || Boolean(vaultMutations[vaultSettings.id])} value={vaultPasswordForm.password} onChange={(event) => setVaultPasswordForm((current) => ({ ...current, password: event.target.value }))} /></label>
-								<label className="field"><span>Confirm new vault password</span><input type="password" autoComplete="new-password" disabled={vaultOwnershipPresentation !== "owner" || Boolean(vaultMutations[vaultSettings.id])} value={vaultPasswordForm.confirmation} onChange={(event) => setVaultPasswordForm((current) => ({ ...current, confirmation: event.target.value }))} /></label>
+								<label className="field"><span>{t("ui.pages.protect.new.vault.password")}</span><input type="password" autoComplete="new-password" disabled={vaultOwnershipPresentation !== "owner" || Boolean(vaultMutations[vaultSettings.id])} value={vaultPasswordForm.password} onChange={(event) => setVaultPasswordForm((current) => ({ ...current, password: event.target.value }))} /></label>
+								<label className="field"><span>{t("ui.pages.protect.confirm.new.vault.password")}</span><input type="password" autoComplete="new-password" disabled={vaultOwnershipPresentation !== "owner" || Boolean(vaultMutations[vaultSettings.id])} value={vaultPasswordForm.confirmation} onChange={(event) => setVaultPasswordForm((current) => ({ ...current, confirmation: event.target.value }))} /></label>
 							</div>
-							{vaultPasswordForm.password && vaultPasswordForm.confirmation && vaultPasswordForm.password !== vaultPasswordForm.confirmation && <small className="inline-error" role="alert">The vault passwords do not match.</small>}
-							<button className="btn" disabled={vaultOwnershipPresentation !== "owner" || Boolean(vaultMutations[vaultSettings.id])} onClick={submitVaultPasswordChange}>Change vault password</button>
+							{vaultPasswordForm.password && vaultPasswordForm.confirmation && vaultPasswordForm.password !== vaultPasswordForm.confirmation && <small className="inline-error" role="alert">{t("ui.pages.protect.the.vault.passwords.do.not.match")}</small>}
+							<button className="btn" disabled={vaultOwnershipPresentation !== "owner" || Boolean(vaultMutations[vaultSettings.id])} onClick={submitVaultPasswordChange}>{t("ui.pages.protect.change.vault.password")}</button>
 						</>}
 					</section>
-					{dormantJobs.length > 0 && <section className="unowned-snapshots"><div className="modal-section-label">Dormant recovery jobs</div><p>These definitions remain protected in vault.replicaro but do not run or own snapshots locally.</p>{dormantJobs.map((item) => <div className="unowned-snapshot" key={item.jobId}><span><strong>{item.definition.name}</strong><small>{displayPath(item.definition.source)} · {scheduleLabel(item.definition.schedule)}</small><small>Before script: {item.definition.beforeScriptPath ? `${item.definition.beforeScriptPath} (${item.definition.beforeScriptMustSucceed ? "required" : "optional"})` : "none"} · After script: {item.definition.afterScriptPath ? `${item.definition.afterScriptPath} (${item.definition.afterScriptMustSucceed ? "required" : "optional"})` : "none"}</small></span><div className="tool-buttons"><button className="btn sm" disabled={Boolean(dormantBusy)} onClick={() => void changeDormant(item.repositoryId, item.jobId, "restore")}>{dormantBusy === `restore:${item.jobId}` && <span className="spinner" />}Restore disabled</button><button className="btn sm danger-outline" disabled={Boolean(dormantBusy)} onClick={() => void changeDormant(item.repositoryId, item.jobId, "discard")}>{dormantBusy === `discard:${item.jobId}` && <span className="spinner" />}Discard definition</button></div></div>)}</section>}
-					{vaultSettingsIntegration && (!usesRcloneNativeLogin(vaultSettings.connector) || (vaultSettings.engine === "restic" && vaultSettingsRcloneSupported)) && <section className="vault-connection-panel"><div className="modal-section-label">Vault connection</div><p>Use this to reconnect to the vault after disconnection for any reason.</p><button className="btn" onClick={() => requestSavedVaultReconnect(vaultSettings)}>Reconnect vault</button></section>}
-					<div className="danger-zone"><div className="modal-section-label">Danger zone</div><p>Removing this vault also removes it as a destination from matching backup jobs. Jobs with no other destination are deleted. Data saved in the vault is untouched, and you can easily add the vault again later.</p><button className="btn danger-outline" onClick={() => { const repository = vaultSettings; dismissVaultSettings(); openVaultDelete(repository); }}>Remove vault from Replicaro</button></div>
+					{dormantJobs.length > 0 && <section className="unowned-snapshots"><div className="modal-section-label">{t("ui.pages.protect.dormant.recovery.jobs")}</div><p>{t("ui.pages.protect.these.definitions.remain.protected.in.vault.replicaro.but.do.not.run.o", { sidecar: "vault.replicaro" })}</p>{dormantJobs.map((item) => <div className="unowned-snapshot" key={item.jobId}><span><strong>{item.definition.name}</strong><small>{displayPath(item.definition.source)} · {scheduleLabel(item.definition.schedule)}</small><small>{t("ui.protect.dormantScriptSummary", { before: item.definition.beforeScriptPath ? `${item.definition.beforeScriptPath} (${item.definition.beforeScriptMustSucceed ? t("ui.protect.required") : t("ui.protect.optional")})` : t("ui.protect.noneLower"), after: item.definition.afterScriptPath ? `${item.definition.afterScriptPath} (${item.definition.afterScriptMustSucceed ? t("ui.protect.required") : t("ui.protect.optional")})` : t("ui.protect.noneLower") })}</small></span><div className="tool-buttons"><button className="btn sm" disabled={Boolean(dormantBusy)} onClick={() => void changeDormant(item.repositoryId, item.jobId, "restore")}>{dormantBusy === `restore:${item.jobId}` && <span className="spinner" />}{t("ui.pages.protect.restore.disabled")}</button><button className="btn sm danger-outline" disabled={Boolean(dormantBusy)} onClick={() => void changeDormant(item.repositoryId, item.jobId, "discard")}>{dormantBusy === `discard:${item.jobId}` && <span className="spinner" />}{t("ui.pages.protect.discard.definition")}</button></div></div>)}</section>}
+					{vaultSettingsIntegration && (!usesRcloneNativeLogin(vaultSettings.connector) || (vaultSettings.engine === "restic" && vaultSettingsRcloneSupported)) && <section className="vault-connection-panel"><div className="modal-section-label">{t("ui.pages.protect.vault.connection")}</div><p>{t("ui.pages.protect.use.this.to.reconnect.to.the.vault.after.disconnection.for.any.reason")}</p><button className="btn" onClick={() => requestSavedVaultReconnect(vaultSettings)}>{t("ui.pages.protect.reconnect.vault")}</button></section>}
+					<div className="danger-zone"><div className="modal-section-label">{t("ui.pages.protect.danger.zone")}</div><p>{t("ui.pages.protect.removing.this.vault.also.removes.it.as.a.destination.from.matching.bac")}</p><button className="btn danger-outline" onClick={() => { const repository = vaultSettings; dismissVaultSettings(); openVaultDelete(repository); }}>{t("ui.pages.protect.remove.vault.from.replicaro")}</button></div>
 						</div>
-						<div className="modal-footer"><button className="btn" onClick={closeVault}>Cancel</button><button className="btn primary" disabled={vaultWorkState !== "idle" || !validObjectLockSettings(objectLock, maintenanceSchedule, true, vaultSettings.objectLock)} onClick={saveCare}>Save</button></div>
+						<div className="modal-footer"><button className="btn" onClick={closeVault}>{t("ui.pages.protect.cancel")}</button><button className="btn primary" disabled={vaultWorkState !== "idle" || !validObjectLockSettings(objectLock, maintenanceSchedule, true, vaultSettings.objectLock)} onClick={saveCare}>{t("ui.pages.protect.save")}</button></div>
 					</div>
                 </Modal>
             )}
 
             {vaultDelete && (
                 <ConfirmDialog
-					title={`Remove "${vaultDelete.name}"?`}
-					message={<><span>Removing this vault also removes this vault as a destination for <strong>{jobCountFor(vaultDelete.id)} backup job{jobCountFor(vaultDelete.id) === 1 ? "" : "s"}</strong>.</span><br /><br /><span>Jobs that have other vaults as a destination will not be deleted. Jobs with just this vault as a destination will be deleted.</span><br /><br /><span>Data on disk is untouched — you can re-add the vault later.</span></>}
-					confirmLabel="Remove vault"
+					title={t("ui.protect.removeNamedVaultQuestion", { vault: vaultDelete.name })}
+					message={<><span>{renderMessage("ui.protect.removeVaultDestinationHelp", { count: jobCountFor(vaultDelete.id), jobCount: <strong>{t("ui.protect.backupJobCount", { count: jobCountFor(vaultDelete.id) })}</strong> })}</span><br /><br /><span>{t("ui.pages.protect.jobs.that.have.other.vaults.as.a.destination.will.not.be.deleted.jobs")}</span><br /><br /><span>{t("ui.pages.protect.data.on.disk.is.untouched.you.can.re.add.the.vault.later")}</span></>}
+					confirmLabel={t("ui.pages.protect.remove.vault")}
 					onConfirm={() => void removeVault(vaultDelete)}
                     onCancel={dismissVaultDelete}
                 />
             )}
 
 			{vaultOneAtATimeChoice && (
-				<Modal title="Pick one action" onClose={() => setVaultOneAtATimeChoice(null)}>
+				<Modal title={t("ui.pages.protect.pick.one.action")} onClose={() => setVaultOneAtATimeChoice(null)}>
 					<p className="muted" style={{ marginTop: 0 }}>{vaultOneAtATimeChoice.kind === "reconnect"
-						? "You have changed vault settings and also selected to reconnect. You may only do one at a time. Pick one now and then come back to do the other."
-						: "You have changed vault settings and also selected to change the vault password. You may only do one at a time. Pick one now and then come back to do the other."}</p>
+						? t("ui.pages.protect.you.have.changed.vault.settings.and.also.selected.to")
+						: t("ui.pages.protect.you.have.changed.vault.settings.and.also.selected.to.2")}</p>
 					<div className="modal-footer">
-						<button className="btn" onClick={() => setVaultOneAtATimeChoice(null)}>Cancel</button>
-						<button className="btn" onClick={chooseSaveVaultSettings}>Save Vault Settings</button>
+						<button className="btn" onClick={() => setVaultOneAtATimeChoice(null)}>{t("ui.pages.protect.cancel")}</button>
+						<button className="btn" onClick={chooseSaveVaultSettings}>{t("ui.pages.protect.save.vault.settings")}</button>
 						{vaultOneAtATimeChoice.kind === "reconnect"
-							? <button className="btn primary" onClick={chooseReconnect}>Go Reconnect</button>
-							: <button className="btn primary" onClick={choosePasswordChange}>Change Vault Password</button>}
+							? <button className="btn primary" onClick={chooseReconnect}>{t("ui.pages.protect.go.reconnect")}</button>
+							: <button className="btn primary" onClick={choosePasswordChange}>{t("ui.pages.protect.change.vault.password.2")}</button>}
 					</div>
 				</Modal>
 			)}

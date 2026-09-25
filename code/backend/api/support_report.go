@@ -20,6 +20,7 @@ import (
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/operationlog"
+	"github.com/local/replicaro/storageavailability"
 )
 
 const (
@@ -40,10 +41,11 @@ func init() {
 
 type supportResponseRecorder struct {
 	http.ResponseWriter
-	status   int
-	err      error
-	expected bool
-	body     strings.Builder
+	status                   int
+	err                      error
+	expected                 bool
+	body                     strings.Builder
+	storageObservationDetail string
 }
 
 func (recorder *supportResponseRecorder) Unwrap() http.ResponseWriter { return recorder.ResponseWriter }
@@ -78,6 +80,35 @@ func markSupportResponseError(w http.ResponseWriter, err error, expected bool) {
 	}
 }
 
+// Only a storage admission caller may add these fixed labels. Arbitrary
+// observer errors can contain paths or native output and never enter activity.
+func markSupportStorageObservation(w http.ResponseWriter, stage string, err error) {
+	var binding *storageBindingFailure
+	var macAccess *macOSAccessError
+	// Preview and retry can also fail native work. A deadline from that work
+	// is not evidence of a storage observation, even at a storage stage.
+	if err == nil || (!errors.As(err, &binding) && !errors.As(err, &macAccess)) ||
+		errors.Is(err, context.Canceled) ||
+		!errors.Is(err, storageavailability.ErrObserverUnavailable) && !errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	switch stage {
+	case "vault_create_destination", "vault_connect_destination", "job_create_source", "job_bind_source":
+	default:
+		return
+	}
+	reason := storageavailability.ResolutionReason(err)
+	switch reason {
+	case database.AvailabilityReasonStorageMissing, database.AvailabilityReasonObservationFailed,
+		database.AvailabilityReasonObservationTimeout, database.AvailabilityReasonIdentityMismatch:
+	default:
+		return
+	}
+	if recorder, ok := w.(*supportResponseRecorder); ok {
+		recorder.storageObservationDetail = "stage=" + stage + " reason=" + reason
+	}
+}
+
 func recordSupportResponseErrors(db *sql.DB, next http.Handler) http.Handler {
 	if db == nil {
 		return next
@@ -101,11 +132,20 @@ func recordSupportResponseErrors(db *sql.DB, next http.Handler) http.Handler {
 		if detail := supportResponseErrorDetail(recorder); detail != "" {
 			message += " detail=" + quoteBoundedSupportDetail(detail)
 		}
-		_ = database.LogError(db, message)
+		if recorder.storageObservationDetail != "" {
+			// Fixed storage labels belong in the export, while the failed
+			// request itself remains the user's visible result.
+			_ = database.LogSupport(db, message)
+		} else {
+			_ = database.LogError(db, message)
+		}
 	})
 }
 
 func supportResponseErrorDetail(recorder *supportResponseRecorder) string {
+	if recorder.storageObservationDetail != "" {
+		return recorder.storageObservationDetail
+	}
 	if recorder.err != nil {
 		value, truncated := limitSupportRawDetail(recorder.err.Error())
 		return strings.TrimSpace(supportBoundedRawDetail(value, truncated))
@@ -132,7 +172,9 @@ func eligibleSupportResponseError(r *http.Request, response *supportResponseReco
 	if r.URL.Path == supportReportPath || !strings.HasPrefix(r.URL.Path, "/api/") {
 		return false
 	}
-	if response.expected || errors.Is(response.err, context.Canceled) || errors.Is(response.err, context.DeadlineExceeded) ||
+	if response.expected && response.storageObservationDetail == "" ||
+		(response.storageObservationDetail == "" &&
+			(errors.Is(response.err, context.Canceled) || errors.Is(response.err, context.DeadlineExceeded))) ||
 		errors.Is(r.Context().Err(), context.Canceled) || errors.Is(r.Context().Err(), context.DeadlineExceeded) {
 		return false
 	}
@@ -141,6 +183,10 @@ func eligibleSupportResponseError(r *http.Request, response *supportResponseReco
 		return false
 	}
 	if response.status >= http.StatusInternalServerError {
+		return true
+	}
+	if response.storageObservationDetail != "" &&
+		(response.status == http.StatusBadRequest || response.status == http.StatusConflict) {
 		return true
 	}
 	if response.status != http.StatusConflict ||
@@ -585,7 +631,7 @@ func loadSupportIssues(query supportQueryer, cutoff, generatedAt time.Time, priv
 	activityRows, err := query.Query(`SELECT timestamp,level,CAST(substr(CAST(message AS BLOB),1,?) AS TEXT),
 		length(CAST(message AS BLOB))>?
 		FROM activity_log
-		WHERE level IN ('ERROR','WARN') AND julianday(timestamp) >= julianday(?) AND julianday(timestamp) <= julianday(?)
+		WHERE level IN ('ERROR','WARN','SUPPORT') AND julianday(timestamp) >= julianday(?) AND julianday(timestamp) <= julianday(?)
 		ORDER BY julianday(timestamp) DESC,id DESC LIMIT ?`, supportRawDetailByteLimit, supportRawDetailByteLimit,
 		cutoffText, generatedText, supportReportIssueLimit)
 	if err != nil {
@@ -599,10 +645,10 @@ func loadSupportIssues(query supportQueryer, cutoff, generatedAt time.Time, priv
 			return nil, err
 		}
 		message = supportBoundedRawDetail(message, truncated)
-		detail := "level=" + supportAllowedLabel(level, "ERROR", "WARN") + " " + supportDetailField(message, privatePatterns)
+		detail := "level=" + supportAllowedLabel(level, "ERROR", "WARN", "SUPPORT") + " " + supportDetailField(message, privatePatterns)
 		if matches := supportRecordedActivityPattern.FindStringSubmatch(message); matches != nil {
 			detail = fmt.Sprintf("level=%s method=%s category=%s status=%s",
-				supportAllowedLabel(level, "ERROR", "WARN"), matches[1], matches[2], matches[3])
+				supportAllowedLabel(level, "ERROR", "WARN", "SUPPORT"), matches[1], matches[2], matches[3])
 			if matches[4] != "" {
 				if recorded, unquoteErr := strconv.Unquote(matches[4]); unquoteErr == nil {
 					detail += " " + supportDetailField(recorded, privatePatterns)

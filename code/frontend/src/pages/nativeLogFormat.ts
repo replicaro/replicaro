@@ -676,9 +676,17 @@ export function formatReadableLog(text: string, context: ReadableLogContext, liv
         ? `[${context.engine} · maintenance]\n${formatted}`
         : formattedBody ?? formatted;
     const unique = [...new Set(diagnostics.map(value => value.trim()).filter(Boolean))];
+    // Restic's status error_count is cumulative. Every progress record is
+    // retained in Raw and Readable body. Put the last observed count first so
+    // native errors cannot push it past the twelve-line summary cap; earlier
+    // counts are superseded only in this short diagnostic summary.
+    const progressCount = /^Restic reported [1-9]\d* errors?\.$/;
+    const lastProgressCount = unique.findLastIndex(value => progressCount.test(value));
+    const summaryDiagnostics = lastProgressCount < 0 ? unique
+        : [unique[lastProgressCount], ...unique.filter(value => !progressCount.test(value))];
     // A summary stays short; all omitted text remains in the detailed log.
-    const concise = unique.slice(0, 12).map(value => value.length > 500 ? value.slice(0, 500) + "… (see Raw in the completed log)" : value);
-    if (unique.length > 12) concise.push("Additional errors or warnings are in Raw in the completed log.");
+    const concise = summaryDiagnostics.slice(0, 12).map(value => value.length > 500 ? value.slice(0, 500) + "… (see Raw in the completed log)" : value);
+    if (summaryDiagnostics.length > 12) concise.push("Additional errors or warnings are in Raw in the completed log.");
     const summary = ["[errors / warnings summary]",
         ...(live ? ["Errors and warnings shown below cover the currently loaded log output."] : []),
         ...(concise.length ? concise : ["No errors or warnings identified in the loaded output."]),

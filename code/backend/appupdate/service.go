@@ -18,6 +18,7 @@ import (
 
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/desktop"
+	"github.com/local/replicaro/locale"
 	"github.com/local/replicaro/models"
 )
 
@@ -26,8 +27,6 @@ const (
 	requestTimeout           = 5 * time.Second
 	maximumResponseSize      = 4096
 	automaticStateRetryDelay = time.Minute
-	updateNotificationTitle  = "Replicaro update available"
-	updateNotificationBody   = "New Replicaro version is available! Click for details."
 )
 
 type Status struct {
@@ -275,7 +274,12 @@ func (service *Service) Check(ctx context.Context, automatic bool) (status Statu
 	}
 	status = statusFromState(state, false)
 	if automatic && !status.AutomaticChecksDisabled && status.Result == "update_available" && !status.AvailableVersionSkipped {
-		if notifyErr := service.showNotification(updateNotificationTitle, updateNotificationBody, "", true); notifyErr != nil {
+		language := models.LanguageSystem
+		if settings, settingsErr := database.GetSettings(service.db); settingsErr == nil {
+			language = settings.Language
+		}
+		effective := locale.Effective(language)
+		if notifyErr := service.showNotification(locale.Text(effective, "notifications.appUpdate.title", nil), locale.Text(effective, "notifications.appUpdate.message", nil), "", true); notifyErr != nil {
 			log.Printf("application update notification: %v", notifyErr)
 		}
 	}

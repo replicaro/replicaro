@@ -27,13 +27,23 @@ type macOSAccessError struct {
 func (err *macOSAccessError) Error() string { return err.message }
 func (err *macOSAccessError) Unwrap() error { return err.cause }
 
+type storageBindingFailure struct {
+	message string
+	cause   error
+}
+
+func (err *storageBindingFailure) Error() string { return err.message }
+func (err *storageBindingFailure) Unwrap() error { return err.cause }
+
 func storageBindingError(err error, subject, ability, fallback string) error {
 	return storageBindingErrorForPlatform(runtime.GOOS, err, subject, ability, fallback)
 }
 
 func storageBindingErrorForPlatform(platform string, err error, subject, ability, fallback string) error {
 	if platform != "darwin" || !storageavailability.IsPermissionDenied(err) {
-		return errors.New(fallback)
+		// The public message stays stable. The typed cause carries only local
+		// observation classification to the narrow support recorder.
+		return &storageBindingFailure{message: fallback, cause: err}
 	}
 	return &macOSAccessError{
 		cause: err,
@@ -80,7 +90,7 @@ func bindImportedJobSourceStorage(ctx context.Context, job models.BackupJob) (mo
 		if errors.As(err, &access) {
 			return models.BackupJob{}, err
 		}
-		return models.BackupJob{}, errors.New(importedSourceMissingMessage)
+		return models.BackupJob{}, &storageBindingFailure{message: importedSourceMissingMessage, cause: err}
 	}
 	return bound, nil
 }

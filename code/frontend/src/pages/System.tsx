@@ -7,9 +7,9 @@ import { checkForAppUpdate, getEngines, getPlatform, getSettings, getSupportRepo
 import type { AppUpdateStatus, EngineDescriptor, PlatformInfo, Settings as SettingsType } from "../types";
 import type { AppUpdateOutletContext } from "../layouts/MainLayout";
 import { applyThemePreference } from "../theme";
+import { activateLocale, languageNames, t } from "../i18n";
 
 const supportReportByteLimit = 256 * 1024;
-const highBackupAdmissionConfirmation = "More than 5 simultaneous backup runs may fail if your computer does not have enough RAM or CPU. Are you sure you want to set the limit above 5?";
 type PendingSaveAction = "save" | "save-and-leave";
 let supportClipboardTail: Promise<void> = Promise.resolve();
 
@@ -73,6 +73,7 @@ export default function System() {
     const [supportReport, setSupportReport] = useState("");
     const [supportError, setSupportError] = useState("");
     const [copyStatus, setCopyStatus] = useState("");
+    const [copySucceeded, setCopySucceeded] = useState(false);
     const supportGeneration = useRef(0);
     const supportAbort = useRef<AbortController | null>(null);
     const supportCopyAttempt = useRef(0);
@@ -88,6 +89,7 @@ export default function System() {
             setSavedSettings(nextSettings);
             setPlatform(nextPlatform);
 			applyThemePreference(nextSettings.theme);
+            activateLocale(nextSettings.effectiveLocale);
         }).catch((error: Error) => toast("error", error.message));
     }, [toast]);
 
@@ -98,15 +100,33 @@ export default function System() {
         supportAbort.current?.abort();
     }, []);
 
-    const save = async () => {
-        if (!settings) return false;
-		const attemptedSettings = settings;
+    const save = async (resetEnglish = false) => {
+        if (!settings || !savedSettings || saving) return false;
+        // The recovery button saves only the language. Other edits stay in the
+        // draft and still pass through the normal Save settings confirmations.
+		const attemptedSettings: SettingsType = resetEnglish
+            ? { ...savedSettings, language: "en", effectiveLocale: "en" }
+            : settings;
 		const previouslySavedSettings = savedSettings;
         setSaving(true);
         try {
             await saveSettings(attemptedSettings);
-            setSavedSettings(attemptedSettings);
-            toast("ok", "Settings saved and applied");
+            // The backend owns OS-language resolution. Re-read only when the
+            // language preference changed so the selected catalog follows its
+            // authoritative effectiveLocale without consulting the browser.
+            let confirmedSettings = attemptedSettings;
+            if ((attemptedSettings.language ?? "system") !== (previouslySavedSettings?.language ?? "system")) {
+                try { confirmedSettings = await getSettings(); }
+                catch { /* The saved choice is durable; the next load retries locale resolution. */ }
+            }
+            setSavedSettings(confirmedSettings);
+            setSettings((current) => {
+                if (!current) return current;
+                if (resetEnglish) return { ...current, language: confirmedSettings.language, effectiveLocale: confirmedSettings.effectiveLocale };
+                return sameSettings(current, attemptedSettings) ? confirmedSettings : current;
+            });
+            activateLocale(confirmedSettings.effectiveLocale);
+            toast("ok", t("ui.system.settingsSaved"));
             return true;
         } catch (error) {
             toast("error", (error as Error).message);
@@ -116,9 +136,12 @@ export default function System() {
 				if (!previouslySavedSettings || !sameSettings(persistedSettings, previouslySavedSettings)) {
 					committed = true;
 					setSavedSettings(persistedSettings);
+                    if (resetEnglish) activateLocale(persistedSettings.effectiveLocale);
 					setSettings((currentSettings) => {
+                        if (resetEnglish && currentSettings) return { ...currentSettings, language: persistedSettings.language, effectiveLocale: persistedSettings.effectiveLocale };
 						if (!currentSettings || !sameSettings(currentSettings, attemptedSettings)) return currentSettings;
 						applyThemePreference(persistedSettings.theme);
+                        activateLocale(persistedSettings.effectiveLocale);
 						return persistedSettings;
 					});
 				}
@@ -194,16 +217,20 @@ export default function System() {
         setSupportCopying(true);
         setCopyStatus("");
         let nextStatus: string;
+        let nextSucceeded: boolean;
         try {
             await writeSupportReportToClipboard(report);
-            nextStatus = "Error log copied to the clipboard.";
+            nextStatus = t("ui.system.logCopied");
+            nextSucceeded = true;
         } catch {
-            nextStatus = "Replicaro could not copy the error log. Select the preview and copy it manually.";
+            nextStatus = t("ui.system.logCopyFailed");
+            nextSucceeded = false;
         } finally {
             supportCopyPending.current = false;
             setSupportCopying(false);
         }
         if (supportGeneration.current === generation && supportCopyAttempt.current === attempt) {
+            setCopySucceeded(nextSucceeded);
             setCopyStatus(nextStatus);
         }
     };
@@ -299,52 +326,57 @@ export default function System() {
     if (!settings) return <div className="page"><Loading /></div>;
 
     return <div className="page system-page">
-        <header className="page-header simple"><h1 className="page-title">System</h1><p className="page-desc">Settings and housekeeping</p></header>
+        <header className="page-header simple"><h1 className="page-title">{t("ui.pages.system.system")}</h1><p className="page-desc">{t("ui.pages.system.settings.and.housekeeping")}</p></header>
         <div className="system-list">
-            <div className="system-label">Version</div><section className="system-section"><div className="system-value mono">{version || "Unknown"}</div></section>
-            <div className="system-label">Updates</div><section className="system-section app-update-settings">
-                <button type="button" className="btn" disabled={checkingForUpdate} onClick={() => void checkForUpdate()}>{checkingForUpdate ? "Checking…" : "Check for update now"}</button>
+            <div className="system-label">{t("ui.pages.system.version")}</div><section className="system-section"><div className="system-value mono">{version || t("ui.system.unknownVersion")}</div></section>
+            <div className="system-label">{t("ui.pages.system.updates")}</div><section className="system-section app-update-settings">
+                <button type="button" className="btn" disabled={checkingForUpdate} onClick={() => void checkForUpdate()}>{checkingForUpdate ? t("ui.pages.system.checking") : t("ui.pages.system.check.for.update.now")}</button>
 				<div>
-					<label className="check"><input type="checkbox" aria-describedby="automatic-update-help" checked={!(settings.disableAutomaticUpdateChecks ?? false)} onChange={(event) => setSettings({ ...settings, disableAutomaticUpdateChecks: !event.target.checked })} />Automatically check for updates</label>
-                    <div id="automatic-update-help" className="setting-hint">Replicaro notifies you of an update but never downloads an update by itself.</div>
+					<label className="check"><input type="checkbox" aria-describedby="automatic-update-help" checked={!(settings.disableAutomaticUpdateChecks ?? false)} onChange={(event) => setSettings({ ...settings, disableAutomaticUpdateChecks: !event.target.checked })} />{t("ui.pages.system.automatically.check.for.updates")}</label>
+                    <div id="automatic-update-help" className="setting-hint">{t("ui.pages.system.replicaro.notifies.you.of.an.update.but.never.downloads.an.update.by.i")}</div>
 				</div>
-                {manualUpdateStatus?.result === "up_to_date" && <div className="inline-notice">Replicaro {manualUpdateStatus.runningVersion} is up to date.</div>}
-                {manualUpdateStatus?.result === "unavailable" && <div className="inline-error">Update status is unavailable. Replicaro could not check the update service.</div>}
+                {manualUpdateStatus?.result === "up_to_date" && <div className="inline-notice">{t("ui.system.updateCurrent", { version: manualUpdateStatus.runningVersion })}</div>}
+                {manualUpdateStatus?.result === "unavailable" && <div className="inline-error">{t("ui.system.updateUnavailable")}</div>}
                 {manualUpdateStatus?.result === "update_available" && manualUpdateStatus.availableVersion && <div className="inline-notice app-update-manual-result">
-                    Replicaro {manualUpdateStatus.availableVersion} is available.{manualUpdateStatus.availableVersionSkipped ? " You previously skipped this version; automatic notices remain suppressed." : ""}
-                    <button type="button" className="btn sm" onClick={() => void openManualUpdate()}>Open download page</button>
+                    {manualUpdateStatus.availableVersionSkipped ? t("ui.system.updateAvailableSkipped", { version: manualUpdateStatus.availableVersion }) : t("ui.system.updateAvailable", { version: manualUpdateStatus.availableVersion })}
+                    <button type="button" className="btn sm" onClick={() => void openManualUpdate()}>{t("ui.pages.system.open.download.page")}</button>
                 </div>}
             </section>
-            <div className="system-label">Support</div><section className="system-section support-section"><button type="button" className="btn" onClick={() => void openSupportReport()}>Report bugs or errors</button><div className="setting-hint">Help improve Replicaro by reporting bugs and errors. Your private information (passwords, keys, files, backed up data, etc.) is never included in your report; only anonymized logs are shared.</div></section>
-			<div className="system-label">Appearance</div>
+            <div className="system-label">{t("ui.pages.system.support")}</div><section className="system-section support-section"><button type="button" className="btn" onClick={() => void openSupportReport()}>{t("ui.pages.system.report.bugs.or.errors")}</button><div className="setting-hint">{t("ui.pages.system.help.improve.replicaro.by.reporting.bugs.and.errors.your.private.infor")}</div></section>
+			<div className="system-label">{t("ui.pages.system.appearance")}</div>
 			<section className="system-section">
-				<label className="field system-control-field"><span>Theme</span><select value={settings.theme} onChange={(event) => { const theme = event.target.value as SettingsType["theme"]; applyThemePreference(theme); setSettings({ ...settings, theme }); }}><option value="system">System</option><option value="light">Light</option><option value="neutral">Neutral</option><option value="dark">Dark</option></select></label>
-				<div className="setting-hint system-control-hint">System follows your operating system’s light or dark theme setting.</div>
+				<label className="field system-control-field"><span>{t("ui.pages.system.theme")}</span><select value={settings.theme} onChange={(event) => { const theme = event.target.value as SettingsType["theme"]; applyThemePreference(theme); setSettings({ ...settings, theme }); }}><option value="system">{t("ui.pages.system.system")}</option><option value="light">{t("ui.pages.system.light")}</option><option value="neutral">{t("ui.pages.system.neutral")}</option><option value="dark">{t("ui.pages.system.dark")}</option></select></label>
+				<div className="setting-hint system-control-hint">{t("ui.pages.system.system.follows.your.operating.system.s.light.or.dark.theme.setting")}</div>
+                <div className="system-language-controls">
+                    <label className="field system-control-field system-language-field"><span>{t("system.language.label")}</span><select value={settings.language ?? "system"} disabled={saving} onChange={(event) => setSettings({ ...settings, language: event.target.value as SettingsType["language"] })}><option value="system">{t("system.language.system")}</option><option value="en">{t("system.language.english")}</option>{Object.entries(languageNames).map(([locale, name]) => <option key={locale} value={locale} lang={locale}>{name}</option>)}</select></label>
+                    {/* Keep this recovery action in English so it remains recognizable in every UI language. */}
+                    <button type="button" className="btn" lang="en" dir="ltr" translate="no" disabled={saving} onClick={() => void save(true)}>Reset to English</button>
+                </div>
 			</section>
-            <div className="system-label">Default Engine for Backups</div>
+            <div className="system-label">{t("ui.pages.system.default.engine.for.backups")}</div>
             <section className="system-section">
-                <label className="field system-control-field"><span>Engine used for new vaults</span><select value={settings.defaultEngine} onChange={(event) => setSettings({ ...settings, defaultEngine: event.target.value as SettingsType["defaultEngine"] })}><option value="restic">Restic</option><option value="kopia">Kopia</option></select></label>
-                <div className="setting-hint system-control-hint">Select Restic if you are unsure which engine to use. This setting does not change the engine for existing vaults.</div>
+                <label className="field system-control-field"><span>{t("ui.pages.system.engine.used.for.new.vaults")}</span><select value={settings.defaultEngine} onChange={(event) => setSettings({ ...settings, defaultEngine: event.target.value as SettingsType["defaultEngine"] })}><option value="restic">{t("ui.pages.system.restic")}</option><option value="kopia">{t("ui.pages.system.kopia")}</option></select></label>
+                <div className="setting-hint system-control-hint">{t("ui.pages.system.select.restic.if.you.are.unsure.which.engine.to.use.this.setting.does")}</div>
             </section>
-            <div className="system-label">Backup Engine Status</div><section className="system-section"><div className="engine-cards">{engines.map((engine) => <div className={`engine-state${engine.installed ? " ready" : " missing"}`} key={engine.id}><span className="engine-status-dot" /><div className="engine-details"><strong>{engine.name}{engine.version ? ` · ${engine.version}` : ""}</strong><small>Compression: {engine.compression} · Encryption: {engine.encryption}</small>{engine.compatibilityWarning && <div className="inline-error">{engine.compatibilityWarning}</div>}</div></div>)}</div></section>
-            {(platform?.capabilities.startAtLogin ?? true) && <><div className="system-label">Startup</div><section className="system-section"><label className="check"><input type="checkbox" checked={settings.startAtLogin ?? settings.startWithWindows} onChange={(event) => setSettings({ ...settings, startAtLogin: event.target.checked, startWithWindows: event.target.checked })} />Start Replicaro at login</label></section></>}
-            <div className="system-label">Housekeeping</div><section className="system-section"><label className="field compact-field"><span>Keep logs for (days)</span><input type="number" min={1} value={settings.logRetentionDays} onWheel={preventNumberInputWheel} onChange={(event) => setSettings({ ...settings, logRetentionDays: parseInt(event.target.value, 10) || 30 })} /></label></section>
-            <div className="system-label">Backup admission</div><section className="system-section"><label className="field system-control-field"><span>Maximum simultaneous backup runs</span><input type="number" min={1} max={32} value={settings.maxConcurrentJobRuns} onWheel={preventNumberInputWheel} onChange={(event) => setSettings({ ...settings, maxConcurrentJobRuns: Math.min(32, Math.max(1, parseInt(event.target.value, 10) || 2)) })} /></label></section>
-            <div className="system-label">Notifications</div><section className="system-section notifications-section">{(platform?.capabilities.nativeNotifications ?? true) && <div className="notification-channel"><div className="notification-channel-title">Desktop</div><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnFailure ?? settings.notifyWindowsOnFailure} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnFailure: event.target.checked, notifyWindowsOnFailure: event.target.checked })} />Notify on failures</label><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnSuccess ?? settings.notifyWindowsOnSuccess} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnSuccess: event.target.checked, notifyWindowsOnSuccess: event.target.checked })} />Notify on success</label></div>}<div className="notification-channel"><div className="notification-channel-title">Webhooks</div><label className="field system-wide-field"><span>Webhook URL</span><input type="url" value={settings.webhookUrl} onChange={(event) => setSettings({ ...settings, webhookUrl: event.target.value })} /><small>Leave blank if not using webhooks</small></label><label className="check"><input type="checkbox" checked={settings.notifyWebhookOnFailure} onChange={(event) => setSettings({ ...settings, notifyWebhookOnFailure: event.target.checked })} />Notify on failures</label><label className="check"><input type="checkbox" checked={settings.notifyWebhookOnSuccess} onChange={(event) => setSettings({ ...settings, notifyWebhookOnSuccess: event.target.checked })} />Notify on success</label></div><button className="btn primary save-settings" disabled={saving} onClick={() => requestSave("save")}>{saving ? "Saving…" : "Save settings"}</button></section>
+            <div className="system-label">{t("ui.pages.system.backup.engine.status")}</div><section className="system-section"><div className="engine-cards">{engines.map((engine) => <div className={`engine-state${engine.installed ? " ready" : " missing"}`} key={engine.id}><span className="engine-status-dot" /><div className="engine-details"><strong>{engine.name}{engine.version ? ` · ${engine.version}` : ""}</strong><small>{t("ui.system.engineProtectionSummary", { compression: engine.compression, encryption: engine.encryption })}</small>{engine.compatibilityWarning && <div className="inline-error">{engine.compatibilityWarning}</div>}</div></div>)}</div></section>
+            {(platform?.capabilities.startAtLogin ?? true) && <><div className="system-label">{t("ui.pages.system.startup")}</div><section className="system-section"><label className="check"><input type="checkbox" checked={settings.startAtLogin ?? settings.startWithWindows} onChange={(event) => setSettings({ ...settings, startAtLogin: event.target.checked, startWithWindows: event.target.checked })} />{t("ui.system.startAtLogin")}</label></section></>}
+            <div className="system-label">{t("ui.pages.system.housekeeping")}</div><section className="system-section"><label className="field compact-field"><span>{t("ui.pages.system.keep.logs.for.days")}</span><input type="number" min={1} value={settings.logRetentionDays} onWheel={preventNumberInputWheel} onChange={(event) => setSettings({ ...settings, logRetentionDays: parseInt(event.target.value, 10) || 30 })} /></label></section>
+            <div className="system-label">{t("ui.pages.system.backup.admission")}</div><section className="system-section"><label className="field system-control-field"><span>{t("ui.pages.system.maximum.simultaneous.backup.runs")}</span><input type="number" min={1} max={32} value={settings.maxConcurrentJobRuns} onWheel={preventNumberInputWheel} onChange={(event) => setSettings({ ...settings, maxConcurrentJobRuns: Math.min(32, Math.max(1, parseInt(event.target.value, 10) || 2)) })} /></label></section>
+            <div className="system-label">{t("ui.pages.system.notifications")}</div><section className="system-section notifications-section">{(platform?.capabilities.nativeNotifications ?? true) && <div className="notification-channel"><div className="notification-channel-title">{t("ui.pages.system.desktop")}</div><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnFailure ?? settings.notifyWindowsOnFailure} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnFailure: event.target.checked, notifyWindowsOnFailure: event.target.checked })} />{t("ui.system.notifyFailures")}</label><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnSuccess ?? settings.notifyWindowsOnSuccess} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnSuccess: event.target.checked, notifyWindowsOnSuccess: event.target.checked })} />{t("ui.system.notifySuccess")}</label></div>}<div className="notification-channel"><div className="notification-channel-title">{t("ui.pages.system.webhooks")}</div><label className="field system-wide-field"><span>{t("ui.pages.system.webhook.url")}</span><input type="url" value={settings.webhookUrl} onChange={(event) => setSettings({ ...settings, webhookUrl: event.target.value })} /><small>{t("ui.pages.system.leave.blank.if.not.using.webhooks")}</small></label><label className="check"><input type="checkbox" checked={settings.notifyWebhookOnFailure} onChange={(event) => setSettings({ ...settings, notifyWebhookOnFailure: event.target.checked })} />{t("ui.system.notifyFailures")}</label><label className="check"><input type="checkbox" checked={settings.notifyWebhookOnSuccess} onChange={(event) => setSettings({ ...settings, notifyWebhookOnSuccess: event.target.checked })} />{t("ui.system.notifySuccess")}</label></div><button className="btn primary save-settings" disabled={saving} onClick={() => requestSave("save")}>{saving ? t("ui.system.saving") : t("ui.system.saveSettings")}</button></section>
         </div>
-        {supportOpen && <Modal title="Report bugs or errors" onClose={closeSupportReport} wide><div className="support-report-modal">
-            <p className="modal-intro">Submit an issue on GitHub to report a Replicaro bug/error. You will need to copy/paste the error log below into the GitHub issue. Replicaro never uploads or submits this log automatically.</p>
-            <div className="inline-warning support-report-warning">Computer names and recognizable paths and filenames are removed from this support report. Known and obvious credential forms are also redacted as a precaution. Review the report before posting it on GitHub.</div>
+        {supportOpen && <Modal title={t("ui.pages.system.report.bugs.or.errors")} onClose={closeSupportReport} wide><div className="support-report-modal">
+            <p className="modal-intro">{t("ui.pages.system.submit.an.issue.on.github.to.report.a.replicaro.bug.error.you.will.nee")}</p>
+            <div className="inline-warning support-report-warning">{t("ui.pages.system.computer.names.and.recognizable.paths.and.filenames.are.removed.from.t")}</div>
             {supportLoading && !supportReport && <Loading />}
-            {supportError && <div className="inline-error" role="alert">Could not generate the error log: {supportError}</div>}
-            {supportReport && <textarea className="support-report-preview mono" aria-label="Diagnostic error log preview" readOnly value={supportReport} />}
-            {copyStatus && <div className={copyStatus.startsWith("Error log copied") ? "inline-notice" : "inline-error"} role="status">{copyStatus}</div>}
+            {supportError && <div className="inline-error" role="alert">{t("ui.system.supportReportFailed", { error: supportError })}</div>}
+            {supportReport && <textarea className="support-report-preview mono" aria-label={t("ui.pages.system.diagnostic.error.log.preview")} readOnly value={supportReport} />}
+            {copyStatus && <div className={copySucceeded ? "inline-notice" : "inline-error"} role="status">{copyStatus}</div>}
             <div className="modal-footer">
-                <button type="button" className="btn primary" disabled={!supportReport || supportLoading || supportCopying} onClick={() => void copySupportReport()}>Copy error log</button>
-                <a className="btn" href={supportReport && !supportLoading ? "https://github.com/replicaro/replicaro/issues/new" : undefined} target="_blank" rel="noreferrer" role="link" aria-disabled={!supportReport || supportLoading} tabIndex={supportReport && !supportLoading ? 0 : -1} onClick={() => { if (supportReport && !supportLoading) void copySupportReport(); }}>Open GitHub issue</a>
+                <button type="button" className="btn primary" disabled={!supportReport || supportLoading || supportCopying} onClick={() => void copySupportReport()}>{t("ui.pages.system.copy.error.log")}</button>
+                <a className="btn" href={supportReport && !supportLoading ? "https://github.com/replicaro/replicaro/issues/new" : undefined} target="_blank" rel="noreferrer" role="link" aria-disabled={!supportReport || supportLoading} tabIndex={supportReport && !supportLoading ? 0 : -1} onClick={() => { if (supportReport && !supportLoading) void copySupportReport(); }}>{t("ui.pages.system.open.github.issue")}</a>
             </div>
         </div></Modal>}
-        {pendingSaveAction && <ConfirmDialog title="Confirm backup admission limit" message={highBackupAdmissionConfirmation} confirmLabel="Save limit" busy={saving} onConfirm={confirmHighConcurrencySave} onCancel={() => setPendingSaveAction(null)} />}
+        {pendingSaveAction && <ConfirmDialog title={t("ui.pages.system.confirm.backup.admission.limit")} message={t("ui.system.highBackupConfirmation")} confirmLabel={t("ui.system.saveLimit")} busy={saving} onConfirm={confirmHighConcurrencySave} onCancel={() => setPendingSaveAction(null)} />}
         {pendingNavigation && !pendingSaveAction && <SaveChangesDialog onSave={() => requestSave("save-and-leave")} onDiscard={discardAndLeave} onCancel={() => setPendingNavigation(null)} busy={saving} />}
     </div>;
 }

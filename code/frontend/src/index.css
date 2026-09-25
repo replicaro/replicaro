@@ -1589,9 +1589,10 @@ button.protection-ring { cursor: pointer; }
     transform: translateY(0);
 }
 
-.flow-vault-status {
+.flow-vault > .flow-vault-status {
     display: block !important;
     overflow: visible !important;
+    white-space: normal;
 }
 
 .tooltip-trigger.file-path-label {
@@ -1651,6 +1652,11 @@ button.protection-ring { cursor: pointer; }
 
 .flow-glyph .flow-arrow-vertical {
     display: none;
+}
+
+/* The grid follows text direction; the backup arrow must still point at the vault. */
+[dir="rtl"] .flow-glyph .flow-arrow-horizontal {
+    transform: scaleX(-1);
 }
 
 .flow-source span b,
@@ -2739,6 +2745,11 @@ select option {
     background: transparent;
     color: var(--text-muted);
     cursor: pointer;
+}
+
+/* RTL reverses the controls, so reverse their arrows to match the month order. */
+[dir="rtl"] .calendar-header button {
+    transform: scaleX(-1);
 }
 
 .calendar-header strong {
@@ -3830,6 +3841,17 @@ select option {
     max-width: 100%;
 }
 
+.system-language-field {
+    width: 340px;
+}
+
+.system-language-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 8px;
+}
+
 .system-wide-field input.mono {
     font-size: 12px;
 }
@@ -3879,6 +3901,8 @@ select option {
     min-height: 280px;
     resize: vertical;
     white-space: pre;
+    direction: ltr;
+    text-align: left;
 }
 
 .app-update-settings {
@@ -4237,7 +4261,7 @@ select option {
     }
 
     .system-list {
-        grid-template-columns: 1fr;
+        grid-template-columns: minmax(0, 1fr);
         gap: 8px;
     }
 
@@ -4321,6 +4345,22 @@ select option {
 		flex-direction: column;
 	}
 
+    /* Translated job actions can need more than one line on small screens. */
+    .protect-page .section-heading {
+        flex-wrap: wrap;
+    }
+
+    .job-heading-actions {
+        min-width: 0;
+        max-width: 100%;
+    }
+
+    .job-heading-actions .btn {
+        max-width: 100%;
+        white-space: normal;
+        text-align: start;
+    }
+
     .vault-row {
         grid-template-columns: minmax(0, 1fr) auto;
         gap: 14px;
@@ -4358,6 +4398,13 @@ select option {
     .restore-controls {
         align-items: flex-start;
         flex-direction: column;
+    }
+
+    /* Long translated actions need to wrap within the narrow control column. */
+    .restore-controls > .btn {
+        max-width: 100%;
+        white-space: normal;
+        text-align: start;
     }
 
     .snapshot-row {
@@ -4642,14 +4689,35 @@ input, select, textarea { font-size: 14.5px; }
     inset: 0;
     z-index: 2;
     display: flex;
+    min-height: 0;
     flex-direction: column;
     align-items: center;
-    justify-content: center;
+    /* Safe centering keeps long error/recovery content reachable by scrolling. */
+    justify-content: safe center;
     gap: 10px;
     padding: 20px;
+    overflow-y: auto;
     border-radius: inherit;
     background: var(--panel);
     text-align: center;
+}
+
+.protect-page .vault-overlay-identity {
+    display: flex;
+    max-width: 100%;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    text-align: left;
+}
+
+.protect-page .vault-overlay-identity strong {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+.protect-page .vault-overlay-status {
+    overflow-wrap: anywhere;
 }
 
 .protect-page .vault-removal-overlay > span:not(.spinner) {
@@ -4674,9 +4742,9 @@ input, select, textarea { font-size: 14.5px; }
 	min-height: 0;
 	flex-direction: column;
 	align-items: center;
-	/* Centering a flex column whose content exceeds the card can place its
-	   beginning above scrollTop=0. Start alignment keeps every detail reachable. */
-	justify-content: flex-start;
+	/* Safe centering retains the status in the middle until lengthy recovery
+	   details need scrolling; then the beginning remains reachable. */
+	justify-content: safe center;
 	gap: 8px;
 	padding: 16px;
 	overflow-y: auto;
@@ -4766,8 +4834,16 @@ input, select, textarea { font-size: 14.5px; }
     overflow-wrap: anywhere;
 }
 
+.vault-work-log-lines.is-empty { height: 0; }
+
+.vault-work-stage + .vault-work-stage { margin-top: 1.4em; }
+
+.vault-work-log-spinner {
+    display: block;
+    margin: 10px auto 0;
+}
+
 .vault-work-stage { color: var(--text-muted); }
-.vault-work-native { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
 
 .protect-page .vault-row:hover {
     border-color: var(--hairline);
