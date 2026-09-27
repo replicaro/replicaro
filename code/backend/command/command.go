@@ -40,9 +40,9 @@ type PrivateOutputError struct {
 func (e *PrivateOutputError) Error() string { return "private native command failed" }
 func (e *PrivateOutputError) Unwrap() error { return e.Cause }
 
-// PrivateOutputFailureKind returns only the narrow output-free classification
-// needed by private rclone workflows. Native text is inspected at the process
-// boundary and is not retained in the returned error graph.
+// PrivateOutputFailureKind returns only the failure category that private
+// rclone workflows need, with no output text. Native text is inspected inside
+// this package and is never kept in the returned error chain.
 func PrivateOutputFailureKind(err error) PrivateFailureKind {
 	if _, followup := FailureCauses(err); followup != nil {
 		return PrivateFailureUnknown
@@ -277,9 +277,9 @@ func Run(ctx context.Context, path string, args, env []string, timeout time.Dura
 	return runWithInput(ctx, path, args, env, "", timeout, engine, false, false, nil, nil)
 }
 
-// RunCaptured drains exact ordinary stdout and stderr into owner-local files.
-// Only a bounded diagnostic excerpt remains in memory; total output size does
-// not alter the native process result. The caller must Close the returned
+// RunCaptured drains the complete stdout and stderr into owner-local files.
+// Only a bounded diagnostic excerpt stays in memory, and total output size
+// never changes the native process result. The caller must Close the returned
 // capture after parsing it.
 func RunCaptured(ctx context.Context, path string, args, env []string, timeout time.Duration, engine string) (*CapturedOutput, string, error) {
 	capture, err := newCapturedOutput()
@@ -332,8 +332,7 @@ func RunWithInputSecretsPrivateOutputObservedStderr(
 
 // RunDiscardOutput drains stdout and stderr without retaining either stream.
 // It is for current-user hooks whose arbitrary output is private and is never
-// presented. The ordinary process-tree and cancellation lifecycle
-// remains unchanged.
+// presented. Process-tree cleanup and cancellation work as for any other command.
 func RunDiscardOutput(ctx context.Context, path string, args, env []string, engine string) error {
 	_, err := runWithInput(ctx, path, args, env, "", NoTotalDeadline, engine, true, true, nil, nil)
 	return err
@@ -394,8 +393,8 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 	if !privateOutput && !discardOutput {
 		live = liveOutputObserver(commandContext)
 		if live != nil {
-			// Raw buffers stay first in each tee. The selected engines own ordinary
-			// output content; Replicaro only assembles bounded complete live records.
+			// Raw buffers stay first in each tee. The engine's output is kept as-is; the
+			// live writers only split it into bounded, complete records for display.
 			liveStdout = newLiveRecordWriter("stdout", live)
 			liveStderr = newLiveRecordWriter("stderr", live)
 			stdoutDestination = io.MultiWriter(stdoutDestination, liveStdout)
@@ -547,8 +546,8 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 	}
 	// On Unix waitid intentionally left the leader unreaped while the process
 	// group was cleaned. Reap only afterward so the top-level PID/PGID remains
-	// anchored throughout cleanup. Darwin's documented accepted same-user
-	// secondary-PGID reuse limitation is explained at terminatePlatform.
+	// anchored throughout cleanup. The Darwin same-user secondary-PGID reuse
+	// limitation is a deliberately accepted one; see terminatePlatform.
 	if !waitReaped {
 		canReap := true
 		if cleanupErr != nil {
@@ -620,10 +619,9 @@ func runWithInput(ctx context.Context, path string, args, env []string, input st
 	if !privateOutput && !discardOutput {
 		recordSuccessfulStderr(commandContext, boundedDiagnosticWithOmission(diagnosticStderr, stderrOmitted))
 	}
-	// Investigation of the pinned ordinary Restic and Kopia commands found no
-	// evidence that they print passwords or keys. Their output therefore remains
-	// native and engine-owned; Replicaro redacts only the explicitly public
-	// support-report copy.
+	// We have found nothing in the normal (non-private) pinned Restic and Kopia
+	// commands that prints passwords or keys, so their output is returned
+	// unmodified. Only the public support-report copy is redacted.
 	if captured != nil {
 		return diagnostic, nil
 	}
@@ -726,9 +724,9 @@ func (writer *liveRecordWriter) emit() {
 func (writer *liveRecordWriter) observe(text string) {
 	// The operation runtime manager is the only production observer and performs
 	// one bounded in-memory append. Calling it directly avoids a second queue
-	// whose saturation could silently discard an otherwise complete record.
-	// Presentation failures remain isolated from native parser bytes and result
-	// truth.
+	// whose saturation could silently discard an otherwise complete record. The
+	// recover keeps a presentation failure from affecting parser input or the
+	// command result.
 	defer func() { _ = recover() }()
 	writer.observer(writer.stream, text)
 }

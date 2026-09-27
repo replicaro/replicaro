@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-const ReplicaroVersion = "1.0.2"
+const ReplicaroVersion = "1.0.3"
 
 type SemanticVersion struct {
 	Major uint64

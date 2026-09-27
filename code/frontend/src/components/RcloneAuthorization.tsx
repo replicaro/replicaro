@@ -47,9 +47,9 @@ function RcloneAuthorizationForProvider({
 
 	useLayoutEffect(() => {
 		return () => {
-			// A late native authorization response used to restore an abandoned
-			// OneDrive session after Back, replacing a newer location choice.
-			// Invalidate pending start/continue work during unmount or provider change.
+			// A late native authorization response could otherwise restore an abandoned
+			// OneDrive session after Back and replace a newer location choice.
+			// Invalidate pending start/continue work on unmount or provider change.
 			authorizationGeneration.current++;
 		};
 	}, [provider]);

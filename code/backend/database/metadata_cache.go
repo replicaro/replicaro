@@ -76,8 +76,8 @@ func canonicalMetadataTimestamp(value string) string {
 	return parsed.UTC().Format(metadataTimestampLayout)
 }
 
-// Fresh cache schema 2 stores canonical timestamps at insertion. This hook remains
-// in startup initialization so schema creation has one stable call site.
+// metadataRevisionTx returns the vault's cache revision, or 0 when none has
+// been recorded yet.
 func metadataRevisionTx(tx *sql.Tx, repositoryID string) (int64, error) {
 	repositoryDatabaseID, err := metadataRepositoryDatabaseID(tx, repositoryID)
 	if err != nil {
@@ -935,12 +935,27 @@ func metadataSnapshotRoots(snapshot models.Snapshot) []models.SnapshotSourceRoot
 	return []models.SnapshotSourceRoot{{Path: snapshot.Source, User: snapshot.NativeSourceUser, Host: snapshot.NativeSourceHost}}
 }
 
+// normalizedMetadataSnapshotRoots returns a snapshot's exact native roots and,
+// index for index, the grouping root each one is cached under
+// (metadata_cache_snapshot_roots.normalized_root, joined to
+// metadata_cache_files.root). It is the only place grouping roots are derived:
+// header upsert, the header root-equality check, the entry-set scope, and
+// entry ingestion all call it, so the four can never disagree about where a
+// snapshot's files live.
+//
+// The grouping root equals the native root except for a single-root snapshot
+// that carries MetadataGroupingRoot (a Restic snapshot of a job known on this
+// computer; see MetadataGroupingRoot for why). The native root is still
+// returned untouched and stays the only restore/browse address.
 func normalizedMetadataSnapshotRoots(snapshot models.Snapshot) ([]models.SnapshotSourceRoot, []string, error) {
 	roots := metadataSnapshotRoots(snapshot)
 	normalized := make([]string, len(roots))
 	seen := make(map[string]struct{}, len(roots))
 	for index, root := range roots {
 		normalized[index] = normalizeMetadataRoot(root.Path)
+		if len(roots) == 1 && snapshot.MetadataGroupingRoot != "" {
+			normalized[index] = normalizeMetadataRoot(snapshot.MetadataGroupingRoot)
+		}
 		if normalized[index] == "" {
 			return nil, nil, fmt.Errorf("snapshot %q has an empty native source root", snapshot.ID)
 		}
@@ -1077,24 +1092,42 @@ func loadMetadataSnapshotRootsContext(ctx context.Context, reader metadataSnapsh
 	for index := range snapshots {
 		byID[snapshots[index].ID] = &snapshots[index]
 	}
-	rows, err := reader.QueryContext(ctx, `SELECT roots.snapshot_id,roots.path,roots.native_user,roots.native_host
+	rows, err := reader.QueryContext(ctx, `SELECT roots.snapshot_id,roots.path,roots.normalized_root,roots.native_user,roots.native_host
 		FROM metadata_cache_snapshot_roots roots
 		WHERE roots.repository_database_id=? ORDER BY roots.snapshot_id,roots.root_ordinal`, repositoryDatabaseID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
+	grouping := make(map[string]string, len(snapshots))
 	for rows.Next() {
-		var id string
+		var id, groupingRoot string
 		var root models.SnapshotSourceRoot
-		if err := rows.Scan(&id, &root.Path, &root.User, &root.Host); err != nil {
+		if err := rows.Scan(&id, &root.Path, &groupingRoot, &root.User, &root.Host); err != nil {
 			return err
 		}
 		if snapshot := byID[id]; snapshot != nil {
 			snapshot.SourceRoots = append(snapshot.SourceRoots, models.WithSnapshotNativeRootIdentity(root))
+			if groupingRoot != normalizeMetadataRoot(root.Path) {
+				grouping[id] = groupingRoot
+			}
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// Snapshots rebuilt from the cache (entry-only retries, restore visibility)
+	// carry no native tags, so the grouping decision cannot be made again here.
+	// Reload the stored grouping root instead: an entry retry must ingest under
+	// exactly the root its header was published with, or its files would be
+	// cataloged under a root no header joins to and silently vanish from File
+	// History. SourceRoots above stay the native paths used for restore.
+	for id, groupingRoot := range grouping {
+		if snapshot := byID[id]; snapshot != nil && len(snapshot.SourceRoots) == 1 {
+			snapshot.MetadataGroupingRoot = groupingRoot
+		}
+	}
+	return nil
 }
 
 func MetadataSnapshotReady(db *sql.DB, repositoryID, snapshotID string) (bool, error) {
@@ -1483,9 +1516,18 @@ func insertMetadataEntriesBatchedTxContext(ctx context.Context, tx *sql.Tx, repo
 	if err != nil {
 		return err
 	}
-	_, normalizedRoots, err := normalizedMetadataSnapshotRoots(snapshot)
+	nativeRoots, normalizedRoots, err := normalizedMetadataSnapshotRoots(snapshot)
 	if err != nil {
 		return err
+	}
+	// Engine listings label entries with their native root, while entries
+	// regrouped from an existing cached set (bucket rebuild) already carry the
+	// grouping root. Both name the same root of this snapshot, so either is
+	// mapped to the grouping root the header was published with.
+	groupingRootForEntry := make(map[string]string, 2*len(normalizedRoots))
+	for index, root := range normalizedRoots {
+		groupingRootForEntry[root] = root
+		groupingRootForEntry[normalizeMetadataRoot(nativeRoots[index].Path)] = root
 	}
 	memberships := map[string]stagedMetadataMembership{}
 	// Explicit paths already live in memberships with their version facts. Keep
@@ -1498,13 +1540,8 @@ func insertMetadataEntriesBatchedTxContext(ctx context.Context, tx *sql.Tx, repo
 		entryRoot := normalizeMetadataRoot(entry.SourceRoot)
 		if entryRoot == "" && len(normalizedRoots) == 1 {
 			foundRoot, entryRoot = true, normalizedRoots[0]
-		} else {
-			for _, root := range normalizedRoots {
-				if root == entryRoot {
-					foundRoot = true
-					break
-				}
-			}
+		} else if groupingRoot, ok := groupingRootForEntry[entryRoot]; ok {
+			foundRoot, entryRoot = true, groupingRoot
 		}
 		if !foundRoot {
 			return fmt.Errorf("metadata entry root does not belong to snapshot")

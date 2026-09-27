@@ -52,12 +52,12 @@ func initializeProcessTreePlatform(tree *processTree) {
 // belongs to this invocation's exact Darwin session. The intentionally
 // unreaped session leader anchors the session ID until cleanup is complete.
 //
-// Accepted limitation: XNU identifies secondary process groups numerically, so
+// Accepted limitation: XNU identifies secondary process groups only by number, so
 // a deliberate same-user process can race reuse of a secondary PGID between
-// session enumeration and killpg. Replicaro narrows that interval by rescanning
-// and requiring continuous session quiescence, but does not claim protection
-// from a local same-user adversary. The leader/top-level PGID remains anchored
-// and is not subject to this accepted limitation.
+// session enumeration and killpg. Rescanning and requiring the session to stay
+// quiescent narrows that window, but this does not protect against a malicious
+// local process running as the same user. The leader/top-level PGID stays
+// anchored and is not affected.
 func (tree *processTree) terminatePlatform(process *exec.Cmd) (bool, error) {
 	if tree.sid <= 1 || process.Process == nil || process.Process.Pid != tree.sid {
 		return true, fmt.Errorf("invalid engine process session")

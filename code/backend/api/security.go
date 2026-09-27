@@ -26,7 +26,14 @@ const (
 )
 
 type requestSecurity struct {
-	endpoint   runtimeendpoint.Endpoint
+	endpoint runtimeendpoint.Endpoint
+	// lanOrigins are the HTTPS origins from --lan-origin, served by the user's
+	// own reverse proxy. Nil (no flag) keeps the checks loopback-only. Two
+	// constructors build a requestSecurity (the web UI handler and the API
+	// handler, which re-wraps every /api/ request with its own copy), and both
+	// must carry this list: with it on only one side the page loads but every
+	// API call is rejected, or the other way round.
+	lanOrigins runtimeendpoint.LANOrigins
 	mode       SecurityMode
 	clientUUID string
 }
@@ -70,7 +77,7 @@ var endpointMethods = map[string][]string{
 	"/api/rclone/auth/start": {http.MethodPost}, "/api/rclone/auth/continue": {http.MethodPost},
 	"/api/rclone/auth/status":  {http.MethodPost},
 	"/api/rclone/auth/session": {http.MethodDelete}, "/api/rclone/auth/apply": {http.MethodPost},
-	"/api/jobs/run": {http.MethodPost}, "/api/jobs/status": {http.MethodGet},
+	"/api/jobs/run": {http.MethodPost}, "/api/jobs/status": {http.MethodGet}, "/api/jobs/source": {http.MethodPost},
 	"/api/jobs/enabled": {http.MethodPut}, "/api/engines": {http.MethodGet},
 	"/api/vault-profile-sync": {http.MethodGet, http.MethodPost},
 	"/api/engine":             {http.MethodGet}, "/api/logs": {http.MethodGet, http.MethodDelete},
@@ -181,12 +188,28 @@ func contentSecurityPolicy(security requestSecurity) string {
 	return "default-src 'self'; base-uri 'none'; frame-ancestors 'none'; object-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src " + strings.Join(connectSources, " ")
 }
 
+// approvedHost accepts the exact loopback forms, or a Host naming one of the
+// configured LAN hostnames with any port. The Host is taken as received from
+// the reverse proxy; X-Forwarded-Host and Forwarded are deliberately ignored,
+// since any client can set them and trusting them would let a request name a
+// Host the proxy never saw. The proxy must pass the browser's Host through.
 func approvedHost(host string, security requestSecurity) bool {
 	host = strings.TrimSpace(host)
-	return host != "" && security.endpoint.HostAllowed(host)
+	return host != "" && (security.endpoint.HostAllowed(host) || security.lanOrigins.HostAllowed(host))
 }
 
+// approvedOrigin accepts the loopback (and explicit development) origins, or
+// exactly one of the configured LAN origins. Fetch Metadata's cross-site write
+// fallback and the Access-Control-Allow-Origin echo both go through here, so
+// with two LAN origins configured a page on one may write through the other
+// (for example an IP-address origin and a hostname origin for the same
+// machine). That widening is intended: every configured origin is the user's
+// own proxy in front of this same Replicaro. Unconfigured origins are still
+// rejected.
 func approvedOrigin(origin string, security requestSecurity) bool {
+	if security.lanOrigins.OriginAllowed(origin) {
+		return true
+	}
 	parsed, err := url.Parse(origin)
 	if err != nil || parsed.Scheme != "http" || parsed.User != nil || parsed.Path != "" || parsed.RawQuery != "" || parsed.Fragment != "" || parsed.Hostname() == "" {
 		return false

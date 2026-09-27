@@ -16,8 +16,8 @@ import (
 	"github.com/local/replicaro/appdata"
 )
 
-// Cache formats are admitted exactly. This fresh format stores shared blocks
-// and ordered block lists; no old-format migration or fallback is performed.
+// Only this cache schema version is accepted. It stores shared blocks and
+// ordered block lists; older formats are not migrated or read as a fallback.
 const CurrentMetadataCacheSchemaVersion = 4
 
 var (

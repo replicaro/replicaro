@@ -41,8 +41,8 @@ func storageBindingError(err error, subject, ability, fallback string) error {
 
 func storageBindingErrorForPlatform(platform string, err error, subject, ability, fallback string) error {
 	if platform != "darwin" || !storageavailability.IsPermissionDenied(err) {
-		// The public message stays stable. The typed cause carries only local
-		// observation classification to the narrow support recorder.
+		// The public message stays fixed. The wrapped cause only lets the support
+		// recorder classify the local storage failure.
 		return &storageBindingFailure{message: fallback, cause: err}
 	}
 	return &macOSAccessError{
@@ -75,7 +75,11 @@ func bindExistingRepositoryStorage(ctx context.Context, repo models.Repository) 
 }
 
 func bindJobSourceStorage(ctx context.Context, job models.BackupJob) (models.BackupJob, error) {
-	bound, err := storageavailability.BindJobSource(ctx, job)
+	return bindJobSourceStorageAt(ctx, job, storageavailability.StageJobCreateSource)
+}
+
+func bindJobSourceStorageAt(ctx context.Context, job models.BackupJob, stage string) (models.BackupJob, error) {
+	bound, err := storageavailability.BindJobSource(ctx, job, stage)
 	if err != nil {
 		return models.BackupJob{}, storageBindingError(err, "source", "read it", "source path could not be observed")
 	}
@@ -84,7 +88,7 @@ func bindJobSourceStorage(ctx context.Context, job models.BackupJob) (models.Bac
 }
 
 func bindImportedJobSourceStorage(ctx context.Context, job models.BackupJob) (models.BackupJob, error) {
-	bound, err := bindJobSourceStorage(ctx, job)
+	bound, err := bindJobSourceStorageAt(ctx, job, storageavailability.StageJobBindSource)
 	if err != nil {
 		var access *macOSAccessError
 		if errors.As(err, &access) {
@@ -93,6 +97,27 @@ func bindImportedJobSourceStorage(ctx context.Context, job models.BackupJob) (mo
 		return models.BackupJob{}, &storageBindingFailure{message: importedSourceMissingMessage, cause: err}
 	}
 	return bound, nil
+}
+
+// firstBindRestoredSource handles a dormant recovery definition restored as a
+// new job whose binding records no facts (typically written while the job had
+// an "Update job source" alias; see database.aliasFreeSourceBinding). Stored
+// as it is, the job would be bound with nothing to check before a run, and
+// nothing would ever probe its source again. So it is restored the way an
+// imported job is, unbound with no binding, and first binding runs now: the
+// same probe, stage, and never-refuse-for-a-missing-fact rule as enabling or
+// running an imported job. If that probe fails the job stays unbound and the
+// restore still succeeds; first binding then runs again when the job is
+// enabled or run, exactly as it does for any imported job, and reports the
+// failure there.
+func firstBindRestoredSource(ctx context.Context, job models.BackupJob) models.BackupJob {
+	job.SourceBindingState = "unbound_imported"
+	job.SourceStorageVersion, job.SourceStorageKey, job.SourceStorageDescriptorJSON = "", "", ""
+	bound, err := bindImportedJobSourceStorage(ctx, job)
+	if err != nil {
+		return job
+	}
+	return bound
 }
 
 func requireRepositoryStorageAvailable(ctx context.Context, repo models.Repository) error {
@@ -130,11 +155,12 @@ func applyIntentStorage(repo models.Repository, intent database.RepositoryCreati
 
 // Before a protected root exists, an in-flight creation still owns its exact
 // configured destination. This lookup is only creation-lifecycle routing; it
-// is not a managed-vault identity or import-duplicate rule.
+// is not a managed-vault identity or import-duplicate rule. Filesystem
+// creations are found by exact normalized location, never by recorded facts:
+// facts can legitimately change between a reservation and its retry.
 func findCreationIntentForBoundRepository(db *sql.DB, repo models.Repository) (database.RepositoryCreationIntent, error) {
 	if repo.Connector == "fs" {
-		return database.FindRepositoryCreationIntentByStorage(db,
-			repo.StorageIdentityVersion, repo.StorageIdentityKey, repo.StorageIdentityJSON)
+		return database.FindRepositoryCreationIntentByLocation(db, repo.Location)
 	}
 	return database.FindRepositoryCreationIntentWithOptions(db,
 		repo.Engine, repo.Connector, repo.Location, repo.ConnectorOptions)

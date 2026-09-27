@@ -414,9 +414,9 @@ func RetryKopiaPolicyForTarget(db *sql.DB, jobID, repositoryID string) error {
 	return tx.Commit()
 }
 
-// RetryKopiaPolicyForRepository reopens only the exact current terminal state.
-// Vault-care resubmission uses this for empty enrolled vaults that have no job
-// target through which the older retry endpoint could be reached.
+// RetryKopiaPolicyForRepository reopens the vault's policy only from its current
+// error state. Vault-care resubmission uses this for empty enrolled vaults, which
+// have no job target through which the per-target retry endpoint could be reached.
 func RetryKopiaPolicyForRepository(db *sql.DB, repositoryID string) error {
 	tx, err := db.Begin()
 	if err != nil {
@@ -442,9 +442,9 @@ func retryKopiaPolicyForRepositoryTx(tx *sql.Tx, repositoryID string) error {
 	if state != "error" {
 		return fmt.Errorf("%w: current state is %s", ErrKopiaPolicyRetryUnavailable, state)
 	}
-	// A fence-cleanup error deliberately retains its durable proof. Reopen that
-	// exact error as applying, not ordinary dirty work, so the manager keeps it
-	// on the interrupted-process recovery path until inactivity is proven.
+	// A fence-cleanup error deliberately keeps its active_fence_path. Reopen it as
+	// applying, not dirty, so the manager keeps it on the interrupted-process
+	// recovery path until the fence is confirmed inactive.
 	result, err := tx.Exec(`UPDATE kopia_policy_state
 		SET state=CASE WHEN active_fence_path<>'' THEN 'applying' ELSE 'dirty' END,
 			last_error=''

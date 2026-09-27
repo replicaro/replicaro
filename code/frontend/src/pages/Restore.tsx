@@ -3,6 +3,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { resticArchiveDisplayPath, resticNativeAddress } from "../nativePathDisplay";
+import { jobSourceTooltip, managedSnapshotJob, pathWithinJob } from "../jobSourceDisplay";
+import { JobSourceLabel } from "../components/JobSourceLabel";
 import { DirectoryField } from "../components/DirectoryPicker";
 import { PaginationControls } from "../components/ListControls";
 import { MetadataIndexNotice } from "../components/MetadataIndexNotice";
@@ -10,6 +12,7 @@ import { EmptyState, Icon, Loading, Modal, parseTime, Tooltip, useToast } from "
 import {
 	APIError,
 	getEngines,
+	getJobs,
 	getMetadataStatus,
 	getOperation,
 	getRepositories,
@@ -25,7 +28,7 @@ import {
 } from "../services/api";
 import type { MetadataPreparationStatus } from "../services/api";
 import { defaultConflictMode, restoreCapability, restoreConflictModeLabel } from "../restoreCapabilities";
-import type { EngineDescriptor, Repository, Snapshot, SnapshotEntry } from "../types";
+import type { BackupJob, EngineDescriptor, Repository, Snapshot, SnapshotEntry } from "../types";
 import type { MetadataIndexState } from "../types";
 
 const PAGE_SIZE = 6;
@@ -80,8 +83,10 @@ function snapshotTime(value: string) {
     return date?.toLocaleTimeString(getEffectiveLocale(), { hour: "2-digit", minute: "2-digit", hour12: false }) ?? "—";
 }
 
-function snapshotMeta(snapshot: Snapshot) {
-	const sources = snapshotSourceLabel(snapshot);
+// A managed snapshot's source is shown as its job's name (see
+// jobSourceDisplay.ts); unmanaged snapshots keep their recorded paths.
+function snapshotMeta(snapshot: Snapshot, job?: BackupJob) {
+	const sources = job ? job.name : snapshotSourceLabel(snapshot);
     return t("ui.restore.snapshotMeta", { date: fullDate(snapshot.timestamp), time: snapshotTime(snapshot.timestamp), size: snapshot.size || t("ui.restore.sizeUnknown"), sources });
 }
 
@@ -109,6 +114,9 @@ function RestoreRoute() {
     const toast = useToast();
     const [repos, setRepos] = useState<Repository[] | null>(null);
     const [engines, setEngines] = useState<EngineDescriptor[]>([]);
+	// Jobs only supply names and current sources for managed-snapshot labels.
+	// A failed load falls back to recorded paths; it never blocks Restore.
+	const [jobs, setJobs] = useState<BackupJob[] | null>(null);
     const [selected, setSelected] = useState(repoId);
     const selectedRef = useRef(repoId);
     const [snapshots, setSnapshots] = useState<Snapshot[] | null>(null);
@@ -185,6 +193,11 @@ function RestoreRoute() {
     useEffect(() => {
 		const controller = new AbortController();
 		const generation = ++repositoryGenerationRef.current;
+		getJobs()
+			.then((nextJobs) => {
+				if (!controller.signal.aborted && repositoryGenerationRef.current === generation) setJobs(nextJobs);
+			})
+			.catch(() => undefined);
 		Promise.all([getRepositories(controller.signal), getEngines()])
             .then(([nextRepos, engineResponse]) => {
 				if (controller.signal.aborted || repositoryGenerationRef.current !== generation) return;
@@ -569,8 +582,8 @@ function RestoreRoute() {
 			let operationAbsent = false;
 			const existing = await getOperation(payload.operationId, owner.observationController.signal)
 				.catch((reason) => {
-					// Exact lookup reports ordinary absence as HTTP 404. Only that
-					// response proves this freshly generated identity is available.
+					// The lookup reports a missing operation as HTTP 404. Only that
+					// response shows this freshly generated ID is not already in use.
 					if (isOperationNotFound(reason)) {
 						operationAbsent = true;
 						return [];
@@ -605,12 +618,12 @@ function RestoreRoute() {
 			} catch (reason) {
 				requestError = reason;
 			}
-			// Native execution can finish and make the durable row terminal before
-			// the POST reports its HTTP error. Keep exact handoff ownership until the
-			// separately bounded observer settles so that result truth is not lost.
+			// Native execution can finish and mark the durable row terminal before
+			// the POST reports its HTTP error. Keep ownership of the handoff until the
+			// separately bounded observer settles so the result is not lost.
 			// An HTTP error means the backend handler has returned: a durable row
-			// either already exists or this was a pre-row rejection. AbortError and
-			// transport failures are different because server work may still continue.
+			// either already exists or the request was rejected before creating one.
+			// AbortError and transport failures differ because server work may continue.
 			if (!requestError || requestError instanceof APIError) owner.observationController.abort();
 			const handedOff = await handoff;
 			owner.observationController.abort();
@@ -713,6 +726,10 @@ function RestoreRoute() {
 	const associatedWindowsBreadcrumb = breadcrumbDisplayPath !== breadcrumbNativePath;
 	const browseSeparator = associatedWindowsBreadcrumb || browsing && isWindowsPath(browsing.root.path) ? "\\" : "/";
     const selectedDate = dateFilter ? new Date(`${dateFilter}T12:00:00`) : null;
+	// Presentation only: breadcrumbs, navigation, and restore requests below
+	// keep the native root and paths.
+	const browsingJob = browsing ? managedSnapshotJob(browsing.snapshot, jobs) : undefined;
+	const restoringJob = restoring ? managedSnapshotJob(restoring.snapshot, jobs) : undefined;
 
     return (
         <div className="page restore-page">
@@ -811,7 +828,10 @@ function RestoreRoute() {
 											<article key={snapshot.id} className="snapshot-row" data-snapshot-id={snapshot.id}>
 												<span className="snapshot-machine" title={snapshot.machineLabel || undefined}>{snapshot.machineLabel || t("ui.restore.unknownComputer")}</span>
                                                 <time>{snapshotTime(snapshot.timestamp)}</time>
-												<span className="snapshot-source">{snapshotSourceLabel(snapshot)}</span>
+												{(() => {
+													const job = managedSnapshotJob(snapshot, jobs);
+													return job ? <JobSourceLabel job={job} className="snapshot-source" /> : <span className="snapshot-source">{snapshotSourceLabel(snapshot)}</span>;
+												})()}
                                                 <span className="snapshot-size">{snapshot.size || "—"}</span>
 											<span className="snapshot-actions">{snapshotRoots(snapshot).map((root) => snapshot.nativeRootType === "f"
                                                         ? <Tooltip key={root.nativeRootId} content={t("ui.pages.restore.this.snapshot.does.not.support.browse.it.only.supports.restore")}><button className="btn sm snapshot-browse-unavailable" aria-label={t("ui.pages.restore.browse")} aria-disabled="true">{t("ui.pages.restore.browse")}</button></Tooltip>
@@ -864,10 +884,14 @@ function RestoreRoute() {
 
             {browsing && (
                 <Modal title={t("ui.pages.restore.snapshot")} wide onClose={closeBrowse}>
-					<div className="snapshot-modal-meta mono">{snapshotMeta(browsing.snapshot)} · {browsing.snapshot.id.slice(0, 12)}</div>
+					{browsingJob
+						? <Tooltip content={jobSourceTooltip(browsingJob)}><div className="snapshot-modal-meta mono" aria-label={snapshotMeta(browsing.snapshot, browsingJob)}>{snapshotMeta(browsing.snapshot, browsingJob)} · {browsing.snapshot.id.slice(0, 12)}</div></Tooltip>
+						: <div className="snapshot-modal-meta mono">{snapshotMeta(browsing.snapshot)} · {browsing.snapshot.id.slice(0, 12)}</div>}
                     <div className="browse-crumbs">
-						<button onClick={() => openBrowse(browsing.snapshot, browsing.root, "")}>{displayPath(browsing.root.path) || "/"}</button>
-						{crumbs.map((crumb, index) => <span key={`${crumb}-${index}`}>{associatedWindowsBreadcrumb && index === 0 ? "" : browseSeparator}<button onClick={() => openBrowse(browsing.snapshot, browsing.root, crumbs.slice(0, index + 1).join("/"))}>{associatedWindowsBreadcrumb && index === 0 ? `${crumb}:` : crumb}</button></span>)}
+						{browsingJob
+							? <Tooltip content={jobSourceTooltip(browsingJob)}><button aria-label={browsingJob.name} onClick={() => openBrowse(browsing.snapshot, browsing.root, "")}><span className="job-source-name">{browsingJob.name}</span></button></Tooltip>
+							: <button onClick={() => openBrowse(browsing.snapshot, browsing.root, "")}>{displayPath(browsing.root.path) || "/"}</button>}
+						{crumbs.map((crumb, index) => <span key={`${crumb}-${index}`}>{associatedWindowsBreadcrumb && index === 0 && !browsingJob ? "" : browseSeparator}<button onClick={() => openBrowse(browsing.snapshot, browsing.root, crumbs.slice(0, index + 1).join("/"))}>{associatedWindowsBreadcrumb && index === 0 && !browsingJob ? `${crumb}:` : crumb}</button></span>)}
                     </div>
                     <div className="file-list">
 						{browsePath && <button className="file-up" onClick={() => openBrowse(browsing.snapshot, browsing.root, crumbs.slice(0, -1).join("/"))}><Icon name="arrowUp" size={16} /><span>{t("ui.pages.restore.up.one.directory")}</span></button>}
@@ -880,7 +904,7 @@ function RestoreRoute() {
 								? resticArchiveDisplayPath(nativePath, browsing.snapshot.source) : nativePath;
 							const displayName = displayNative !== nativePath && !childPath.includes("/") ? displayNative : entry.name;
                             return (
-                                <div key={childPath} title={`${displayNative}\nNative source: ${browsing.root.path}\nNative path: ${nativePath}`} className={`file-row ${entry.isDir ? "folder" : "file"}`}>
+                                <div key={childPath} title={browsingJob ? pathWithinJob(childPath, browsing.root.path) : `${displayNative}\nNative source: ${browsing.root.path}\nNative path: ${nativePath}`} className={`file-row ${entry.isDir ? "folder" : "file"}`}>
                                     <Icon name={entry.isDir ? "folder" : "file"} size={15} />
 								{entry.isDir ? <button onClick={() => openBrowse(browsing.snapshot, browsing.root, childPath)}>{displayName}</button> : <span>{displayName}</span>}
 								{!entry.isDir && <span>{entry.size}</span>}
@@ -899,7 +923,9 @@ function RestoreRoute() {
             {restoring && (
                 <Modal title={t("ui.pages.restore.restore.snapshot")} onClose={dismissRestore}>
 					<fieldset className="modal-workflow-fields" disabled={restoreBusy}>
-                    <><div className="snapshot-modal-id">{restoring.snapshot.id.slice(0, 12)}</div><div className="snapshot-modal-meta mono">{snapshotMeta(restoring.snapshot)}</div></>
+                    <><div className="snapshot-modal-id">{restoring.snapshot.id.slice(0, 12)}</div>{restoringJob
+						? <Tooltip content={jobSourceTooltip(restoringJob)}><div className="snapshot-modal-meta mono" aria-label={snapshotMeta(restoring.snapshot, restoringJob)}>{snapshotMeta(restoring.snapshot, restoringJob)}</div></Tooltip>
+						: <div className="snapshot-modal-meta mono">{snapshotMeta(restoring.snapshot)}</div>}</>
                     <div className="modal-section-label">{t("ui.pages.restore.restore.to")}</div>
 					<label className="field">
 						<span>{restoringFileRoot ? t("ui.pages.restore.destination.file") : t("ui.pages.restore.destination.folder")}</span>

@@ -80,6 +80,10 @@ type startupOptions struct {
 	loopbackPort            *int
 	containerPublishedPort  *int
 	rcloneAuthNoOpenBrowser bool
+	// lanOrigins lives only in process memory. It is not persisted, has no
+	// environment-variable or settings alias, and is never handed to desktop,
+	// notification, rendezvous, or rclone code, which all stay on loopback.
+	lanOrigins runtimeendpoint.LANOrigins
 }
 
 func parseStartupOptions(arguments []string) (startupOptions, error) {
@@ -120,8 +124,20 @@ func parseStartupOptions(arguments []string) (startupOptions, error) {
 			options.rcloneAuthNoOpenBrowser = true
 		case strings.HasPrefix(argument, "--rclone-auth-no-open-browser="):
 			return startupOptions{}, fmt.Errorf("--rclone-auth-no-open-browser does not accept a value")
+		case strings.HasPrefix(argument, "--lan-origin="):
+			// Unlike the other options this one repeats, so one install can be
+			// reached by, say, a LAN hostname and a VPN hostname. There are no
+			// numbered or comma-separated forms: unknown arguments are ignored
+			// below, so a "--lan-origin2" would silently do nothing.
+			origin, err := runtimeendpoint.ParseLANOrigin(strings.TrimPrefix(argument, "--lan-origin="))
+			if err != nil {
+				return startupOptions{}, fmt.Errorf("--lan-origin: %w", err)
+			}
+			options.lanOrigins = append(options.lanOrigins, origin)
+		case argument == "--lan-origin":
+			return startupOptions{}, fmt.Errorf("--lan-origin must use exactly --lan-origin=<origin>")
 		default:
-			// Preserve the baseline CLI behavior: arguments outside the three
+			// Preserve the baseline CLI behavior: arguments outside the four
 			// Replicaro-owned namespaces are ignored.
 			continue
 		}
@@ -129,7 +145,43 @@ func parseStartupOptions(arguments []string) (startupOptions, error) {
 	if options.loopbackPort != nil && options.containerPublishedPort != nil {
 		return startupOptions{}, fmt.Errorf("--loopback-port and --container-published-port are mutually exclusive")
 	}
+	// The reverse proxy is configured with a fixed upstream port. Without an
+	// explicit port a host install falls back to a random loopback port when
+	// 9460 is busy, and the proxy would quietly point at nothing (or at
+	// something else), so require the port to be pinned.
+	if len(options.lanOrigins) > 0 && options.loopbackPort == nil && options.containerPublishedPort == nil {
+		return startupOptions{}, fmt.Errorf("--lan-origin requires --loopback-port=<port> or --container-published-port=<port>")
+	}
 	return options, nil
+}
+
+// headlessLANMode is Linux with at least one --lan-origin, outside the
+// container package. Replicaro has no other reliable signal that it runs as a
+// headless user service, and in that layout Start at login is what keeps
+// replicaro.service enabled (see keepStartAtLoginOn). The container package is
+// excluded because it never manages a login service. On other platforms Start
+// at login is a normal desktop preference with no headless service behind
+// it, and --lan-origin doesn't change how it works.
+func headlessLANMode(goos string, options startupOptions) bool {
+	return goos == "linux" && len(options.lanOrigins) > 0 && options.containerPublishedPort == nil
+}
+
+// keepStartAtLoginOn saves Start at login as on when it is off, before the
+// desktop settings are applied. On Linux, applying Start at login off runs
+// `systemctl --user disable replicaro.service` on every start, which would
+// leave a headless install unable to come back after a reboot. The settings API
+// enforces the same rule for later saves. Removing --lan-origin leaves the
+// setting on, and the user can then turn it off as usual.
+//
+// This runs before HTTP is published and before any background worker starts,
+// so nothing else can be writing settings at the same time.
+func keepStartAtLoginOn(db *sql.DB, settings *models.Settings) error {
+	if settings.StartAtLogin || settings.StartWithWindows {
+		return nil
+	}
+	settings.StartAtLogin = true
+	settings.StartWithWindows = true
+	return database.SaveSettings(db, *settings)
 }
 
 func requireContainerRuntime() error {
@@ -398,8 +450,9 @@ func prepareStartupResticRecovery(parent context.Context, db *sql.DB) (*startupR
 		}
 	}
 	for _, repo := range repositories {
-		// No producer has started yet. Unexpected contention is a startup error,
-		// not another unbounded pre-publication wait or a new lock/fence registry.
+		// No producer has started yet, so contention here is unexpected: fail
+		// startup instead of waiting with no bound before publication. Don't add
+		// a separate lock/fence registry to work around it.
 		unlock, acquired, lockErr := vaultlock.YieldLowPriorityAndTryExclusiveContext(ctx, repo.ID)
 		if lockErr != nil || !acquired {
 			cancel()
@@ -668,6 +721,9 @@ func run() (result error) {
 		_ = db.Close()
 		return err
 	}
+	// Storage support diagnostics (fixed step labels and OS codes only) go to
+	// the support-only activity level so they appear in support exports.
+	storageavailability.ConfigureSupportLog(func(message string) { _ = database.LogSupport(db, message) })
 	if err := database.EnsureLanguageSetting(db); err != nil {
 		_ = db.Close()
 		return fmt.Errorf("initialize language setting: %w", err)
@@ -700,6 +756,12 @@ func run() (result error) {
 	if err != nil {
 		_ = db.Close()
 		return err
+	}
+	if headlessLANMode(runtime.GOOS, options) {
+		if err := keepStartAtLoginOn(db, &settings); err != nil {
+			_ = db.Close()
+			return fmt.Errorf("keep Start at login on for headless LAN mode: %w", err)
+		}
 	}
 	if err := desktop.ApplySettings(db); err != nil {
 		log.Printf("desktop settings: %v", err)
@@ -744,13 +806,13 @@ func run() (result error) {
 	var closeRcloneAuth func() error
 	if options.containerPublishedPort != nil {
 		server, closeRcloneAuth = api.NewContainerServerAtWithReaderAndRuntime(
-			db, readDB, endpoint, record, desktop.RestoreWindow,
+			db, readDB, endpoint, options.lanOrigins, record, desktop.RestoreWindow,
 			containerRcloneAuthRelayPort, operationRuntime, updater,
 		)
 	} else {
 		server, closeRcloneAuth = api.NewServerAtWithReaderAndRuntime(
-			db, readDB, endpoint, record, desktop.RestoreWindow,
-			options.rcloneAuthNoOpenBrowser, operationRuntime, updater,
+			db, readDB, endpoint, options.lanOrigins, record, desktop.RestoreWindow,
+			options.rcloneAuthNoOpenBrowser, headlessLANMode(runtime.GOOS, options), operationRuntime, updater,
 		)
 	}
 	defer func() {

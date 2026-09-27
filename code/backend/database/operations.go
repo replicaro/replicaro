@@ -44,10 +44,9 @@ func StartOperation(
 	return StartOperationWithID(db, kind, title, jobID, repositoryID, nil, startedAt)
 }
 
-// StartOperationWithID lets a restore submission carry one exact UI-selected
-// identity into durable state. The canonical UUID v4 check prevents alternate
-// spellings from weakening exact operation lookup, while the database primary
-// key remains the final collision boundary.
+// StartOperationWithID lets a restore submission store the operation ID the UI
+// chose. Requiring a canonical UUID v4 keeps alternate spellings of an ID from
+// breaking exact lookup, and the primary key still rejects collisions.
 func StartOperationWithID(
 	db *sql.DB,
 	kind, title, jobID, repositoryID string,
@@ -297,9 +296,8 @@ func validateBackupTrigger(tx *sql.Tx, requests []BackupOperationRequest, queued
 		return err
 	}
 	if current.Name != expected.Name || current.Source != expected.Source || current.Schedule != expected.Schedule ||
-		current.SourceStorageVersion != expected.SourceStorageVersion ||
-		current.SourceStorageKey != expected.SourceStorageKey ||
-		current.SourceStorageDescriptorJSON != expected.SourceStorageDescriptorJSON ||
+		!equivalentSourceBinding(current.SourceStorageVersion, current.SourceStorageKey, current.SourceStorageDescriptorJSON,
+			expected.SourceStorageVersion, expected.SourceStorageKey, expected.SourceStorageDescriptorJSON) ||
 		current.Enabled != expected.Enabled || current.NextRun != expected.NextRun || current.LastRun != expected.LastRun ||
 		!models.RetentionPolicyEqual(current, expected) || current.Excludes != expected.Excludes || current.Tag != expected.Tag ||
 		!reflect.DeepEqual(current.EngineSettings, expected.EngineSettings) ||
@@ -370,10 +368,11 @@ func ActivateBackupOperation(db *sql.DB, operationID, jobID, repositoryID string
 	if count, _ := targetResult.RowsAffected(); count != 1 {
 		return sql.ErrNoRows
 	}
-	// Process activation is not requested-backup start. Keep the scheduled
-	// occurrence restorable through lock-level admission and supporting native
-	// commands; the runner resolves it only after a conclusive pre-native
-	// availability result or the requested backup boundary has been reached.
+	// Starting the operation is not the same as starting the requested backup. Keep
+	// the scheduled occurrence restorable through the checks under the vault lock
+	// and any supporting native commands; the runner resolves it only once storage
+	// is confirmed unavailable before the native backup, or the requested backup
+	// has been reached.
 	return tx.Commit()
 }
 

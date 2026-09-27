@@ -13,9 +13,9 @@ import (
 	"github.com/local/replicaro/command"
 )
 
-// ValidatePath admits only an exact absolute existing regular file. On POSIX
-// the stored path itself must be executable so the kernel and shebang retain
-// their native semantics.
+// ValidatePath accepts only an absolute path, with no surrounding whitespace,
+// to an existing regular file. On POSIX the stored path itself must be
+// executable so the kernel runs it directly, shebang included.
 func ValidatePath(path string) error {
 	if path == "" {
 		return nil

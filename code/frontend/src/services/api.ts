@@ -1,6 +1,7 @@
 import type {
     ActivityEntry,
     BackupJob,
+    JobSourceUpdateResult,
     DashboardStats,
     DashboardIssues,
     EngineInfo,
@@ -546,8 +547,11 @@ export const browseDirectories = (path = "", signal?: AbortSignal) =>
         { signal }
     );
 
-export const deleteRepository = (id: string, discardRecoveryProfile = false) =>
-	post<ProfileMutationResult | undefined>(`/api/repositories?id=${encodeURIComponent(id)}${discardRecoveryProfile ? "&discardRecoveryProfile=true" : ""}`, undefined, "DELETE");
+// awaitProfileUpdate asks the backend to wait (bounded) for this vault's
+// pending recovery-profile update and then retry the removal once. Send it
+// only after a "vault_profile_update_pending" answer.
+export const deleteRepository = (id: string, discardRecoveryProfile = false, awaitProfileUpdate = false) =>
+	post<ProfileMutationResult | undefined>(`/api/repositories?id=${encodeURIComponent(id)}${discardRecoveryProfile ? "&discardRecoveryProfile=true" : ""}${awaitProfileUpdate ? "&awaitProfileUpdate=true" : ""}`, undefined, "DELETE");
 
 export const getRepositoryInfo = (id: string, snapshotId = "") =>
     request<{ output: string }>(
@@ -835,6 +839,13 @@ export const runJob = (id: string, repositoryId?: string) =>
 export const setJobEnabled = (id: string, enabled: boolean) =>
 	post<JobEnabledResult>(`/api/jobs/enabled?id=${encodeURIComponent(id)}`, { enabled }, "PUT");
 
+// "Update job source": the chosen folder becomes the job's alias. The backend
+// never replaces the immutable source. Without `confirmed` the backend may
+// return a folder check instead of saving; the caller shows it and resubmits
+// with `confirmed: true` only when the user chooses to continue.
+export const updateJobSource = (id: string, path: string, confirmed = false) =>
+	post<JobSourceUpdateResult>("/api/jobs/source", { id, path, confirmed });
+
 export const getJobStatus = () =>
     request<{ running: Record<string, string>; targets: Array<{ jobId: string; repositoryId: string; repositoryName: string; operationId: string; status: string }> }>("/api/jobs/status");
 
@@ -856,8 +867,11 @@ export const getSettings = () => request<Settings>("/api/settings");
 export const getSupportReport = (signal?: AbortSignal) => request<SupportReport>("/api/support/report", { signal, cache: "no-store" });
 
 export const saveSettings = (settings: Settings) => {
+    // Both locale values are read-only backend resolutions. The settings POST
+    // decoder rejects unknown fields, so neither may be echoed back.
     const writable = { ...settings };
     delete writable.effectiveLocale;
+    delete writable.systemLocale;
     return post("/api/settings", writable);
 };
 

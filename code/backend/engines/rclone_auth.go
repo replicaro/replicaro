@@ -387,17 +387,17 @@ func (flow *RcloneAuthorizationFlow) advanceLocked(
 			initial, browserAuthorization = false, false
 			continue
 		case "config_shared_client_id":
-			// Rclone's shared Google client retirement notice was previously
-			// surfaced as a UI question even though Replicaro has no custom
-			// client-ID input. Keep the notice internal in every login flow and
-			// use the only supported native choice; rclone reports any failure.
+			// Rclone asks about its shared Google client (a retirement notice).
+			// Replicaro has no custom client-ID input, so keep the question out of
+			// the UI in every login flow and answer with the only supported native
+			// choice; rclone reports any failure.
 			state, result = response.State, "true"
 			initial, browserAuthorization = false, false
 			continue
 		case "config_change_team_drive":
-			// Rclone used to ask users whether to use a Google Shared Drive
-			// after login. This login path defaults to My Drive, so
-			// answer No in every create, connect, and reauthorization flow.
+			// Rclone asks whether to use a Google Shared Drive after login.
+			// This login path always uses My Drive, so answer No in every
+			// create, connect, and reauthorization flow.
 			state, result = response.State, "false"
 			initial, browserAuthorization = false, false
 			continue
@@ -409,9 +409,9 @@ func (flow *RcloneAuthorizationFlow) advanceLocked(
 			initial, browserAuthorization = false, false
 			continue
 		case "config_drive_ok":
-			// Rclone already validated the selected location's root. Its
-			// redundant "Use this drive?" confirmation used to reach the UI;
-			// answer Yes consistently after the location was selected.
+			// Rclone has already validated the selected location's root, so its
+			// "Use this drive?" confirmation is redundant. Answer Yes without
+			// showing it to the user.
 			state, result = response.State, "true"
 			initial, browserAuthorization = false, false
 			continue
@@ -428,11 +428,11 @@ func (flow *RcloneAuthorizationFlow) advanceLocked(
 	}
 }
 
-// surveyOneDriveLocationsLocked fixes the old numbered chooser, which asked
-// users to guess among untested OneDrive IDs. It runs the same native root and
-// identity checks that previously ran only after a user picked one location.
-// Probe every discovered ID before deciding whether a choice is necessary.
-// The checks are read-only remotely; rclone updates the private local config.
+// surveyOneDriveLocationsLocked runs the native root and identity checks on
+// every OneDrive ID rclone discovers, so users never have to guess among
+// untested IDs. Probe every discovered ID before deciding whether a choice is
+// necessary. The checks are read-only remotely; rclone updates the private
+// local config.
 func (flow *RcloneAuthorizationFlow) surveyOneDriveLocationsLocked(
 	ctx context.Context,
 	state string,

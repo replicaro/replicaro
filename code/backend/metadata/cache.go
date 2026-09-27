@@ -693,9 +693,9 @@ func deferRepositorySync(db *sql.DB, repo models.Repository) (func(), <-chan str
 	if cancel := coordinator.activeCancel[key]; cancel != nil {
 		cancels = append(cancels, cancel)
 	}
-	// Publication writers are per-vault now. Preserve same-vault cooperative
-	// yielding and coalescing, while an unrelated vault's cache transaction can
-	// continue on its independent writer connection.
+	// Each vault has its own publication writer. Keep same-vault cooperative
+	// yielding and coalescing, while an unrelated vault's cache transaction
+	// continues on its own writer connection.
 	coordinator.mu.Unlock()
 	for _, cancel := range cancels {
 		cancel()
@@ -994,15 +994,32 @@ func repositoryLockKey(repo models.Repository) string {
 	return repo.ID
 }
 
+// visibleSnapshotsForProfile classifies one native header listing and decides
+// each visible snapshot's File History grouping root from the same read of the
+// vault's jobs. A job change committed while this refresh is running is
+// handled only best effort by database.RefreshStaleMetadataGrouping. It
+// reserves a newer generation (which this refresh cannot publish over) only
+// when the grouping already published in the cache is stale for the new jobs.
+// It reserves nothing when the published grouping was not yet stale, when the
+// vault was never indexed, or when the cache could not be read at that moment
+// (for example while this refresh is rebuilding it). In those cases this
+// refresh may publish the grouping of the jobs it read. That is presentation
+// only, because restore addressing never uses grouping roots, and the next
+// header refresh corrects it.
 func visibleSnapshotsForProfile(db *sql.DB, repo models.Repository, snapshots []models.Snapshot) ([]models.Snapshot, error) {
-	knownJobs, err := database.JobIDsForRepository(db, repo.ID)
+	jobSources, err := database.JobSourcesForRepository(db, repo.ID)
 	if err != nil {
 		return nil, err
+	}
+	knownJobs := make(map[string]bool, len(jobSources))
+	for jobID := range jobSources {
+		knownJobs[jobID] = true
 	}
 	visible := make([]models.Snapshot, 0, len(snapshots))
 	for _, snapshot := range snapshots {
 		snapshot = models.PresentSnapshot(snapshot, repo.ProfileUUID, knownJobs)
 		if snapshot.Presentation != models.SnapshotPresentationHidden {
+			snapshot.MetadataGroupingRoot = database.MetadataGroupingRoot(repo.Engine, repo.ProfileUUID, snapshot, jobSources)
 			visible = append(visible, snapshot)
 		}
 	}

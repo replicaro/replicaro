@@ -1,4 +1,4 @@
-// targetverify admits the exact selected native inputs for one public build.
+// targetverify verifies the selected native inputs for one public build target.
 package main
 
 import (

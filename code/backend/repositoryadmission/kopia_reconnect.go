@@ -5,50 +5,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/models"
-	"github.com/local/replicaro/storageavailability"
 )
-
-// ReconnectKopiaFilesystem durably changes only Kopia's isolated native
-// configuration. Candidate aliases are committed by the existing intent only
-// after native path, repository ID, and client identity readback succeeds.
-func ReconnectKopiaFilesystem(ctx context.Context, db *sql.DB, repo models.Repository, candidate string, observedAt time.Time) error {
-	priorPath := repo.ResolvedRepositoryPath
-	if priorPath == "" {
-		priorPath = repo.Location
-	}
-	candidateRepo := repo
-	candidateRepo.Location = candidate
-	candidateRepo.ResolvedRepositoryPath = candidate
-	engine, err := engines.ResolveWithRepositoryAvailabilityCheck(candidateRepo, storageavailability.RequireRepositoryAvailable)
-	if err != nil {
-		return err
-	}
-	if priorPath == candidate {
-		validationOutput, validationErr := engines.ValidateRepository(ctx, engine, candidateRepo)
-		if validationErr != nil {
-			return fmt.Errorf("validate active Kopia filesystem configuration: %w", validationErr)
-		}
-		fingerprint, fingerprintErr := engines.RepositoryFingerprint(candidateRepo, validationOutput)
-		if fingerprintErr != nil || fingerprint != candidateRepo.NativeRepositoryID {
-			return fmt.Errorf("the active Kopia configuration identifies a different native repository")
-		}
-		return database.SetResolvedRepositoryPath(db, repo.ID, repo.Location, candidate, observedAt)
-	}
-	_, priorSHA, err := engines.KopiaActiveConfigFingerprint(engine, repo)
-	if err != nil {
-		return fmt.Errorf("fingerprint active Kopia filesystem configuration: %w", err)
-	}
-	intent, err := database.ReserveKopiaFilesystemReconnect(db, repo.ID, priorPath, candidate, priorSHA)
-	if err != nil {
-		return err
-	}
-	return ContinueKopiaFilesystemReconnect(ctx, db, engine, candidateRepo, intent, observedAt)
-}
 
 // StageKopiaConnectionUpdate reuses the bounded reconnect artifacts for a
 // confirmed same-UUID update. Native configuration is prepared separately,
@@ -61,11 +22,7 @@ func StageKopiaConnectionUpdate(ctx context.Context, db *sql.DB, engine engines.
 		if fingerprintErr != nil {
 			return intent, fmt.Errorf("fingerprint active Kopia configuration: %w", fingerprintErr)
 		}
-		priorPath := saved.ResolvedRepositoryPath
-		if priorPath == "" {
-			priorPath = saved.Location
-		}
-		intent, err = database.ReserveKopiaFilesystemReconnect(db, saved.ID, priorPath, candidate.Location, priorSHA)
+		intent, err = database.ReserveKopiaFilesystemReconnect(db, saved.ID, saved.Location, candidate.Location, priorSHA)
 	}
 	if err != nil {
 		return intent, err
@@ -94,9 +51,9 @@ func StageKopiaConnectionUpdate(ctx context.Context, db *sql.DB, engine engines.
 		activeSHA, activeErr := engines.KopiaReconnectConfigFingerprint(paths.Active)
 		switch {
 		case activeErr == nil && activeSHA == intent.PriorConfigSHA:
-			// Preparation is reversible staging; activation replaces the live Kopia
-			// config. Honor an already-won cancellation immediately before that first
-			// consequential mutation so exact retries retain truthful pending state.
+			// Preparation only stages files and can be undone; activation replaces the
+			// live Kopia config. Check for an already-accepted cancellation right before
+			// that first change to live state so a retry still sees an accurate pending state.
 			if err := ctx.Err(); err != nil {
 				return intent, err
 			}
@@ -152,8 +109,9 @@ func CleanupKopiaConnectionUpdate(ctx context.Context, db *sql.DB, engine engine
 }
 
 // ContinueKopiaFilesystemReconnect is exported only so startup recovery can
-// resume the same narrow durable intent; it is not a generalized workflow.
-func ContinueKopiaFilesystemReconnect(ctx context.Context, db *sql.DB, engine engines.Engine, repo models.Repository, intent database.KopiaFilesystemReconnectIntent, observedAt time.Time) error {
+// resume the saved intent of a confirmed connection update. It is not a
+// general-purpose workflow and never publishes an automatic alias.
+func ContinueKopiaFilesystemReconnect(ctx context.Context, db *sql.DB, engine engines.Engine, repo models.Repository, intent database.KopiaFilesystemReconnectIntent) error {
 	paths, err := engines.KopiaFilesystemReconnectArtifacts(engine, repo, intent.IntentID)
 	if err != nil {
 		return err
@@ -205,9 +163,11 @@ func ContinueKopiaFilesystemReconnect(ctx context.Context, db *sql.DB, engine en
 				return err
 			}
 		} else if errors.Is(connectionErr, sql.ErrNoRows) {
-			if err := database.CommitKopiaFilesystemReconnect(db, intent, observedAt); err != nil {
-				return err
-			}
+			// Only a confirmed connection update may commit a staged Kopia
+			// config. Anything else would be an automatic relocation publishing
+			// an alias, which is not supported; those intents are discarded at
+			// startup and must never be committed here.
+			return fmt.Errorf("Kopia reconnect intent has no pending confirmed connection update")
 		} else {
 			return connectionErr
 		}
@@ -219,16 +179,12 @@ func ContinueKopiaFilesystemReconnect(ctx context.Context, db *sql.DB, engine en
 		}
 		if _, connectionErr := database.FindRepositoryConnectionIntent(db, intent.RepositoryID); connectionErr == nil {
 			// The confirmed connection transaction alone publishes the configured
-			// location and advances cleanup; startup recovery must not substitute an
-			// observational alias commit for that exact saved-row update.
+			// location and advances cleanup.
 			return nil
 		} else if !errors.Is(connectionErr, sql.ErrNoRows) {
 			return connectionErr
 		}
-		if err := database.MarkKopiaFilesystemReconnectCleanup(db, intent.RepositoryID, intent.IntentID); err != nil {
-			return err
-		}
-		intent.State = "cleanup"
+		return fmt.Errorf("committed Kopia reconnect intent has no pending confirmed connection update")
 	}
 	if intent.State == "cleanup" {
 		if err := engines.CleanupKopiaFilesystemReconnect(paths); err != nil {

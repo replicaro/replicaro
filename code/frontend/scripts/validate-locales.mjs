@@ -15,6 +15,8 @@ const notificationContract = {
   'notifications.message.completedWithIssues': 'taskName',
   'notifications.message.backupNativeSucceededWithIssues': 'taskName',
   'notifications.message.failed': 'taskName',
+  'notifications.message.sourceUnavailable30Days': 'jobName',
+  'notifications.message.vaultUnavailable30Days': 'jobName,vaultName',
   'notifications.appUpdate.title': '',
   'notifications.appUpdate.message': '',
   'notifications.task.backup': 'name',

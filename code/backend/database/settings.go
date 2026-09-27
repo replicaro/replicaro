@@ -240,10 +240,13 @@ func SaveSettings(
 	).Scan(&dashboardIssuesReviewedAt)
 	var installationID string
 	_ = tx.QueryRow(`SELECT value FROM settings WHERE key = ?`, installationIDKey).Scan(&installationID)
+	// metadataGroupingRootsSettingKey is internal migration state, not a user
+	// setting; dropping it would repeat the one-time metadata refresh.
 	_, err = tx.Exec(
-		`DELETE FROM settings WHERE key NOT IN (?, ?, ?, ?)`,
+		`DELETE FROM settings WHERE key NOT IN (?, ?, ?, ?, ?)`,
 		appUpdateLastAutomaticAttemptKey, appUpdateLastResultKey,
 		appUpdateLastAvailableVersionKey, appUpdateSkippedVersionKey,
+		metadataGroupingRootsSettingKey,
 	)
 
 	if err != nil {

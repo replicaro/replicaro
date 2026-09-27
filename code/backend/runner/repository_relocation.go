@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"os"
-	"time"
 
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/engines"
@@ -17,18 +16,16 @@ import (
 	"github.com/local/replicaro/vaultlock"
 )
 
-func ReconnectKopiaFilesystem(ctx context.Context, db *sql.DB, repo models.Repository, candidate string, observedAt time.Time) error {
-	return repositoryadmission.ReconnectKopiaFilesystem(ctx, db, repo, candidate, observedAt)
+func continueKopiaFilesystemReconnect(ctx context.Context, db *sql.DB, engine engines.Engine, repo models.Repository, intent database.KopiaFilesystemReconnectIntent) error {
+	return repositoryadmission.ContinueKopiaFilesystemReconnect(ctx, db, engine, repo, intent)
 }
 
-func continueKopiaFilesystemReconnect(ctx context.Context, db *sql.DB, engine engines.Engine, repo models.Repository, intent database.KopiaFilesystemReconnectIntent, observedAt time.Time) error {
-	return repositoryadmission.ContinueKopiaFilesystemReconnect(ctx, db, engine, repo, intent, observedAt)
-}
-
-// RecoverKopiaFilesystemReconnects attempts every pending reconnect without
-// making one unavailable candidate a process-wide startup dependency. The
-// exact intent remains durable and fences only its repository until a later
-// retry can finish it.
+// RecoverKopiaFilesystemReconnects resumes confirmed Kopia connection
+// updates (and finishes staged-file cleanup) without making one unavailable
+// vault a process-wide startup dependency. The intent stays saved and fences
+// only its repository until a later retry can finish it.
+// Automatic-relocation intents are never resumed; database.Migrate
+// discards them before this runs.
 func RecoverKopiaFilesystemReconnects(ctx context.Context, db *sql.DB) error {
 	intents, err := database.ListKopiaFilesystemReconnects(db)
 	if err != nil {
@@ -62,9 +59,9 @@ func recoverKopiaFilesystemReconnect(ctx context.Context, db *sql.DB, listed dat
 		return err
 	}
 	defer unlock()
-	// An ordinary operation may have finished this exact intent while startup
-	// recovery waited for the repository lock. Re-read under the lock so a
-	// stale listed transition can neither replay nor replace later truth.
+	// A normal operation may have finished this intent while startup recovery
+	// waited for the repository lock. Re-read under the lock so a stale entry
+	// from the earlier listing can't be replayed or overwrite newer state.
 	intent, err := database.FindKopiaFilesystemReconnect(db, listed.RepositoryID)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
@@ -93,9 +90,13 @@ func recoverKopiaFilesystemReconnect(ctx context.Context, db *sql.DB, listed dat
 			return fmt.Errorf("remote Kopia connection update requires exact credential retry before staging")
 		}
 	}
+	if repo.Connector == "fs" && intent.State != "cleanup" {
+		if _, connectionErr := database.FindRepositoryConnectionIntent(db, repo.ID); connectionErr != nil {
+			return fmt.Errorf("filesystem Kopia reconnect has no pending confirmed connection update: %w", connectionErr)
+		}
+	}
 	configured := repo.Location
 	repo.Location = intent.CandidatePath
-	repo.ResolvedRepositoryPath = intent.CandidatePath
 	engine, err := engines.ResolveWithRepositoryAvailabilityCheck(repo, storageavailability.RequireRepositoryAvailable)
 	if err != nil {
 		return err
@@ -112,8 +113,7 @@ func recoverKopiaFilesystemReconnect(ctx context.Context, db *sql.DB, listed dat
 	}
 	// Preserve the immutable configured location through the commit helper.
 	repo.Location = configured
-	repo.ResolvedRepositoryPath = intent.CandidatePath
 	candidateRepo := repo
 	candidateRepo.Location = intent.CandidatePath
-	return continueKopiaFilesystemReconnect(ctx, db, engine, candidateRepo, intent, time.Now().UTC())
+	return continueKopiaFilesystemReconnect(ctx, db, engine, candidateRepo, intent)
 }

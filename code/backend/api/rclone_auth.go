@@ -1268,14 +1268,14 @@ func applyRcloneAuthorizedCredentials(
 		Activation: engines.RcloneConfigActivation{Disposition: engines.RcloneConfigRetained},
 		Attached:   true,
 	}
-	// A native-login apply is an attended foreground transaction. In particular,
-	// OneDrive and Google Drive can still be completing an ordinary protected
-	// profile publication when the browser flow returns. Wait for that exact
-	// in-process vault owner, then revalidate every admission and saved-vault
-	// precondition below while holding the lock. A one-shot try here made slower
-	// providers report a spurious busy failure; cancellation still leaves the
-	// retained authorization retryable. This wait neither unlocks native work
-	// nor masks remote multi-computer races.
+	// A native-login apply runs in the foreground while the user waits. OneDrive
+	// and Google Drive in particular can still be publishing the protected
+	// profile, holding this vault's lock, when the browser flow returns. Wait for
+	// that in-process lock holder instead of trying once (a single try makes
+	// slower providers report a spurious busy error), then revalidate every check
+	// and saved-vault precondition below while holding the lock. Cancelling the
+	// wait still leaves the retained authorization retryable. The wait does not
+	// unlock any native work and does not cover races with other computers.
 	unlock, lockErr := vaultlock.AcquireExclusiveContext(ctx, repo.ID)
 	if lockErr != nil {
 		return failRcloneApplication(outcome, rcloneFailureAdmission, lockErr)
@@ -1283,12 +1283,13 @@ func applyRcloneAuthorizedCredentials(
 	defer unlock()
 	// Authorization may outlive the saved-row review. A pending reconnect or
 	// password change must be rejected under the vault lock before native
-	// validation, artifact staging, or canonical rclone config publication.
-	// Publication used to precede the database reservation check at commit.
+	// validation, artifact staging, or canonical rclone config publication, not
+	// only by the database reservation check at commit.
 	if err := database.ValidateRepositoryMutationAdmission(db, repo.ID); err != nil {
-		// The handler loaded repo before waiting for the vault owner. Removal may
-		// have committed under that owner in the meantime, so only conclusive
-		// under-lock absence replaces the pre-wait attachment truth.
+		// The handler loaded repo before waiting for the vault lock, and a removal
+		// may have committed while we waited. Only a confirmed "row not found" under
+		// the lock marks the vault as no longer attached; any other error keeps the
+		// attachment state loaded before the wait.
 		if errors.Is(err, sql.ErrNoRows) {
 			outcome.Attached = false
 		}
@@ -1331,10 +1332,10 @@ func applyRcloneAuthorizedCredentials(
 	candidate.RcloneConfigPath = stagedConfig
 	// This uses the staged rclone credentials for the existing native access
 	// probe. The protected root/profile checks below match the saved vault
-	// records; ordinary backup admission compares the actual native ID before
-	// backup. Do not add another Restic config read for the narrow false-success
-	// case described at validateRotatedCredentials: it would add a remote round
-	// trip without a demonstrated backup-integrity benefit.
+	// records, and backup admission compares the actual native ID before backup.
+	// Do not add another Restic config read here for the false-success case
+	// described at validateRotatedCredentials: it adds a remote round trip, and
+	// backup admission already checks the repository ID.
 	if err := validateRotatedCredentials(ctx, candidate); err != nil {
 		return failRcloneApplication(outcome, rcloneFailureNativeValidation, fmt.Errorf("rclone login could not access the native vault"))
 	}

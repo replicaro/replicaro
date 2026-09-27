@@ -249,9 +249,11 @@ func ownerTransferMaintenanceMutationContext(
 	})
 }
 
-// admitOwnerVaultCare keeps the actual native identity proof in ordinary
-// admission and supplies its complete owner/attachment proof once. Sidecar
-// ownership alone is never enough to authorize native repository administration.
+// admitOwnerVaultCare leaves the native identity check to the normal
+// repository admission and passes the owner check (canonical root and owner
+// profile) as its AssertControlPlane in place of the default root/attachment
+// check. The attachment is re-checked after admission. Owning the sidecar
+// alone never authorizes native repository administration.
 func admitOwnerVaultCare(ctx context.Context, db *sql.DB, repo models.Repository) (models.Repository, vaultprofile.Root, []byte, error) {
 	var root vaultprofile.Root
 	var rootData []byte

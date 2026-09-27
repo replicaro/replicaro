@@ -198,6 +198,16 @@ type BackupOptions struct {
 	Excludes      []string
 	Verify        bool
 	Settings      models.EngineJobSettings
+	// FullSourceRead asks the engine to read every source file instead of
+	// trusting metadata matches against earlier snapshots. The runner sets it
+	// after the job's source alias changed, and for a new (job, vault) pair
+	// whose vault may already hold the job's snapshots from another folder,
+	// on every attempt until the pair commits a snapshot. Kopia maps it to
+	// --force-hash=100 because --override-source can leave another folder's
+	// snapshots as the comparison base. Restic ignores it: it records the
+	// folder actually read, so a different folder already has no matching
+	// parent snapshot.
+	FullSourceRead bool
 }
 
 // RetentionPolicy is the compact job intent translated by each engine. A zero
@@ -248,10 +258,10 @@ type RestoreOptions struct {
 	Destination       string
 	Selection         string
 	NativeRoot        models.SnapshotSourceRoot
-	// ExactSourceRoot is set only after the restore coordinator has established
-	// that a whole restore is the one authoritative source of a managed
-	// snapshot. NativeRoot alone is rebuildable addressing identity and must
-	// never be allowed to narrow whole-snapshot scope.
+	// ExactSourceRoot is set only after the restore coordinator has confirmed
+	// that NativeRoot is the sole source root of a managed snapshot, so a whole
+	// restore may target it. NativeRoot by itself is rebuildable cache addressing
+	// and must never be used to narrow a whole-snapshot restore.
 	ExactSourceRoot  bool
 	OriginalLocation bool
 	ConflictMode     string
@@ -449,8 +459,8 @@ func validateNativeDeletionIDResults(requested []string, results []NativeDeletio
 }
 
 // ValidateSnapshotIDArgument rejects values that a native CLI could interpret
-// as options or multiple arguments. Exact canonical membership is separately
-// established from a native listing by the locked orchestration layer.
+// as options or multiple arguments. Whether the ID actually exists is checked
+// separately against a native listing by the orchestration layer, under lock.
 func ValidateSnapshotIDArgument(id string) error {
 	if id == "" || strings.TrimSpace(id) != id || strings.HasPrefix(id, "-") ||
 		strings.ContainsAny(id, "\x00\r\n\t ") {

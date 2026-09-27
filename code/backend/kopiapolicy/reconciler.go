@@ -345,7 +345,13 @@ func cleanupFencePath(db *sql.DB, fencePath string) error {
 	if referenced {
 		return fmt.Errorf("native operation fence remains durably referenced")
 	}
-	return command.CleanupClosedNativeProcessFence(fencePath)
+	// Both completion paths above call this right after closing the fence, when
+	// an unrelated process launch may still hold an inherited copy of it for a
+	// few milliseconds; without the short tolerance that showed up as a fence
+	// cleanup error on an otherwise clean reconciliation. The recovered-fence
+	// path has already proven the fence inactive, so it passes on the first
+	// look. A fence that is really still held fails exactly as before.
+	return command.CleanupNativeProcessFenceAfterClose(fencePath)
 }
 
 func Queue(db *sql.DB, repositoryID string) bool {

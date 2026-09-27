@@ -1,7 +1,7 @@
 import { t } from "../i18n";
 import { useCallback, useEffect, useRef, useState } from "react";
 
-import { browseDirectories } from "../services/api";
+import { APIError, browseDirectories } from "../services/api";
 import type { DirectoryListing } from "../types";
 import { Icon, Loading, Modal } from "./ui";
 
@@ -70,6 +70,11 @@ function DirectoryPicker({
     const [listing, setListing] = useState<DirectoryListing | null>(null);
     const [path, setPath] = useState(initialPath);
     const [error, setError] = useState("");
+	// The backend ends a listing after 60 seconds when the folder (typically a
+	// dead network share or a disconnected mapped drive) does not answer; the
+	// OS call itself keeps running on the server. That case gets its own
+	// localized message instead of the technical error text.
+	const [notResponding, setNotResponding] = useState(false);
 	const requestRef = useRef<{ controller: AbortController; generation: number } | null>(null);
 	const generationRef = useRef(0);
 
@@ -88,6 +93,7 @@ function DirectoryPicker({
 		if (generationRef.current !== generation || controller.signal.aborted) return;
         setListing(null);
         setError("");
+		setNotResponding(false);
         try {
 			const next = await browseDirectories(requested, controller.signal);
 			if (generationRef.current !== generation || controller.signal.aborted) return;
@@ -95,7 +101,8 @@ function DirectoryPicker({
             setPath(next.current);
         } catch (reason) {
 			if (generationRef.current !== generation || controller.signal.aborted || (reason as { name?: string })?.name === "AbortError") return;
-            setError((reason as Error).message);
+			if (reason instanceof APIError && reason.code === "directory_not_responding") setNotResponding(true);
+            else setError((reason as Error).message);
 		} finally {
 			if (requestRef.current?.generation === generation) requestRef.current = null;
         }
@@ -132,7 +139,11 @@ function DirectoryPicker({
             </div>
 
             {error && <div className="inline-error">{error}</div>}
-            {!error && listing === null && <Loading />}
+            {notResponding && <div className="inline-error" role="alert">
+                <strong>{t("ui.components.directorypicker.notResponding.title")}</strong>
+                <div>{t("ui.components.directorypicker.notResponding.body")}</div>
+            </div>}
+            {!error && !notResponding && listing === null && <Loading />}
 
             {listing && (
                 <>

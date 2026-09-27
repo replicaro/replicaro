@@ -168,8 +168,8 @@ func LongestEligibleObjectLockMaintenance(settings ObjectLockSettings) (string, 
 	return "", fmt.Errorf("object lock duration does not permit a space reclamation schedule")
 }
 
-// ValidateObjectLockTransition enforces the provider guarantees Replicaro can
-// truthfully preserve after initial enrollment. Provider locks cannot be
+// ValidateObjectLockTransition rejects changes that would break the provider's
+// lock guarantees after initial enrollment. Provider locks cannot be
 // shortened, and S3 Compliance cannot safely be weakened to Governance.
 func ValidateObjectLockTransition(current, next ObjectLockSettings) error {
 	if current.Enrolled != next.Enrolled {
@@ -200,6 +200,10 @@ func ValidateObjectLockTransition(current, next ObjectLockSettings) error {
 	return nil
 }
 
+// Repository.ResolvedRepositoryPath and ResolvedRepositoryObservedAt mirror
+// the retired automatic vault alias columns. Startup clears them and nothing
+// writes them; a vault always runs at Location. The columns stay only to avoid
+// a schema change.
 type Repository struct {
 	ID                           string             `json:"id"`
 	Name                         string             `json:"name"`
@@ -253,16 +257,6 @@ type Repository struct {
 	// RcloneConfigPath is an operation-only override for a still-owned native
 	// authorization stage. Attached repositories always resolve by ID.
 	RcloneConfigPath string `json:"-"`
-}
-
-// RuntimeView selects the local-only cached filesystem alias without changing
-// the immutable configured Location exposed by the API or protected profiles.
-// Admission code must resolve and freeze the path before constructing a view.
-func (r Repository) RuntimeView() Repository {
-	if r.Connector == "fs" && strings.TrimSpace(r.ResolvedRepositoryPath) != "" {
-		r.Location = r.ResolvedRepositoryPath
-	}
-	return r
 }
 
 // ValidateVaultPassword rejects values that cannot be delivered unchanged to

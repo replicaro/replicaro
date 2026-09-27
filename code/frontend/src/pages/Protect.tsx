@@ -7,6 +7,8 @@ import { BackupRunPicker } from "../components/BackupRunPicker";
 import { ListControls } from "../components/ListControls";
 import { RcloneAuthorization } from "../components/RcloneAuthorization";
 import { JobScriptFields } from "../components/JobScriptFields";
+import { UpdateJobSourceDialog } from "../components/UpdateJobSourceDialog";
+import { jobCurrentSource, jobSourceNeedsUpdate } from "../jobSourceDisplay";
 import { preventNumberInputWheel } from "../components/numberInput";
 import {
     ConfirmDialog,
@@ -65,7 +67,7 @@ import {
 	} from "../services/api";
 import { APIError } from "../services/api";
 import type { ExistingVaultStorageInput, JobInput, ManualTargetAdmissionResult, RcloneAuthStatus, RepositoryConnectionIntent, RepositoryCreationIntent, VaultOwnershipStatus, VaultPasswordChangeResult, VaultProfileSyncStatus, VaultProgressRecord } from "../services/api";
-import { backupTargetIsActive, nextSnapshotTooltip } from "../services/backupJobs";
+import { backupTargetIsActive, manualRunNotice, nextSnapshotTooltip } from "../services/backupJobs";
 import { validVaultPassword } from "../services/vaultPassword";
 import type {
     BackupJob,
@@ -163,8 +165,8 @@ const setVaultMutation = (mutation: VaultMutation) => publishVaultMutationSnapsh
 });
 
 const setAuthoritativeVaultPasswordMutation = (mutation: VaultPasswordMutation) => {
-	// A POST or its exact reconciliation is newer than passive reads that began
-	// before this truth settled. Active reconciliation has separate ownership.
+	// A POST result, or its reconciliation, supersedes passive status reads that
+	// started before it settled. Active reconciliation is tracked separately.
 	invalidateVaultPasswordStatusObservation(mutation.repositoryId);
 	setVaultMutation(mutation);
 };
@@ -182,8 +184,13 @@ const beforeVaultMutationUnload = (event: BeforeUnloadEvent) => {
 	event.returnValue = "";
 };
 
-const holdVaultMutationUnloadGuard = (repositoryId: string, generation: number) => {
-	const requestKey = `${repositoryId}:${generation}`;
+// Every guarded request holds its own unique key: "<vault>:<generation>" for
+// settings and password changes, and "removal:<vault>:<sequence>" for vault
+// removal. The key only has to be unique per request, so one request's
+// release can never drop a guard that another request of the same vault
+// still holds.
+let vaultRemovalRequestSequence = 0;
+const holdVaultMutationUnloadGuard = (requestKey: string) => {
 	if (activeVaultMutationRequests.size === 0) window.addEventListener("beforeunload", beforeVaultMutationUnload);
 	activeVaultMutationRequests.add(requestKey);
 	return () => {
@@ -200,10 +207,141 @@ const subscribeVaultMutations = (listener: (snapshot: Record<string, VaultMutati
 	return () => { vaultMutationListeners.delete(listener); };
 };
 
+type VaultRemovalPresentation = {
+	phase: "removing" | "updating_profile" | "profile_error" | "error";
+	message?: string;
+	profileStillUpdating?: boolean;
+};
+
+// Vault removal state is module-owned for the same reason as the settings and
+// password mutations above: the request keeps running on the server when the
+// user navigates away inside the app, and the Protect page that comes back
+// has to show it. When this lived in component state, a remounted page lost
+// the "being removed" overlay, left the card unblocked so a second removal of
+// the same vault could start (and fail fast, showing "could not be removed"
+// while the first request's toast said it was removed), and the inventory
+// refresh ran on the unmounted page, so the removed vault's card stayed
+// visible. Keep the presentation, the in-flight map and the settle
+// notification here; the page only subscribes.
+let vaultRemovalSnapshot: Record<string, VaultRemovalPresentation> = {};
+const vaultRemovalListeners = new Set<(snapshot: Record<string, VaultRemovalPresentation>) => void>();
+// Mounted pages reload their inventory through this once a removal settles.
+// If no page is mounted, the next one loads the inventory when it mounts.
+const vaultRemovalSettledListeners = new Set<() => void>();
+// Vault id -> request sequence. Only the request that owns the entry may
+// publish results, which also keeps a request from a reset test run inert.
+const vaultRemovalsInFlight = new Map<string, number>();
+
+const publishVaultRemoval = (repositoryId: string, presentation: VaultRemovalPresentation | undefined) => {
+	const next = { ...vaultRemovalSnapshot };
+	if (presentation) next[repositoryId] = presentation;
+	else delete next[repositoryId];
+	vaultRemovalSnapshot = next;
+	for (const listener of vaultRemovalListeners) listener(vaultRemovalSnapshot);
+};
+
+const subscribeVaultRemovals = (listener: (snapshot: Record<string, VaultRemovalPresentation>) => void) => {
+	vaultRemovalListeners.add(listener);
+	listener(vaultRemovalSnapshot);
+	return () => { vaultRemovalListeners.delete(listener); };
+};
+
+const subscribeVaultRemovalSettled = (listener: () => void) => {
+	vaultRemovalSettledListeners.add(listener);
+	return () => { vaultRemovalSettledListeners.delete(listener); };
+};
+
+const vaultRemovalIsInFlight = (repositoryId: string) => vaultRemovalsInFlight.has(repositoryId);
+
+// "Keep vault" only dismisses a settled error; a running request keeps its overlay.
+const dismissVaultRemoval = (repositoryId: string) => {
+	if (vaultRemovalsInFlight.has(repositoryId)) return;
+	publishVaultRemoval(repositoryId, undefined);
+};
+
+// A settled error only means something while the vault is still listed. Once
+// the authoritative inventory no longer has the vault (a lost response after a
+// committed delete, or a removal finished elsewhere), drop its entry, so a
+// later reconnect of the same vault UUID does not come back showing "could not
+// be removed" with a "Retry removal" nobody asked for. A running request keeps
+// its entry; it publishes its own outcome when it settles.
+const forgetSettledVaultRemovalsNotIn = (repositories: readonly Pick<Repository, "id">[]) => {
+	const listed = new Set(repositories.map((repository) => repository.id));
+	for (const repositoryId of Object.keys(vaultRemovalSnapshot)) {
+		if (!listed.has(repositoryId) && !vaultRemovalsInFlight.has(repositoryId)) publishVaultRemoval(repositoryId, undefined);
+	}
+};
+
+const runVaultRemoval = async (
+	repository: Pick<Repository, "id" | "name">,
+	discardRecoveryProfile: boolean,
+	toast: (kind: "ok" | "error" | "info", message: string) => void,
+) => {
+	if (vaultRemovalsInFlight.has(repository.id)) return;
+	const request = ++vaultRemovalRequestSequence;
+	vaultRemovalsInFlight.set(repository.id, request);
+	const owns = () => vaultRemovalsInFlight.get(repository.id) === request;
+	// Removal publishes the recovery profile and then deletes local state in
+	// one server request (two when it has to wait for a profile update, see
+	// below). Closing or reloading the tab in the middle can leave that work
+	// half done, so the browser's leave-page prompt is held until the last
+	// request settles. The guard is module-owned, so leaving the Protect page
+	// inside the app neither cancels the request nor drops the prompt.
+	const releaseUnloadGuard = holdVaultMutationUnloadGuard(`removal:${repository.id}:${request}`);
+	// The request remains foreground on the server so its profile publication,
+	// lock, and deletion safeguards are unchanged. Only the dialog gives way
+	// to card-local progress while other UI work can continue.
+	publishVaultRemoval(repository.id, { phase: "removing" });
+	try {
+		let result: Awaited<ReturnType<typeof deleteRepository>>;
+		try {
+			result = discardRecoveryProfile
+				? await deleteRepository(repository.id, true)
+				: await deleteRepository(repository.id);
+		} catch (error) {
+			if (!(error instanceof APIError && error.code === "vault_profile_update_pending")) throw error;
+			// Removing another vault that shares a job queues a recovery-profile
+			// update for this one, and removal must not skip it. The backend
+			// reports that case separately; the second request waits (up to two
+			// minutes) for the update and then retries the removal once with
+			// every safeguard rechecked. It is never retried again automatically.
+			if (owns()) publishVaultRemoval(repository.id, { phase: "updating_profile" });
+			result = await deleteRepository(repository.id, discardRecoveryProfile, true);
+		}
+		if (!owns()) return;
+		toast(result?.warning ? "info" : "ok", result?.warning ?? `Vault "${repository.name}" removed from Replicaro`);
+		publishVaultRemoval(repository.id, undefined);
+	} catch (error) {
+		if (!owns()) return;
+		if (error instanceof APIError && error.code === "vault_removal_cleanup_required") {
+			publishVaultRemoval(repository.id, undefined);
+			toast("error", `Vault "${repository.name}" was removed from Replicaro, but local cleanup needs attention: ${error.message}`);
+			return;
+		}
+		const phase = !discardRecoveryProfile && error instanceof APIError && error.code === "vault_profile_sync_required"
+			? "profile_error" : "error";
+		// The profile update outlasted the wait (or another change queued a new
+		// one during the retry). The vault is kept; the plain explanation
+		// replaces the technical message and "Retry removal" stays available.
+		const profileStillUpdating = error instanceof APIError && error.code === "vault_profile_update_still_pending";
+		publishVaultRemoval(repository.id, { phase, message: (error as Error).message, profileStillUpdating });
+	} finally {
+		releaseUnloadGuard();
+		if (owns()) {
+			vaultRemovalsInFlight.delete(repository.id);
+			// Every outcome reloads the authoritative inventory: success and
+			// cleanup_required remove the card, and a lost response may follow a
+			// committed delete, so an error overlay must not stay on a card that
+			// may already be gone.
+			for (const listener of vaultRemovalSettledListeners) listener();
+		}
+	}
+};
+
 const clearVaultMutation = (repositoryId: string, generation?: number) => {
 	if (generation !== undefined && !ownsVaultMutation(repositoryId, generation)) return;
-	// A dismissed or completed presentation is newer truth than any status GET
-	// that was already pending for this vault.
+	// A dismissed or completed presentation supersedes any status GET that was
+	// already pending for this vault.
 	invalidateVaultPasswordStatusObservation(repositoryId);
 	const next = { ...vaultMutationSnapshot };
 	delete next[repositoryId];
@@ -239,7 +377,7 @@ const runVaultSettingsMutation = (
 	// still owns root publication/local commit, or the profile-local commit plus
 	// its existing profile.replicaro queue response, before this overlay ends.
 	setVaultMutation({ kind: "settings", status: "running", repositoryId, repositoryName, generation, payload, retainedPasswordRecovery });
-	const releaseUnloadGuard = holdVaultMutationUnloadGuard(repositoryId, generation);
+	const releaseUnloadGuard = holdVaultMutationUnloadGuard(`${repositoryId}:${generation}`);
 	void updateRepositorySchedules(payload as VaultSettingsPayload).then((response) => {
 		if (!ownsVaultMutation(repositoryId, generation)) return;
 		setVaultMutation({ kind: "settings", status: "succeeded", repositoryId, repositoryName, generation, payload, response, retainedPasswordRecovery });
@@ -263,8 +401,9 @@ const settleVaultSettingsPresentation = (repositoryId: string, generation: numbe
 	const current = vaultMutationSnapshot[repositoryId];
 	if (!current || current.kind !== "settings" || current.generation !== generation) return;
 	if (current.retainedPasswordRecovery) {
-		// cleanup_pending is separate committed-password recovery truth. A settings
-		// presentation may temporarily cover it, but must not dismiss it.
+		// cleanup_pending is a separate recovery state for an already committed
+		// password. A settings presentation may temporarily cover it, but must not
+		// dismiss it.
 		setVaultMutation({ ...current.retainedPasswordRecovery, generation: ++vaultMutationGeneration });
 		return;
 	}
@@ -280,9 +419,9 @@ const passwordMutationFromResult = (
 ): VaultPasswordMutation => {
 	const base = { kind: "password" as const, repositoryId: result.repositoryId, repositoryName, generation, result, uncertainResolved };
 	if (vaultPasswordChangeNeedsRecovery(result)) return { ...base, status: "recovery", error };
-	// Orchestration completion means the candidate credential and sidecars were
-	// committed. Preserve a failed/interrupted native result as informational
-	// native truth, but never turn the completed password change into a failure.
+	// A completed orchestration means the new credential and sidecars were
+	// committed. A failed or interrupted native result is kept for information,
+	// but a completed password change is never reported as a failure.
 	if (result.phase === "completed" && !result.cleanupPending) return { ...base, status: "succeeded" };
 	return { ...base, status: "error", error };
 };
@@ -297,7 +436,7 @@ const runVaultPasswordMutation = (
 	if (current && current.generation !== replaceGeneration) return false;
 	const generation = ++vaultMutationGeneration;
 	setAuthoritativeVaultPasswordMutation({ kind: "password", status: "running", repositoryId, repositoryName, generation });
-	const releaseUnloadGuard = holdVaultMutationUnloadGuard(repositoryId, generation);
+	const releaseUnloadGuard = holdVaultMutationUnloadGuard(`${repositoryId}:${generation}`);
 	void request().then((result) => {
 		if (!ownsVaultMutation(repositoryId, generation)) return;
 		if (result.repositoryId !== repositoryId) throw new Error("Password-change response did not match the selected vault.");
@@ -372,6 +511,9 @@ export const resetVaultMutationPresentationForTests = () => {
 	vaultPasswordStatusLifecycle++;
 	for (const repositoryId of Object.keys(vaultPasswordStatusObservationOwners)) delete vaultPasswordStatusObservationOwners[repositoryId];
 	publishVaultMutationSnapshot({});
+	vaultRemovalsInFlight.clear();
+	vaultRemovalSnapshot = {};
+	for (const listener of vaultRemovalListeners) listener(vaultRemovalSnapshot);
 };
 
 type RunSubmissionOwner = {
@@ -627,9 +769,9 @@ function normalizedRcloneFolderName(value: string) {
 }
 
 function usesRcloneNativeLogin(provider: string) {
-	// These account-backed rclone connectors use backend-enforced sole-profile
-	// admission. Connect must reuse or transfer that one attachment instead of
-	// offering Join or another profile that would imply unsupported coordination.
+	// For these account-backed rclone connectors the backend allows only one
+	// profile. Connect must reuse or transfer that attachment rather than offer
+	// Join or another profile, which would imply coordination we don't support.
 	return provider === "dropbox" || provider === "google_drive" || provider === "onedrive";
 }
 
@@ -675,8 +817,8 @@ function providerPresentationDescription(
 	return engineDescription && engineDescription !== fallback ? engineDescription : localized;
 }
 
-// Certification status must never be shown in the end-user UI. Runtime
-// admission remains authoritative for whether an engine/provider is available.
+// Do not show certification status in the end-user UI. Whether an
+// engine/provider is available is decided by the backend's runtime checks.
 
 function unicodeCodePointCount(value: string) {
 	return Array.from(value).length;
@@ -978,6 +1120,10 @@ const emptyBulkEdit: BulkEditForm = {
 	replaceDestinations: false,
 };
 
+// The form keeps the immutable source: an edit always saves job.source, never
+// the "Update job source" alias. The edit dialog's read-only source field
+// shows the alias instead (jobCurrentSource), the same location the job card
+// shows; that is display only. Copy job clears the source entirely.
 function jobToForm(job: BackupJob): JobForm {
     const custom = job.schedule.startsWith("every:");
 	const cron = job.schedule.startsWith("cron:");
@@ -1102,8 +1248,8 @@ function sameStringSet(left: string[], right: string[]) {
 }
 
 function suggestedCopyJobName(job: BackupJob, jobs: BackupJob[]) {
-	// SQLite NOCASE folds only ASCII letters. Match the database's uniqueness
-	// authority deterministically instead of depending on the browser locale.
+	// SQLite NOCASE folds only ASCII letters. Fold the same way so suggestions
+	// match the database's uniqueness rule regardless of the browser locale.
 	const used = new Set(jobs.map((candidate) => asciiNoCase(candidate.name.trim())));
 	const base = `${job.name.trim()} copy`;
 	if (!used.has(asciiNoCase(base))) return base;
@@ -1827,7 +1973,7 @@ function DestinationVaultPicker({
                         key={repository.id}
                         onClick={() => onChange([...selectedIds, repository.id])}
                     >
-                        <span><strong>{repository.name}</strong><small className="mono">{repository.location}</small>{repository.resolvedRepositoryPath && <small className="mono">{t("ui.protect.lastVerifiedAtPath", { path: repository.resolvedRepositoryPath })}</small>}</span>
+                        <span><strong>{repository.name}</strong><small className="mono">{repository.location}</small></span>
                         <span className="destination-add"><Icon name="plus" size={12} /> {t("ui.pages.protect.add")}</span>
                     </button>
                 ))}
@@ -1906,6 +2052,7 @@ export default function Protect() {
     const [jobAdvanced, setJobAdvanced] = useState(false);
     const [jobSaving, setJobSaving] = useState(false);
     const [jobDelete, setJobDelete] = useState<BackupJob | null>(null);
+	const [sourceUpdateJob, setSourceUpdateJob] = useState<BackupJob | null>(null);
     const [jobDeleting, setJobDeleting] = useState(false);
 	const [jobToggleBusy, setJobToggleBusy] = useState("");
 	const [selectedJobIDs, setSelectedJobIDs] = useState<string[]>([]);
@@ -1953,12 +2100,12 @@ export default function Protect() {
 	const [connectChecking, setConnectChecking] = useState(false);
 	const [connectSaving, setConnectSaving] = useState(false);
 	const [vaultProgress, setVaultProgress] = useState<VaultProgressRecord[]>([]);
-	// A small bounded presentation buffer lets users see actual stages while the
-	// existing request remains authoritative. No progress is invented, persisted,
-	// or used to decide whether creation/connection worked.
-	// This bounded state feeds only the stage activity view. Native records stay
-	// in the API/native result capture; admitting them here could evict every
-	// stage during a chatty engine operation without helping this UI.
+	// A small bounded buffer of stage records lets users see real progress. It
+	// is display only: nothing is made up or persisted, and the request's own
+	// result decides whether creation/connection worked.
+	// Only stage records go here. Native records stay in the API/native result
+	// capture; adding them could push every stage out of the buffer during a
+	// chatty engine operation.
 	const appendVaultProgress = (record: VaultProgressRecord) => {
 		if (record.type === "stage") setVaultProgress((current) => [...current.slice(-199), record]);
 	};
@@ -1990,7 +2137,7 @@ export default function Protect() {
     const [showRawToolLog, setShowRawToolLog] = useState(false);
 	const toolRequestController = useRef<AbortController | null>(null);
 	const [vaultDelete, setVaultDelete] = useState<Repository | null>(null);
-	const [vaultRemoval, setVaultRemoval] = useState<Record<string, { phase: "removing" | "profile_error" | "error"; message?: string }>>({});
+	const [vaultRemoval, setVaultRemoval] = useState<Record<string, VaultRemovalPresentation>>(vaultRemovalSnapshot);
 	const [closePrompt, setClosePrompt] = useState<"job" | "vault" | null>(null);
 	const jobModalSession = useRef(0);
 	const jobSubmissionGeneration = useRef(0);
@@ -2031,7 +2178,6 @@ export default function Protect() {
 	const jobDeleteSession = useRef(0);
 	const jobDeleteGeneration = useRef(0);
 	const jobDeleteOwner = useRef<{ session: number; generation: number } | null>(null);
-	const vaultRemovalInFlight = useRef(new Set<string>());
 	const refreshGenerations = useRef({ jobs: 0, repositories: 0, profileSync: 0, running: 0, creations: 0 });
 	const runningState = useRef<Record<string, boolean>>({});
 	const handledVaultMutationCompletions = useRef(new Set<string>());
@@ -2043,6 +2189,7 @@ export default function Protect() {
 	}, []);
 
 	useEffect(() => subscribeVaultMutations(setVaultMutations), []);
+	useEffect(() => subscribeVaultRemovals(setVaultRemoval), []);
 
 	useEffect(() => {
 		protectPageActive.current = true;
@@ -2240,6 +2387,7 @@ export default function Protect() {
 		void getRepositories().then((nextRepos) => {
 			if (refreshGenerations.current.repositories !== request.repositories) return;
 			setRepos(nextRepos);
+			forgetSettledVaultRemovalsNotIn(nextRepos);
 			setVaultStats((current) => Object.fromEntries(nextRepos.map((repository) => {
 				const active = current[repository.id];
 				return [repository.id, active?.running || active?.pending ? active : {
@@ -2267,6 +2415,9 @@ export default function Protect() {
 			if (refreshGenerations.current.repositories === request.repositories) toast("error", error.message);
 		});
 	}, [commitJobs, commitRunning, toast]);
+
+	// A removal started on an earlier mount of this page settles here too.
+	useEffect(() => subscribeVaultRemovalSettled(load), [load]);
 
 	const retryProfile = async (repositoryId: string) => {
 		try {
@@ -3078,17 +3229,16 @@ export default function Protect() {
 				}
 			}
             if (result.count > 0) commitRunning({ ...runningState.current, [jobId]: true });
-			if (ownsSubmission() && reviewingMultipleTargets) setRunResults(result.results);
-			const admittedVaultNames = result.results
-				.filter((admission) => admission.status === "admitted")
-				.map((admission) => job.targets.find((target) => target.repositoryId === admission.repositoryId)?.repositoryName ?? admission.repositoryId);
-			if (admittedVaultNames.length === 1) {
-				toast("info", `"${jobName}" started for "${admittedVaultNames[0]}".`);
-			} else if (admittedVaultNames.length > 1) {
-				toast("info", `"${jobName}" started for ${admittedVaultNames.length} vaults: ${admittedVaultNames.map((name) => `"${name}"`).join(", ")}.`);
-			} else {
-				toast("info", `No backup started for "${jobName}". Review the admission result.`);
-			}
+			const showsRunResults = ownsSubmission() && reviewingMultipleTargets;
+			if (showsRunResults) setRunResults(result.results);
+			// Same per-vault notice as the top-bar "Run jobs now" picker. The one
+			// exception: when no vault started and the review dialog is showing
+			// the per-vault admission results, the toast points there instead of
+			// repeating every reason. Runs started without that screen (a
+			// single-vault job run straight from its card) get the full notice.
+			const notice = manualRunNotice(jobName, job.targets, result.results);
+			if (notice.admittedCount > 0 || !showsRunResults) toast(notice.kind, notice.message);
+			else toast("info", `No backup started for "${jobName}". Review the admission result.`);
             load();
 			if (ownsSubmission() && !reviewingMultipleTargets) setRunJobID("");
         } catch (error) {
@@ -3407,10 +3557,9 @@ export default function Protect() {
 			if (!refiningProfile) connectPreviewBaseFields.current = reviewedBaseFields;
 			setConnectPreview(preview);
 			if (preview.existingVault) {
-				// A same-UUID copy is an update of the one registered row. Keep the
-				// current local preferences and attachment selected; an older copied
-				// profile is evidence for the vault, never authority to restore jobs or
-				// roll local settings backward.
+				// A same-UUID copy updates the one registered row. Keep the current local
+				// preferences and attachment selected; an older copied profile identifies
+				// the vault but must never restore jobs or roll local settings backward.
 				setConnectForm((current) => ({
 					...current,
 					name: preview.existingVault!.name,
@@ -3593,10 +3742,10 @@ export default function Protect() {
 			toast("error", t("ui.protect.reviewExistingVaultUpdate"));
 			return;
 		}
-		// The profile and owner controls state the transfer consequences, and the
-		// final Connect vault action is their confirmation boundary. A browser
-		// confirmation here would duplicate those deliberate choices without adding
-		// authority; the backend still revalidates the exact attachment transition.
+		// The profile and owner controls explain the transfer, and the final Connect
+		// vault click confirms it. Don't add a browser confirmation here; it would
+		// only repeat those choices, and the backend still revalidates the
+		// attachment change.
 		const vaultName = connectForm.name.trim();
 		const reviewedOptions = { ...storage.options };
 		if (!connectForm.coldStorage && connectForm.connector === "s3" && connectDetectedEngine === "restic") {
@@ -4025,6 +4174,10 @@ export default function Protect() {
 				load();
 			}
 		}
+		// Closing the settings dialog reacts to a module-owned mutation snapshot
+		// (possibly started from an earlier mount of this page), so it can only
+		// run once that snapshot has arrived here.
+		// eslint-disable-next-line react-hooks/set-state-in-effect
 		if (vaultSettings && vaultMutations[vaultSettings.id] && vaultMutationBlocksCard(vaultMutations[vaultSettings.id])) dismissVaultSettings();
 		// dismissVaultSettings is intentionally not a dependency: this effect is
 		// driven by coordinator snapshots, while the dialog cleanup helper changes
@@ -4080,7 +4233,7 @@ export default function Protect() {
 	const cancelColdMaintenance = () => toolRequestController.current?.abort();
 
     const openVaultDelete = (repository: Repository) => {
-		if (vaultRemovalInFlight.current.has(repository.id)) return;
+		if (vaultRemovalIsInFlight(repository.id)) return;
 		setVaultDelete(repository);
 	};
 
@@ -4089,38 +4242,11 @@ export default function Protect() {
 		return true;
 	};
 
-	const removeVault = async (repository: Repository, discardRecoveryProfile = false) => {
-		if (vaultRemovalInFlight.current.has(repository.id)) return;
-		vaultRemovalInFlight.current.add(repository.id);
-		// The request remains foreground on the server so its profile publication,
-		// lock, and deletion safeguards are unchanged. Only the dialog gives way
-		// to card-local progress while other UI work can continue.
+	const removeVault = (repository: Repository, discardRecoveryProfile = false) => {
+		if (vaultRemovalIsInFlight(repository.id)) return;
 		setVaultDelete(null);
-		setVaultRemoval((current) => ({ ...current, [repository.id]: { phase: "removing" } }));
-        try {
-			const result = discardRecoveryProfile
-				? await deleteRepository(repository.id, true)
-				: await deleteRepository(repository.id);
-			toast(result?.warning ? "info" : "ok", result?.warning ?? `Vault "${repository.name}" removed from Replicaro`);
-			setVaultRemoval((current) => { const next = { ...current }; delete next[repository.id]; return next; });
-            load();
-        } catch (error) {
-			if (error instanceof APIError && error.code === "vault_removal_cleanup_required") {
-				setVaultRemoval((current) => { const next = { ...current }; delete next[repository.id]; return next; });
-				toast("error", `Vault "${repository.name}" was removed from Replicaro, but local cleanup needs attention: ${error.message}`);
-				load();
-				return;
-			}
-			const phase = !discardRecoveryProfile && error instanceof APIError && error.code === "vault_profile_sync_required"
-				? "profile_error" : "error";
-			setVaultRemoval((current) => ({ ...current, [repository.id]: { phase, message: (error as Error).message } }));
-			// A lost response may follow a committed delete. Reload the authoritative
-			// inventory before leaving an error overlay on a possibly absent card.
-			load();
-        } finally {
-			vaultRemovalInFlight.current.delete(repository.id);
-        }
-    };
+		void runVaultRemoval(repository, discardRecoveryProfile, toast);
+	};
 
 	const refreshConnectionIntents = () => void getRepositoryConnectionIntents().then(setConnectionIntents).catch((error: Error) => toast("error", error.message));
 	const refreshCreationIntents = async () => {
@@ -4369,9 +4495,9 @@ export default function Protect() {
 	const currentOwnerName = currentConnectOwner?.attachment.display.computerName && currentConnectOwner.attachment.display.operatingSystem
 		? `${currentConnectOwner.attachment.display.computerName}@${currentConnectOwner.attachment.display.operatingSystem}`
 		: connectPreview?.vault_owner_profile_uuid ? t("ui.protect.profileIdLabel", { id: connectPreview.vault_owner_profile_uuid }) : t("ui.protect.currentProfileLabel");
-	// Pending intent recovery appears only after the user enters its exact
-	// destination. Stale intents no longer occupy the whole reconnect screen;
-	// the server still proves physical identity and the saved review on retry.
+	// Pending intent recovery appears only after the user enters its destination,
+	// so stale intents do not take over the reconnect screen. The server still
+	// checks physical identity and the saved review on retry.
 	const enteredConnectLocation = vaultLocation(connectForm);
 	const matchingConnectionIntent = enteredConnectLocation ? connectionIntents.find((intent) =>
 		connectionIntentMatchesDestination(intent, connectForm, enteredConnectLocation)) : undefined;
@@ -4420,6 +4546,13 @@ export default function Protect() {
                         const issueTargets = job.targets.filter((target) => target.lastStatus === "completed_with_issues");
                         const isRunning = Boolean(running[job.id]) || activeTargets.length > 0;
                         const sourceUnavailable = job.targets.some((target) => target.sourceAvailability === "unavailable");
+						// Offered whenever the source cannot be used (paused or failing);
+						// the backend also refuses while any target is queued or running.
+						const offerSourceUpdate = jobSourceNeedsUpdate(job) && !isRunning;
+						// After "Update job source" the card shows the location in use as
+						// the job's source, without calling it an alias. The immutable
+						// source is kept in the backend.
+						const currentSource = jobCurrentSource(job);
                         const vaultUnavailable = job.targets.some((target) => target.targetAvailability === "unavailable");
                         const successfulTargets = job.targets.filter((target) => target.lastStatus === "success");
                         const fullyProtected = job.targets.length > 0 && successfulTargets.length === job.targets.length;
@@ -4449,14 +4582,14 @@ export default function Protect() {
 								</div>
                                 <div className="flow-source">
                                     <strong>{job.name}</strong>
-									<Tooltip content={displayPath(job.source)}>
-										<span className="flow-source-path"><span className="flow-source-path-text"><b>{t("ui.pages.protect.source")}</b> {displayPath(job.source)}</span></span>
+									<Tooltip content={displayPath(currentSource)}>
+										<span className="flow-source-path"><span className="flow-source-path-text"><b>{t("ui.pages.protect.source")}</b> {displayPath(currentSource)}</span></span>
 									</Tooltip>
-									{job.resolvedSourcePath && <span className="flow-source-path"><span className="flow-source-path-text"><b>{t("ui.pages.protect.last.verified.at")}</b> {displayPath(job.resolvedSourcePath)}</span></span>}
 									<span><b>{t("ui.pages.protect.size")}</b> {job.sizeBytes == null ? t("ui.pages.protect.not.measured.yet") : readableSize(job.sizeBytes)}</span>
                                 </div>
                                 <div className="flow-glyph">
                                     <span className="flow-status">{status === t("ui.jobStatus.partiallyProtected") ? renderMessage("ui.jobStatus.partiallyProtectedBreak", { break: <br /> }) : status}</span>
+									{offerSourceUpdate && <button type="button" className="btn sm flow-status-action" onClick={() => setSourceUpdateJob(job)}>{t("ui.protect.updateJobSource")}</button>}
                                     <svg className="flow-arrow-horizontal" viewBox="0 0 120 10" aria-hidden="true">
                                         <line x1="0" y1="5" x2="112" y2="5" />
                                         <path d="M112 1.5L119 5l-7 3.5z" />
@@ -4602,11 +4735,11 @@ export default function Protect() {
                                 </div>
 								{removal && <div className="vault-removal-overlay" role="status" aria-live="polite">
 									<VaultOverlayIdentity name={repo.name} />
-									{removal.phase === "removing" ? <><strong className="vault-overlay-status">{t("ui.pages.protect.vault.is.being.removed")}</strong><span>{t("ui.pages.protect.you.can.continue.using.replicaro.while.this.finishes")}</span><span className="spinner" aria-hidden="true" /></> : <>
+									{removal.phase === "removing" || removal.phase === "updating_profile" ? <><strong className="vault-overlay-status">{t("ui.pages.protect.vault.is.being.removed")}</strong>{removal.phase === "updating_profile" && <span>{t("ui.pages.protect.vaultRemoval.updatingInformation")}</span>}<span>{t("ui.pages.protect.you.can.continue.using.replicaro.while.this.finishes")}</span><span className="spinner" aria-hidden="true" /></> : <>
 										<strong>{removal.phase === "profile_error" ? t("ui.pages.protect.the.recovery.profile.could.not.be.updated") : t("ui.pages.protect.the.vault.could.not.be.removed")}</strong>
-										<span>{removal.message}</span>
+										<span>{removal.profileStillUpdating ? t("ui.pages.protect.vaultRemoval.stillUpdating") : removal.message}</span>
 										{removal.phase === "profile_error" && <span>{t("ui.pages.protect.removing.it.anyway.leaves.the.remote.recovery.profile.unchanged.the.va")}</span>}
-										<div className="vault-removal-actions"><button className="btn sm" onClick={() => setVaultRemoval((current) => { const next = { ...current }; delete next[repo.id]; return next; })}>{t("ui.pages.protect.keep.vault")}</button><button className="btn sm danger-outline" onClick={() => void removeVault(repo, removal.phase === "profile_error")}>{removal.phase === "profile_error" ? t("ui.pages.protect.remove.anyway") : t("ui.pages.protect.retry.removal")}</button></div>
+										<div className="vault-removal-actions"><button className="btn sm" onClick={() => dismissVaultRemoval(repo.id)}>{t("ui.pages.protect.keep.vault")}</button><button className="btn sm danger-outline" onClick={() => removeVault(repo, removal.phase === "profile_error")}>{removal.phase === "profile_error" ? t("ui.pages.protect.remove.anyway") : t("ui.pages.protect.retry.removal")}</button></div>
 									</>}
 								</div>}
 								{mutation && !removal && <VaultMutationOverlay mutation={mutation} onReopenSettings={(repositoryId, generation) => { void reopenVaultSettings(repositoryId, generation); }} />}
@@ -4654,7 +4787,7 @@ export default function Protect() {
 								    permits source updates before local binding, but exposing that here would
 								    let users point the same job ID at different data and alter native retention
 								    scope. Backend mutability does not imply an editable source field. */}
-								<label className="field"><span>{t("ui.pages.protect.source.data")}</span><DirectoryField ariaLabel={t("ui.pages.protect.source.data")} value={jobForm.source} readOnly={jobModal !== "new"} autoFocus={jobCopyDraft} onChange={(source) => setJobForm({ ...jobForm, source })} /><small>{jobModal === "new" ? t("ui.pages.protect.must.be.a.local.folder.mounted.share.mapped.drive.or.network.path.exte") : t("ui.protect.editSourceImmutableHelp")}</small></label>
+								<label className="field"><span>{t("ui.pages.protect.source.data")}</span><DirectoryField ariaLabel={t("ui.pages.protect.source.data")} value={jobModal !== "new" && jobModal ? jobCurrentSource(jobModal) : jobForm.source} readOnly={jobModal !== "new"} autoFocus={jobCopyDraft} onChange={(source) => setJobForm({ ...jobForm, source })} /><small>{jobModal === "new" ? t("ui.pages.protect.must.be.a.local.folder.mounted.share.mapped.drive.or.network.path.exte") : t("ui.protect.editSourceImmutableHelp")}</small></label>
 							</>}
                         <div className="field"><span>{t("ui.pages.protect.destination.vaults")}</span><DestinationVaultPicker repositories={repos ?? []} selectedIds={jobForm.repositoryIds} onChange={(repositoryIds) => setJobForm({ ...jobForm, repositoryIds })} /><small>{t("ui.pages.protect.select.one.or.more.vaults.backups.for.all.vaults.are.managed.by.this.j")}</small></div>
                         <label className="field"><span>{t("ui.pages.protect.schedule")}</span><select aria-label={t("ui.pages.protect.schedule")} value={jobForm.schedule} onChange={(event) => setJobForm({ ...jobForm, schedule: event.target.value })}>{schedulePresets.map(([value, label]) => <option key={value} value={value}>{label()}</option>)}</select><small>{scheduleHelp(jobForm.schedule)}</small></label>
@@ -4779,6 +4912,16 @@ export default function Protect() {
 				</div>
 			</Modal>}
 
+				{sourceUpdateJob && <UpdateJobSourceDialog
+					job={sourceUpdateJob}
+					onClose={() => setSourceUpdateJob(null)}
+					onError={(message) => toast("error", message)}
+					onSaved={(saved) => {
+						setSourceUpdateJob(null);
+						applySavedJob(saved);
+						load();
+					}}
+				/>}
 				{jobDelete && <ConfirmDialog title={t("ui.protect.deleteNamedJobQuestion", { name: jobDelete.name })} message={t("ui.pages.protect.its.run.history.is.kept.but.no.further.backups.will.run.existing.backu")} confirmLabel={t("ui.pages.protect.delete.job")} busy={jobDeleting} onConfirm={() => void removeJob()} onCancel={dismissJobDelete} />}
             {selectedRunJob && (
                 <Modal title={t("ui.protect.runNamedJob", { name: selectedRunJob.name })} onClose={dismissRunReview}>
@@ -5036,7 +5179,7 @@ export default function Protect() {
 					title={t("ui.protect.removeNamedVaultQuestion", { vault: vaultDelete.name })}
 					message={<><span>{renderMessage("ui.protect.removeVaultDestinationHelp", { count: jobCountFor(vaultDelete.id), jobCount: <strong>{t("ui.protect.backupJobCount", { count: jobCountFor(vaultDelete.id) })}</strong> })}</span><br /><br /><span>{t("ui.pages.protect.jobs.that.have.other.vaults.as.a.destination.will.not.be.deleted.jobs")}</span><br /><br /><span>{t("ui.pages.protect.data.on.disk.is.untouched.you.can.re.add.the.vault.later")}</span></>}
 					confirmLabel={t("ui.pages.protect.remove.vault")}
-					onConfirm={() => void removeVault(vaultDelete)}
+					onConfirm={() => removeVault(vaultDelete)}
                     onCancel={dismissVaultDelete}
                 />
             )}

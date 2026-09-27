@@ -254,6 +254,18 @@ export function StatusBadge({ status }: { status: string }) {
 /* Modal                                                               */
 /* ------------------------------------------------------------------ */
 
+// Open modals in mount order; the last entry is the one on top. Every Modal
+// listens on window, so without this a single Escape reached every open
+// dialog at once: pressing it in a DirectoryPicker opened from a job dialog
+// closed the picker and the job dialog behind it, and the Tab focus trap of
+// every open dialog ran on each key press. Only the topmost Modal may act on
+// a key; the ones underneath ignore keys until they are on top again.
+// Entries are removed by identity, not popped, because a dialog lower in the
+// stack can close first (for example when the page that opened it unmounts).
+// Nested dialogs are portals rather than DOM descendants, so the order is
+// tracked here instead of being read from the DOM tree.
+const openModalStack: object[] = [];
+
 export function Modal({
     title,
     onClose,
@@ -281,7 +293,10 @@ export function Modal({
 		) ?? []).filter((element) => !element.hidden);
 		const preferred = dialog?.querySelector<HTMLElement>("[autofocus]") ?? focusable()[0] ?? dialog;
 		preferred?.focus();
+		const stackEntry = {};
+		openModalStack.push(stackEntry);
         const onKey = (e: KeyboardEvent) => {
+			if (openModalStack[openModalStack.length - 1] !== stackEntry) return;
 			if (e.key === "Escape") onCloseRef.current();
 			if (e.key !== "Tab") return;
 			const items = focusable();
@@ -303,6 +318,8 @@ export function Modal({
         window.addEventListener("keydown", onKey);
 		return () => {
 			window.removeEventListener("keydown", onKey);
+			const index = openModalStack.indexOf(stackEntry);
+			if (index !== -1) openModalStack.splice(index, 1);
 			previousFocus?.focus();
 		};
 	}, []);

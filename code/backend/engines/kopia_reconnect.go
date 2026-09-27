@@ -300,6 +300,20 @@ func VerifyActiveKopiaFilesystemReconnect(ctx context.Context, engine Engine, re
 	return paths, status, nil
 }
 
+// DiscardKopiaReconnectArtifacts removes the staged and previous config
+// copies of one reconnect intent that startup discarded (an automatic
+// relocation intent, see database.retireAutomaticRelocationState). They are
+// copies of the vault's isolated Kopia config file and hold no credentials;
+// the active config is never touched. Only the vault ID and token are needed
+// to derive the paths, so no engine binary is resolved.
+func DiscardKopiaReconnectArtifacts(repositoryID, token string) error {
+	paths, err := kopiaReconnectPaths(&kopiaEngine{}, models.Repository{ID: repositoryID, Engine: KopiaID}, token)
+	if err != nil {
+		return err
+	}
+	return CleanupKopiaFilesystemReconnect(paths)
+}
+
 func CleanupKopiaFilesystemReconnect(paths KopiaFilesystemReconnectPaths) error {
 	var result error
 	for _, path := range []string{paths.Staged, paths.Previous} {

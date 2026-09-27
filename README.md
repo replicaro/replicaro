@@ -223,7 +223,7 @@ The canonical English interface catalog is at
 Translations are contributed through pull requests and require review before
 they are included in the app. A new catalog is a candidate until a maintainer
 explicitly registers its locale in the frontend catalog registry, backend
-catalog loader, and supported language setting. The v1.0.2 source includes
+catalog loader, and supported language setting. The v1.0.3 source includes
 English, German, French, Arabic, Urdu, Hindi, Spanish, Italian, Simplified
 Chinese (Mandarin), Traditional Chinese (Cantonese), Japanese, Irish, Korean,
 Malay, Indonesian, Turkish, Hebrew, European Portuguese, Brazilian Portuguese,

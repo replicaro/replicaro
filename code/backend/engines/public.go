@@ -140,7 +140,7 @@ func ChangeRepositoryPassword(ctx context.Context, engine Engine, repo models.Re
 		if errors.As(nativeErr, &exit) && exit.ExitCode() == 11 {
 			// Pinned Restic 0.19.1 defines exit 11 for key passwd as a lock
 			// rejection before its key mutation. Keep the native failure intact;
-			// this structured exit status only narrows recovery cleanup authority.
+			// the disposition below only tells recovery cleanup the key never changed.
 			disposition = PasswordMutationRejectedBeforeMutation
 		}
 	}
@@ -253,9 +253,9 @@ func EmbeddedBinarySHA256(id, target string) (string, error) {
 	return expectedEmbeddedHash(id, target)
 }
 
-// publicEngine binds repository availability checks and requested-operation
-// classification around a concrete adapter. Ordinary output remains the
-// selected engine's native content through this application boundary.
+// publicEngine wraps a concrete adapter with repository availability checks
+// and requested-operation classification. It passes the selected engine's
+// native output through unchanged.
 type publicEngine struct {
 	Engine
 	repo              models.Repository
@@ -311,11 +311,10 @@ func admitNativeDeletion(ctx context.Context) error {
 	return &command.PreProcessAdmissionError{Err: err}
 }
 
-// ContextWithResticMaintenancePruneAdmission installs the one narrow
-// application authorization check that must run after a successful optional
-// plain Restic unlock and immediately before the requested prune command.
-// It is intentionally specific to owner-authorized maintenance and is not a
-// generalized process coordinator.
+// ContextWithResticMaintenancePruneAdmission installs an authorization check
+// that must run after the optional plain Restic unlock succeeds and immediately
+// before the requested prune command. It exists only for maintenance run by the
+// vault owner; do not grow it into a general process coordinator.
 func ContextWithResticMaintenancePruneAdmission(
 	ctx context.Context,
 	admit func(context.Context) error,

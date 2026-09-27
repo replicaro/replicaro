@@ -663,6 +663,10 @@ export interface ReadableLogContext {
     partial?: boolean;
 }
 
+// The summary's only line when nothing was found. Overview compares against
+// it to decide whether the summary actually lists errors or warnings.
+export const noSummaryDiagnosticsLine = "No errors or warnings identified in the loaded output.";
+
 export function formatReadableLog(text: string, context: ReadableLogContext, live = false, formattedBody?: string, pageDiagnostics?: readonly string[]) {
     const diagnostics: string[] = pageDiagnostics ? [...pageDiagnostics] : [];
     const completedWithIssues = context.operationKind === "backup" && context.operationStatus === "completed_with_issues";
@@ -689,7 +693,7 @@ export function formatReadableLog(text: string, context: ReadableLogContext, liv
     if (summaryDiagnostics.length > 12) concise.push("Additional errors or warnings are in Raw in the completed log.");
     const summary = ["[errors / warnings summary]",
         ...(live ? ["Errors and warnings shown below cover the currently loaded log output."] : []),
-        ...(concise.length ? concise : ["No errors or warnings identified in the loaded output."]),
+        ...(concise.length ? concise : [noSummaryDiagnosticsLine]),
     ];
     return `${summary.join("\n")}\n\n${trimSectionLines(body)}`.trimEnd();
 }

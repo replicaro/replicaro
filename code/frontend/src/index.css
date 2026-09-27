@@ -1,3 +1,129 @@
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: italic;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("./assets/fonts/jetbrains-mono-cyrillic-ext-italic.woff2") format("woff2");
+    unicode-range: U+0460-052F, U+1C80-1C8A, U+20B4, U+2DE0-2DFF, U+A640-A69F, U+FE2E-FE2F;
+}
+
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: italic;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("./assets/fonts/jetbrains-mono-cyrillic-italic.woff2") format("woff2");
+    unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: italic;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("./assets/fonts/jetbrains-mono-greek-italic.woff2") format("woff2");
+    unicode-range: U+0370-0377, U+037A-037F, U+0384-038A, U+038C, U+038E-03A1, U+03A3-03FF;
+}
+
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: italic;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("./assets/fonts/jetbrains-mono-vietnamese-italic.woff2") format("woff2");
+    unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB;
+}
+
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: italic;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("./assets/fonts/jetbrains-mono-latin-ext-italic.woff2") format("woff2");
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: italic;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("./assets/fonts/jetbrains-mono-latin-italic.woff2") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: normal;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("./assets/fonts/jetbrains-mono-cyrillic-ext.woff2") format("woff2");
+    unicode-range: U+0460-052F, U+1C80-1C8A, U+20B4, U+2DE0-2DFF, U+A640-A69F, U+FE2E-FE2F;
+}
+
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: normal;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("./assets/fonts/jetbrains-mono-cyrillic.woff2") format("woff2");
+    unicode-range: U+0301, U+0400-045F, U+0490-0491, U+04B0-04B1, U+2116;
+}
+
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: normal;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("./assets/fonts/jetbrains-mono-greek.woff2") format("woff2");
+    unicode-range: U+0370-0377, U+037A-037F, U+0384-038A, U+038C, U+038E-03A1, U+03A3-03FF;
+}
+
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: normal;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("./assets/fonts/jetbrains-mono-vietnamese.woff2") format("woff2");
+    unicode-range: U+0102-0103, U+0110-0111, U+0128-0129, U+0168-0169, U+01A0-01A1, U+01AF-01B0, U+0300-0301, U+0303-0304, U+0308-0309, U+0323, U+0329, U+1EA0-1EF9, U+20AB;
+}
+
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: normal;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("./assets/fonts/jetbrains-mono-latin-ext.woff2") format("woff2");
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+    font-family: "JetBrains Mono";
+    font-style: normal;
+    font-weight: 100 800;
+    font-display: swap;
+    src: url("./assets/fonts/jetbrains-mono-latin.woff2") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
+@font-face {
+    font-family: "Schibsted Grotesk";
+    font-style: normal;
+    font-weight: 400 900;
+    font-display: swap;
+    src: url("./assets/fonts/schibsted-grotesk-latin-ext.woff2") format("woff2");
+    unicode-range: U+0100-02BA, U+02BD-02C5, U+02C7-02CC, U+02CE-02D7, U+02DD-02FF, U+0304, U+0308, U+0329, U+1D00-1DBF, U+1E00-1E9F, U+1EF2-1EFF, U+2020, U+20A0-20AB, U+20AD-20C0, U+2113, U+2C60-2C7F, U+A720-A7FF;
+}
+
+@font-face {
+    font-family: "Schibsted Grotesk";
+    font-style: normal;
+    font-weight: 400 900;
+    font-display: swap;
+    src: url("./assets/fonts/schibsted-grotesk-latin.woff2") format("woff2");
+    unicode-range: U+0000-00FF, U+0131, U+0152-0153, U+02BB-02BC, U+02C6, U+02DA, U+02DC, U+0304, U+0308, U+0329, U+2000-206F, U+20AC, U+2122, U+2191, U+2193, U+2212, U+2215, U+FEFF, U+FFFD;
+}
+
 :root {
     color-scheme: dark;
     --bg: #0a0c10;
@@ -49,6 +175,14 @@
     font-synthesis: none;
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
+}
+
+/* Schibsted Grotesk has no ơ, ư or tone-marked letters, so Vietnamese words
+   would mix it with fallback glyphs letter by letter. Use the system font for
+   all Vietnamese UI text instead; monospace text keeps JetBrains Mono, which
+   covers Vietnamese. */
+:root:lang(vi) {
+    font-family: system-ui, sans-serif;
 }
 
 :root[data-theme="light"] {
@@ -375,7 +509,7 @@ pre {
     align-items: center;
     gap: 11px;
     color: var(--chrome-text);
-    font-family: Helvetica, Arial, sans-serif;
+    font-family: inherit;
     font-size: 16px;
     font-weight: 700;
 }
@@ -1633,6 +1767,11 @@ button.protection-ring { cursor: pointer; }
 
 .flow-glyph > .flow-status {
     text-align: center;
+}
+
+.flow-glyph > .flow-status-action {
+    margin: 2px 0;
+    white-space: nowrap;
 }
 
 .flow-glyph > .tooltip-trigger {
@@ -2925,6 +3064,35 @@ select option {
     white-space: nowrap;
 }
 
+/* Job-name labels for managed snapshots. Job names have no length limit, so
+   the name is truncated with an ellipsis; the trigger itself stays unclipped
+   so the "Job source:" tooltip can render outside it. */
+.job-source-label.tooltip-trigger {
+    overflow: visible;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.job-source-name {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The source line of a search result clips long paths; a job label truncates
+   itself instead so its tooltip is not clipped with it. */
+.find-result-main .mono.job-source-line {
+    display: flex;
+    gap: 0.5ch;
+    overflow: visible;
+}
+
+.browse-tree-main .job-source-label {
+    color: inherit;
+    font-size: inherit;
+}
+
 .snapshot-size {
     min-width: 60px;
     color: var(--text-faint);
@@ -3850,6 +4018,8 @@ select option {
     flex-wrap: wrap;
     align-items: flex-end;
     gap: 8px;
+    /* Same separation as a hint before the next group in .app-update-settings. */
+    margin-top: 12px;
 }
 
 .system-wide-field input.mono {
@@ -4133,20 +4303,19 @@ select option {
         display: none;
     }
 
+    /* Wrap the links into rows (two per row) rather than scrolling them
+       sideways: the old scroller hid its scrollbar, so on a phone the last
+       link was cut off with no sign that there was more to reach. A label too
+       long to share a row simply takes a row of its own. */
     .topnav {
         order: 3;
         width: 100%;
         flex: 0 0 100%;
-        overflow-x: auto;
-        scrollbar-width: none;
-    }
-
-    .topnav::-webkit-scrollbar {
-        display: none;
+        flex-wrap: wrap;
     }
 
     .topnav a {
-        flex: 1;
+        flex: 1 1 40%;
         padding: 6px 10px;
         text-align: center;
     }
@@ -4493,7 +4662,7 @@ select option {
         animation-iteration-count: infinite !important;
     }
 }
-/* Replicaro readability improvement. */
+/* Larger type sizes for readability. */
 
 body { font-size: 15.5px; }
 
@@ -4612,7 +4781,7 @@ input, select, textarea { font-size: 14.5px; }
 .notification-channel-title { font-size: 14px; }
 
 /* ============================================================
-   Protect page redesign 
+   Protect page layout
    ============================================================ */
 
 /* --- 1. Section headers: kicker + coloured rule ----------- */
@@ -4640,7 +4809,7 @@ input, select, textarea { font-size: 14.5px; }
     margin-bottom: 0px;
 }
 
-/* --- 2. Vaults: full-width rows -> responsive card grid --- */
+/* --- 2. Vaults: responsive card grid ---------------------- */
 
 .protect-page .vault-list {
     display: grid;
@@ -4657,14 +4826,14 @@ input, select, textarea { font-size: 14.5px; }
     .protect-page .vault-list { grid-template-columns: 1fr; }
 }
 
-/* Each vault becomes a bordered card.
-   Children (identity / 2 stats / actions) are re-flowed with
-   grid areas so the two stats sit side-by-side — no JSX needed.
+/* Each vault is a bordered card.
+   Children (identity / 2 stats / actions) are placed with grid
+   areas so the two stats sit side by side.
    Direct children of .vault-row are, in order:
-     .vault-identity , span.tooltip-trigger , span.tooltip-trigger , .row-actions 
+     .vault-identity , span.tooltip-trigger , span.tooltip-trigger , .row-actions
 	 
-	Jobs list is intentionally left as-is — it now contrasts
-   with the vault grid on its own. 
+	The jobs list deliberately keeps its row layout so it
+   contrasts with the vault grid.
 */
 .protect-page .vault-row {
     position: relative;
@@ -4677,7 +4846,7 @@ input, select, textarea { font-size: 14.5px; }
     gap: 14px 20px;
     align-content: start;
     padding: 20px;
-    border: 1px solid var(--rule);        /* was border-bottom only */
+    border: 1px solid var(--rule);
     border-radius: 12px;
     background: var(--panel);
 }
@@ -4732,8 +4901,8 @@ input, select, textarea { font-size: 14.5px; }
     gap: 8px;
 }
 
-/* Settings and password requests remain synchronous; this card-local layer
-   only releases the rest of the UI while the unchanged endpoint finishes. */
+/* Settings and password requests are synchronous; this card-local layer
+   blocks only its card so the rest of the UI stays usable until they finish. */
 .protect-page .vault-mutation-overlay {
 	position: absolute;
 	inset: 0;

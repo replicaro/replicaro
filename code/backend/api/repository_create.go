@@ -137,7 +137,10 @@ func writeRepositoryCreationSuccess(
 		rcloneOutcome = attachedUsableRcloneOutcome(rcloneOutcome)
 	}
 	cleanupWarnings := []string{}
-	if cleanupErr := cleanupCreationFenceWithRetry(db, fencePath); cleanupErr != nil {
+	// The fence was shown inactive earlier in this request, so this normally
+	// passes at once. The cleanup absorbs a momentary inherited holder and
+	// refuses a fence that stays held.
+	if cleanupErr := cleanupCreationNativeFence(db, fencePath); cleanupErr != nil {
 		cleanupWarnings = append(cleanupWarnings, "The vault is attached, but its inactive local creation fence still needs cleanup.")
 	}
 	if authCleanupErr := finishAuthorization(rcloneOutcome.Activation.Disposition); authCleanupErr != nil {
@@ -501,7 +504,12 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	inactive, proofErr := command.NativeProcessFenceInactive(fencePath)
+	// On the first attempt this request closed the fence a moment ago, and on a
+	// retry the previous request may have just done so. Either way an unrelated
+	// process launch can still hold an inherited copy of the fence descriptor
+	// for a few milliseconds, so the check tolerates that short window. A native
+	// process that is really still running keeps failing here as before.
+	inactive, proofErr := command.NativeProcessFenceInactiveAfterClose(fencePath)
 	if proofErr != nil || !inactive {
 		message := "The matching native creation process or a descendant may still be running; wait and retry."
 		_ = database.MarkRepositoryCreationError(db, intent.ID, message)
@@ -660,7 +668,7 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		// post-attachment reconciler; startup QueueAll covers a crash here.
 		kopiapolicy.QueueDirty(db, id)
 	}
-	// Attachment is already committed and truthful success must not be rewritten
-	// by best-effort local fence or authorization-session cleanup.
+	// Attachment is already committed. Best-effort cleanup of the local fence or
+	// authorization session must not turn this success into a failure.
 	writeRepositoryCreationSuccess(db, w, id, createdStore, completedRepo, fencePath, rcloneOutcome, finishAuthorization)
 }

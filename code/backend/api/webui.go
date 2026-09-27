@@ -29,27 +29,33 @@ func ApplicationHandlerAt(db *sql.DB, endpoint runtimeendpoint.Endpoint, record 
 
 func ApplicationHandlerAtWithSecurityMode(db *sql.DB, endpoint runtimeendpoint.Endpoint, record rendezvous.Record, activate func() error, mode SecurityMode) http.Handler {
 	return applicationHandlerAtWithSecurityModeAndRcloneAuth(
-		db, db, endpoint, record, activate, mode, newRcloneAuthStore(), appupdate.New(db),
+		db, db, endpoint, nil, record, activate, mode, newRcloneAuthStore(), appupdate.New(db), false,
 	)
 }
 
 func applicationHandlerAtWithSecurityModeAndRcloneAuth(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
+	lanOrigins runtimeendpoint.LANOrigins,
 	record rendezvous.Record,
 	activate func() error,
 	mode SecurityMode,
 	rcloneAuth *rcloneAuthStore,
 	updater *appupdate.Service,
+	keepStartAtLogin bool,
 	runtimeManagers ...*operationruntime.Manager,
 ) http.Handler {
 	runtimeManager := operationruntime.New()
 	if len(runtimeManagers) > 0 && runtimeManagers[0] != nil {
 		runtimeManager = runtimeManagers[0]
 	}
-	security := requestSecurity{endpoint: endpoint, mode: normalizedSecurityMode(mode), clientUUID: installationUUID(db)}
+	// Page loads are checked with this copy. The API handler below builds its
+	// own copy from the same lanOrigins, which replaces this one for /api/.
+	security := requestSecurity{
+		endpoint: endpoint, lanOrigins: lanOrigins, mode: normalizedSecurityMode(mode), clientUUID: installationUUID(db),
+	}
 	apiHandler := handlerAtWithSecurityModeRcloneAuthAndRuntime(
-		db, readDB, endpoint, record, activate, mode, rcloneAuth, updater, runtimeManager,
+		db, readDB, endpoint, lanOrigins, record, activate, mode, rcloneAuth, updater, keepStartAtLogin, runtimeManager,
 	)
 	webUI, err := webUIFileSystem()
 	if err == nil {

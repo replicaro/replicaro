@@ -220,12 +220,117 @@ func BuildInitialProfile(repo models.Repository, jobs []models.BackupJob, dorman
 }
 
 func SyncRepository(ctx context.Context, db *sql.DB, repositoryID string) error {
+	// Registered first so it is released last, after the vault lock: a caller
+	// that just failed to take the lock must still see who held it.
+	holding, release := trackSync(repositoryID)
+	defer release()
 	unlock, err := vaultlock.AcquireExclusiveContext(ctx, repositoryID)
 	if err != nil {
 		return fmt.Errorf("wait for vault profile publication lock: %w", err)
 	}
 	defer unlock()
+	holding()
 	return syncRepositoryUnderLock(ctx, db, repositoryID)
+}
+
+// activeSyncs is in-memory bookkeeping of SyncRepository calls (the
+// background queue and settings saves) per vault: how many are running, and
+// how many of those hold the vault lock. Vault removal uses it to tell a
+// short wait for a profile update apart from a real conflict with another
+// operation, and to know when that update has finished. It is not a lock or a
+// queue and records nothing durable; vault_profile_sync remains the only
+// record of pending work.
+var activeSyncs = struct {
+	sync.Mutex
+	running map[string]int
+	holding map[string]int
+}{running: map[string]int{}, holding: map[string]int{}}
+
+func trackSync(repositoryID string) (holding func(), release func()) {
+	activeSyncs.Lock()
+	activeSyncs.running[repositoryID]++
+	activeSyncs.Unlock()
+	held := false
+	holding = func() {
+		activeSyncs.Lock()
+		activeSyncs.holding[repositoryID]++
+		held = true
+		activeSyncs.Unlock()
+	}
+	release = func() {
+		activeSyncs.Lock()
+		defer activeSyncs.Unlock()
+		if held {
+			if activeSyncs.holding[repositoryID]--; activeSyncs.holding[repositoryID] <= 0 {
+				delete(activeSyncs.holding, repositoryID)
+			}
+		}
+		if activeSyncs.running[repositoryID]--; activeSyncs.running[repositoryID] <= 0 {
+			delete(activeSyncs.running, repositoryID)
+		}
+	}
+	return holding, release
+}
+
+// PublishingUnderLock reports whether a profile update currently holds this
+// vault's lock.
+func PublishingUnderLock(repositoryID string) bool {
+	activeSyncs.Lock()
+	defer activeSyncs.Unlock()
+	return activeSyncs.holding[repositoryID] > 0
+}
+
+// pendingUpdatePollInterval is how often WaitForPendingUpdate rechecks. A
+// poll keeps the wait inside the caller's request without adding a
+// notification path to the queue; a variable only so tests can shorten it.
+var pendingUpdatePollInterval = 250 * time.Millisecond
+
+// WaitForPendingUpdate waits up to timeout until no profile update for the
+// vault is running and none is due. It returns true once the durable row is
+// gone, or when the last attempt failed and is backing off (the queue will not
+// retry it within the wait, so the caller's own publication is the next
+// attempt and reports that failure). It returns false at the timeout. It never
+// starts, cancels, or discards an update; callers wake the queue first.
+func WaitForPendingUpdate(ctx context.Context, db *sql.DB, repositoryID string, timeout time.Duration) (bool, error) {
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	for {
+		settled, err := pendingUpdateSettled(db, repositoryID)
+		if err != nil || settled {
+			return settled, err
+		}
+		poll := time.NewTimer(pendingUpdatePollInterval)
+		select {
+		case <-ctx.Done():
+			poll.Stop()
+			return false, ctx.Err()
+		case <-deadline.C:
+			poll.Stop()
+			return false, nil
+		case <-poll.C:
+		}
+	}
+}
+
+func pendingUpdateSettled(db *sql.DB, repositoryID string) (bool, error) {
+	activeSyncs.Lock()
+	running := activeSyncs.running[repositoryID] > 0
+	activeSyncs.Unlock()
+	if running {
+		return false, nil
+	}
+	state, err := database.VaultProfileSyncState(db, repositoryID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if state.NextAttemptAt == "" {
+		return false, nil
+	}
+	next, err := time.Parse(time.RFC3339Nano, state.NextAttemptAt)
+	return err == nil && next.After(time.Now()), nil
 }
 
 // SyncRepositoryUnderLock publishes while the caller holds this repository's

@@ -18,22 +18,27 @@ import (
 )
 
 type Event struct {
-	Locale                string `json:"-"`
-	TaskKey               string `json:"-"`
-	TaskName              string `json:"-"`
-	TaskTarget            string `json:"-"`
-	Event                 string `json:"event"`
-	Status                string `json:"status,omitempty"`
-	Success               bool   `json:"success"`
-	NativeBackupSucceeded bool   `json:"nativeBackupSucceeded,omitempty"`
-	Title                 string `json:"title"`
-	Message               string `json:"message"`
-	OperationID           string `json:"operationId,omitempty"`
-	TimelineURL           string `json:"timelineUrl,omitempty"`
-	Severity              string `json:"severity"`
-	Color                 string `json:"color"`
-	Icon                  string `json:"icon"`
-	Timestamp             string `json:"timestamp"`
+	Locale     string `json:"-"`
+	TaskKey    string `json:"-"`
+	TaskName   string `json:"-"`
+	TaskTarget string `json:"-"`
+	// MessageKey optionally replaces the generic status message with one
+	// specific catalog message (currently only the 30-day unavailable-storage
+	// notice). MessageValues fills its placeholders.
+	MessageKey            string            `json:"-"`
+	MessageValues         map[string]string `json:"-"`
+	Event                 string            `json:"event"`
+	Status                string            `json:"status,omitempty"`
+	Success               bool              `json:"success"`
+	NativeBackupSucceeded bool              `json:"nativeBackupSucceeded,omitempty"`
+	Title                 string            `json:"title"`
+	Message               string            `json:"message"`
+	OperationID           string            `json:"operationId,omitempty"`
+	TimelineURL           string            `json:"timelineUrl,omitempty"`
+	Severity              string            `json:"severity"`
+	Color                 string            `json:"color"`
+	Icon                  string            `json:"icon"`
+	Timestamp             string            `json:"timestamp"`
 }
 
 var dispatchWG sync.WaitGroup
@@ -147,6 +152,9 @@ func prepare(event *Event) {
 		})
 	}
 	event.Message = localizedNotificationMessage(taskName, *event)
+	if event.MessageKey != "" {
+		event.Message = locale.Text(event.Locale, event.MessageKey, event.MessageValues)
+	}
 	if len(event.Message) > maxWebhookMessageBytes {
 		event.Message = event.Message[:maxWebhookMessageBytes] + "…"
 	}

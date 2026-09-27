@@ -169,16 +169,17 @@ func privateRcloneOperationDirectories() (root, cache, temporary string, cleanup
 	return root, cache, temporary, cleanup, nil
 }
 
-// ValidateRcloneVaultConfig verifies the selected private file and its local
-// path safeguards. OAuth authorization discovers the account, drive, or
-// namespace needed for the canonical physical address once. Pinned rclone then
-// owns this opaque file and its token refresh; Replicaro does not reparse its
-// credential fields. Every attached vault is still admitted by the selected
-// engine's native repository identity and the protected sidecar. Repeating
-// provider probes on each command would chiefly police a same-OS-user manual
-// config replacement or reauthorization outside this workflow, rather than
-// strengthen those vault proofs. Ordinary engine orchestration and exact
-// private-path safety are the intended boundary for attached operations.
+// ValidateRcloneVaultConfig checks the vault's private rclone config file and
+// its local path safeguards; it deliberately does not contact the provider. OAuth
+// authorization discovers the account, drive, or namespace for the vault's
+// physical address once. After that, pinned rclone owns this opaque file and
+// its token refresh, and Replicaro does not reparse its credential fields.
+// Every attached vault is still verified by the engine's native repository
+// identity and the protected sidecar. Probing the provider on every command
+// would mainly catch someone replacing or reauthorizing the config by hand as
+// the same OS user, and would not strengthen that vault verification. Local
+// path safety plus the normal engine checks are the intended limit for attached
+// operations.
 func ValidateRcloneVaultConfig(ctx context.Context, repo models.Repository) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -243,11 +244,11 @@ func openRcloneVaultConfigBindingLocal(repo models.Repository) (*RcloneVaultConf
 	}, nil
 }
 
-// OpenRcloneVaultConfigBinding locally admits a Restic-rclone config and selects
-// its ordinary canonical path. Revalidate checks local path safety immediately
-// before or after use. Native repository and sidecar proofs establish the vault
-// identity; a provider listing here would not prove those objects. The binding
-// retains no file or directory.
+// OpenRcloneVaultConfigBinding validates a Restic-rclone config locally and
+// selects its canonical private path. Revalidate re-checks local path safety
+// immediately before or after use. The vault's identity is confirmed by the
+// native repository and the sidecar; a provider listing here would add nothing.
+// The binding keeps no file or directory open.
 func OpenRcloneVaultConfigBinding(
 	ctx context.Context,
 	repo models.Repository,
@@ -258,9 +259,10 @@ func OpenRcloneVaultConfigBinding(
 	return openRcloneVaultConfigBindingLocal(repo)
 }
 
-// RcloneVaultCredentialsReady reports the narrow attached-vault readiness
-// contract: complete non-secret address identity plus one secure private native
-// config file. Provider reachability remains operation-authoritative.
+// RcloneVaultCredentialsReady reports whether an attached vault is ready to
+// use: its address options are complete and hold no secrets, and it has one
+// secure private rclone config file. Whether the provider is reachable is left
+// to the operation itself.
 func RcloneVaultCredentialsReady(ctx context.Context, repo models.Repository) bool {
 	if repo.Engine != ResticID || !IsResticRcloneConnector(repo.Connector) {
 		return false
@@ -453,9 +455,10 @@ func OpenExistingRcloneStatisticsConfigBinding(
 	return nonResticRcloneSidecarBinding(repo.ID, config), nil
 }
 
-// NewRclonePreviewSidecarConfig creates a native-touched operation-owned opaque
-// config for pre-attachment inspection. Random preview IDs never select a
-// durable vault path.
+// NewRclonePreviewSidecarConfig creates a temporary rclone config (via
+// "rclone config touch") in a private operation directory, for inspecting a
+// vault before it is attached. Random preview IDs never map to a durable vault
+// config path.
 func NewRclonePreviewSidecarConfig(
 	ctx context.Context,
 ) (string, func() error, error) {

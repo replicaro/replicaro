@@ -38,10 +38,11 @@ func requireRepositoryConnectionUnreserved(tx *sql.Tx, repositoryID string) erro
 	return nil
 }
 
-// requireRepositoryMutationUnreserved permits ordinary saved-row controls
-// after the new credential is atomically committed. Destructive removal keeps
-// using requireRepositoryConnectionUnreserved so cleanup truth cannot cascade
-// away with the repository row.
+// requireRepositoryMutationUnreserved allows normal saved-vault edits once a
+// password change has committed the new credential. Deleting the vault still
+// uses requireRepositoryConnectionUnreserved, which blocks on any
+// password-change record, so the record that cleanup relies on is not
+// cascade-deleted with the repository row.
 func requireRepositoryMutationUnreserved(tx *sql.Tx, repositoryID string) error {
 	var passwordChange int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM vault_password_change_operations
@@ -161,13 +162,12 @@ func ReserveRepositoryConnectionWithStorage(
 	mode, digest, payloadJSON, profileSHA256, nativeFingerprint string,
 	publicationOperationID ...string,
 ) (RepositoryConnectionIntent, error) {
-	canonicalJSON, err := validateStorageBinding(version, key, descriptorJSON)
-	if err != nil {
+	if err := validateStorageBinding(version, key, descriptorJSON, location); err != nil {
 		return RepositoryConnectionIntent{}, err
 	}
-	if err := validatePathOnlyBindingLocation(location, canonicalJSON); err != nil {
-		return RepositoryConnectionIntent{}, err
-	}
+	// The key argument is ignored by reserveRepositoryConnection: connection
+	// intents are always keyed by the protected vault UUID from the payload,
+	// never by location, so imports are never merged or rejected by path.
 	return reserveRepositoryConnection(db, key, "fs", location, reviewedOptions,
 		mode, digest, payloadJSON, profileSHA256, nativeFingerprint, nil, publicationOperationID...)
 }
@@ -180,11 +180,7 @@ func ReserveRepositoryUpdateWithStorage(
 	mode, digest, payloadJSON, profileSHA256, nativeFingerprint string,
 	publicationOperationID ...string,
 ) (RepositoryConnectionIntent, error) {
-	canonicalJSON, err := validateStorageBinding(version, key, descriptorJSON)
-	if err != nil {
-		return RepositoryConnectionIntent{}, err
-	}
-	if err := validatePathOnlyBindingLocation(location, canonicalJSON); err != nil {
+	if err := validateStorageBinding(version, key, descriptorJSON, location); err != nil {
 		return RepositoryConnectionIntent{}, err
 	}
 	return reserveRepositoryConnection(db, expected.ID, "fs", location, reviewedOptions,
@@ -306,17 +302,17 @@ func validateRepositoryUpdateReservation(tx *sql.Tx, expected models.Repository)
 		return err
 	}
 	var name, engine, connector, archiveWriteClass, location, identity, description string
-	var storageVersion, storageKey, storageJSON, resolvedPath, resolvedAt string
+	var storageVersion, storageKey, storageJSON string
 	var password, options, nativeID, profileUUID, checkSchedule, maintenanceSchedule, concurrencyMode, storedObjectLock string
 	var coldStorage, autoUnlock bool
 	var attachmentGeneration int64
 	var requiredGeneration int64
 	if err := tx.QueryRow(`SELECT name,engine,connector,cold_storage,archive_write_class,location,canonical_identity,description,
-		storage_identity_version,storage_identity_key,storage_identity_json,resolved_repository_path,resolved_repository_observed_at,
+		storage_identity_version,storage_identity_key,storage_identity_json,
 		passphrase,connector_options,native_repository_id,profile_uuid,attachment_generation,check_schedule,maintenance_schedule,
 		concurrency_mode,auto_unlock,object_lock_json,required_generation FROM repositories WHERE id=?`, expected.ID).Scan(
 		&name, &engine, &connector, &coldStorage, &archiveWriteClass, &location, &identity, &description,
-		&storageVersion, &storageKey, &storageJSON, &resolvedPath, &resolvedAt,
+		&storageVersion, &storageKey, &storageJSON,
 		&password, &options, &nativeID, &profileUUID, &attachmentGeneration, &checkSchedule, &maintenanceSchedule,
 		&concurrencyMode, &autoUnlock, &storedObjectLock, &requiredGeneration,
 	); err != nil {
@@ -326,21 +322,29 @@ func validateRepositoryUpdateReservation(tx *sql.Tx, expected models.Repository)
 	if err != nil {
 		return fmt.Errorf("invalid saved concurrency mode: %w", err)
 	}
-	// The reservation is the last no-mutation boundary. Once it succeeds,
-	// ordinary row and job mutations are fenced by the existing connection
-	// reservation until exact retry completes or a prepared review is cancelled.
+	// This reservation is the last step before anything is changed. Once it
+	// succeeds, the connection reservation blocks normal vault and job edits until
+	// the retry completes or the prepared review is cancelled.
+	// Filesystem vaults are compared by location, not by storage columns: the
+	// first successful probe after upgrade may convert a legacy binding (and
+	// its canonical identity) under the vault lock between the review and this
+	// reservation, and the recorded facts are observations, not identity.
+	storageChanged := location != expected.Location
+	if connector != "fs" {
+		storageChanged = storageChanged || identity != expected.CanonicalIdentity ||
+			storageVersion != expected.StorageIdentityVersion || storageKey != expected.StorageIdentityKey ||
+			storageJSON != expected.StorageIdentityJSON
+	}
 	if name != expected.Name || engine != expected.Engine || connector != expected.Connector || coldStorage != expected.ColdStorage ||
 		archiveWriteClass != expected.ArchiveWriteClass ||
-		location != expected.Location || identity != expected.CanonicalIdentity || description != expected.Description ||
-		storageVersion != expected.StorageIdentityVersion || storageKey != expected.StorageIdentityKey || storageJSON != expected.StorageIdentityJSON ||
-		resolvedPath != expected.ResolvedRepositoryPath || resolvedAt != expected.ResolvedRepositoryObservedAt ||
+		storageChanged || description != expected.Description ||
 		password != encodedPassword || options != encodedOptions || nativeID != expected.NativeRepositoryID ||
 		profileUUID != expected.ProfileUUID || attachmentGeneration != expected.AttachmentGeneration ||
 		checkSchedule != expected.CheckSchedule || maintenanceSchedule != expected.MaintenanceSchedule ||
 		concurrencyMode != expected.ConcurrencyMode || autoUnlock != expected.AutoUnlock || storedObjectLock != objectLockJSON {
 		return fmt.Errorf("saved vault changed after Update existing vault review")
 	}
-	_ = requiredGeneration // Metadata catch-up may advance independently of the reviewed saved-row state.
+	_ = requiredGeneration // Not compared: metadata catch-up can bump it after the review without the saved vault changing.
 	var active int
 	if err := tx.QueryRow(`SELECT
 		(SELECT COUNT(*) FROM operations WHERE repository_id=? AND status IN ('queued','running')) +
@@ -378,9 +382,10 @@ func ListRepositoryConnectionIntents(db *sql.DB) ([]RepositoryConnectionIntent, 
 	return result, nil
 }
 
-// CancelRepositoryConnectionIntent removes a purely local prepared review.
-// Once publication or native configuration work starts, forward recovery is
-// the only safe lifecycle and the immutable intent remains authoritative.
+// CancelRepositoryConnectionIntent removes a prepared review that has not yet
+// changed anything outside the local database. Once publication or native
+// configuration has started, it cannot be cancelled; recovery must finish it
+// forward using the intent exactly as recorded.
 func CancelRepositoryConnectionIntent(db *sql.DB, id string) error {
 	tx, err := db.Begin()
 	if err != nil {

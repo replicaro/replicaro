@@ -85,15 +85,17 @@ func markSupportResponseError(w http.ResponseWriter, err error, expected bool) {
 func markSupportStorageObservation(w http.ResponseWriter, stage string, err error) {
 	var binding *storageBindingFailure
 	var macAccess *macOSAccessError
-	// Preview and retry can also fail native work. A deadline from that work
-	// is not evidence of a storage observation, even at a storage stage.
+	// Preview and retry can also fail inside native work. A deadline from that
+	// work does not mean the storage check timed out, even at a storage stage.
 	if err == nil || (!errors.As(err, &binding) && !errors.As(err, &macAccess)) ||
 		errors.Is(err, context.Canceled) ||
 		!errors.Is(err, storageavailability.ErrObserverUnavailable) && !errors.Is(err, context.DeadlineExceeded) {
 		return
 	}
 	switch stage {
-	case "vault_create_destination", "vault_connect_destination", "job_create_source", "job_bind_source":
+	case storageavailability.StageVaultCreate, storageavailability.StageVaultConnect,
+		storageavailability.StageJobCreateSource, storageavailability.StageJobBindSource,
+		storageavailability.StageJobSourceUpdate:
 	default:
 		return
 	}
@@ -105,7 +107,11 @@ func markSupportStorageObservation(w http.ResponseWriter, stage string, err erro
 		return
 	}
 	if recorder, ok := w.(*supportResponseRecorder); ok {
-		recorder.storageObservationDetail = "stage=" + stage + " reason=" + reason
+		// Fixed labels only: the step name and numeric OS code, never a path,
+		// share name, credential, or OS message text.
+		step, code := storageavailability.ResolutionStep(err)
+		recorder.storageObservationDetail = "stage=" + stage + " reason=" + reason +
+			" step=" + step + " code=" + strconv.FormatInt(code, 10)
 	}
 }
 

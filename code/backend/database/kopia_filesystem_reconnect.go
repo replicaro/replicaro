@@ -77,9 +77,11 @@ func ReserveKopiaFilesystemReconnect(db *sql.DB, repositoryID, priorPath, candid
 	return value, nil
 }
 
-// CommitKopiaConnectionUpdate records that exact staged bytes are active while
-// leaving configured address publication to the repository connection's final
-// transaction. The filesystem alias workflow continues to use its own commit.
+// CommitKopiaConnectionUpdate records that the staged config bytes are active,
+// and leaves publishing the configured address to the repository connection's
+// final transaction. These intents exist only for confirmed connection updates;
+// leftover intents from the retired automatic filesystem-alias workflow are
+// discarded at startup (see Migrate).
 func CommitKopiaConnectionUpdate(db *sql.DB, intent KopiaFilesystemReconnectIntent) error {
 	return updateKopiaFilesystemReconnect(db, intent.RepositoryID, intent.IntentID, "activated", "committed", "", "")
 }
@@ -93,32 +95,6 @@ func SetKopiaFilesystemReconnectStaged(db *sql.DB, repositoryID, intentID, stage
 
 func MarkKopiaFilesystemReconnectActivated(db *sql.DB, repositoryID, intentID string) error {
 	return updateKopiaFilesystemReconnect(db, repositoryID, intentID, "prepared", "activated", "", "")
-}
-
-func CommitKopiaFilesystemReconnect(db *sql.DB, intent KopiaFilesystemReconnectIntent, observedAt time.Time) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var configuredPath string
-	if err := tx.QueryRow(`SELECT location FROM repositories WHERE id=? AND engine='kopia' AND connector='fs'`, intent.RepositoryID).Scan(&configuredPath); err != nil {
-		return err
-	}
-	if err := setResolvedRepositoryPath(tx.Exec, intent.RepositoryID, configuredPath, intent.CandidatePath, observedAt); err != nil {
-		return err
-	}
-	now := time.Now().UTC().Format(time.RFC3339Nano)
-	result, err := tx.Exec(`UPDATE kopia_filesystem_reconnect_intents SET state='committed',error='',updated_at=?
-		WHERE repository_id=? AND intent_id=? AND state='activated' AND staged_config_sha256<>''`,
-		now, intent.RepositoryID, intent.IntentID)
-	if err != nil {
-		return err
-	}
-	if count, _ := result.RowsAffected(); count != 1 {
-		return fmt.Errorf("Kopia filesystem reconnect activation changed before local commit")
-	}
-	return tx.Commit()
 }
 
 func MarkKopiaFilesystemReconnectCleanup(db *sql.DB, repositoryID, intentID string) error {

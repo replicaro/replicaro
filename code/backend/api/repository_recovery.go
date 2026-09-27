@@ -738,10 +738,9 @@ func prepareConnectionProfile(preview ExistingVaultPreview, repo models.Reposito
 	// second local attachment. Keep this check at final admission rather than
 	// relying on the UI or an earlier preview.
 	//
-	// Fresh observations deliberately bound, but cannot eliminate, small races
-	// with another computer using the vault. Replicaro accepts that residual
-	// risk and does not use a server/client coordinator, remote lease, heartbeat,
-	// or CAS protocol.
+	// Re-reading fresh state narrows, but cannot close, small races with another
+	// computer using the vault. That risk is accepted: there is deliberately no
+	// server/client coordinator, remote lease, heartbeat, or CAS protocol.
 	if len(localProfiles) > 1 {
 		return connectionProfileTransition{}, fmt.Errorf("multiple vault profiles are attached to this computer; connection is blocked until the identity conflict is resolved")
 	}
@@ -978,8 +977,9 @@ type connectionIntentPayload struct {
 }
 
 func decodeConnectionIntentPayload(data string, payload *connectionIntentPayload) error {
-	// Durable connection state is executable. Unknown fields must fail closed so
-	// removed workflow branches cannot survive as hidden publication authority.
+	// Stored connection state decides what a retry does next. Reject unknown
+	// fields so state from a workflow branch this code does not know about
+	// cannot trigger a publication.
 	decoder := json.NewDecoder(strings.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(payload); err != nil {
@@ -1131,8 +1131,9 @@ func verifyConnectionProfileBeforeAttachment(ctx context.Context, repo models.Re
 
 func verifyPendingConnectionRoot(ctx context.Context, repo models.Repository, payload connectionIntentPayload, finalRootExpected bool) error {
 	if !engines.IsResticRcloneConnector(repo.Connector) {
-		// This admission closes the published-rclone retry gap without changing
-		// other connectors' established retry flows.
+		// This retry check is for rclone-provider connections, whose config may
+		// already be published when the retry runs. Other connectors keep their
+		// existing retry checks.
 		return nil
 	}
 	rootMayBePublished := payload.PublishRoot || payload.OwnerTransferFromProfileUUID != ""
@@ -1148,10 +1149,10 @@ func verifyPendingConnectionRoot(ctx context.Context, repo models.Repository, pa
 		}
 		return fmt.Errorf("read authoritative vault root for pending connection: %w", err)
 	}
-	// An unregistered import may have reviewed a verified previous root when
-	// canonical was recoverably unavailable. Even if it will publish a changed
-	// care schedule, that exact reviewed fallback can authorize prepublication
-	// work; transition and final roots still require canonical proof.
+	// An unregistered import may have reviewed a verified previous root when the
+	// canonical root was unavailable but recoverable. That reviewed previous root
+	// can still allow the work before publication, even if a changed care
+	// schedule will be published; transition and final roots must be canonical.
 	allowReviewedPrevious := !payload.UpdateExistingVault && payload.ExpectedVaultUUID == "" &&
 		(!rootMayBePublished || !finalRootExpected)
 	if readback.Generation != "canonical" &&
@@ -1784,9 +1785,9 @@ func previewExistingVault(ctx context.Context, input ExistingVaultStorage) (Exis
 			return ExistingVaultPreview{VaultUUID: parsed.VaultUUID}, temporary, nil
 		}
 		if saved, savedErr := database.GetRepository(previewDB(ctx), parsed.VaultUUID); savedErr == nil {
-			// Registration uniqueness is not update authority. Discovery may expose
-			// the registered row, but the final request must explicitly confirm an
-			// update and repeat every proof beneath this UUID's existing lock.
+			// A unique registration does not by itself allow an update. Discovery may
+			// return the registered row, but the final request must explicitly confirm
+			// the update and repeat every check under this UUID's existing lock.
 			if saved.Engine != parsed.Repository.Engine || saved.NativeRepositoryID != parsed.Repository.NativeRepositoryID {
 				return ExistingVaultPreview{}, models.Repository{}, fmt.Errorf("the registered vault identity does not match the protected vault root")
 			}
@@ -2078,9 +2079,9 @@ func finishExistingVaultPreview(ctx context.Context, input ExistingVaultStorage,
 		})
 		localConflicts = map[string]string{}
 	}
-	// Kopia policy is intentionally not connection-review authority. The single
-	// post-attachment reconciler owns native mutation and exact readback while
-	// dirty/not-ready state keeps backup and managed retention fail-closed.
+	// Kopia policy is deliberately not part of the connection review. The single
+	// post-attachment reconciler applies it and reads it back, and until then the
+	// dirty/not-ready state blocks backup and managed retention.
 	protectedReview := []byte(rootSHA256 + recoverySHA256(selectedProfileData))
 	// Hash the original attachment/preferences review independently of the
 	// selected record. Refinement carries this comparison evidence and bounded
@@ -2889,14 +2890,13 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 			jobs = importedSourceJobs(repo, preview.ImportedSources)
 		}
 		if preview.Profile != nil && !transition.CreateOnly && !updatingExisting {
-			// Choosing a profile is the recovery authorization boundary. Every job
-			// in that profile is restored disabled so connection cannot silently
-			// split the portable definition through a partial selection.
-			// A Join transition is create-only and must not inherit the discovery
-			// scan's sole-profile convenience default. Automatic sole-profile
-			// connectors may omit request selection fields, so the admitted
-			// transition—not raw request shape—controls this boundary. Per-job
-			// request selections must not be reintroduced here.
+			// Choosing a profile is what authorizes the recovery. Every job in that
+			// profile is restored disabled, so a partial selection cannot silently
+			// split the portable definition. A Join transition is create-only and must
+			// not pick up the discovery scan's default of selecting the only profile.
+			// Connectors that auto-select their only profile may omit the selection
+			// fields, so the validated transition, not the raw request shape, decides
+			// this. Do not reintroduce per-job request selections here.
 			for _, saved := range preview.Profile.Jobs {
 				job := models.BackupJob{ID: saved.JobUUID, Name: saved.Name, Source: saved.Source, Schedule: saved.Schedule,
 					Retention: saved.Retention, RetentionHourly: saved.RetentionHourly,
@@ -3114,9 +3114,9 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 		}
 
 		publicationOperationID := uuid.NewString()
-		// Exact publication readback and expected hashes remain the boundary. The
-		// connection flow does not add a generalized remote lease, heartbeat, or
-		// coordination protocol for the narrow cross-client race.
+		// Publication readback against the expected hashes is the safeguard here. The
+		// connection flow deliberately adds no remote lease, heartbeat, or
+		// coordination protocol for the small race with another computer.
 		payload := connectionIntentPayload{Repository: safeConnectionRepository(repo), ExpectedVaultUUID: strings.TrimSpace(req.ExpectedVaultUUID), Jobs: jobs,
 			LocalJobAdmissions: localJobAdmissions,
 			JobStorageBindings: jobStorageBindings,

@@ -118,10 +118,10 @@ func readPasswordRotationFileBounded(path string, limit int64) ([]byte, error) {
 }
 
 func syncPasswordRotationDirectory(path string) error {
-	// Windows has no supported directory equivalent of fsync. Every staged
-	// file is flushed before its directory publication reaches this boundary;
-	// retain the exact non-reparse directory check without treating the native
-	// ERROR_ACCESS_DENIED from FlushFileBuffers on a directory as data loss.
+	// Windows has no supported directory fsync: FlushFileBuffers on a directory
+	// fails with ERROR_ACCESS_DENIED, which does not indicate data loss. Every
+	// staged file is flushed before its directory is published, so this only
+	// rechecks that the path is still a non-reparse directory; keep that check.
 	if err := validatePasswordRotationDirectory(path); err != nil {
 		return err
 	}

@@ -189,9 +189,9 @@ func readRcloneProviderConfigReader(
 			known = known || field == key
 		}
 		if !known {
-			// Rclone owns native additions. Replicaro observes only the identity
-			// and credential fields it already needs and ignores every other
-			// field without admitting, repairing, or rewriting it.
+			// Rclone may add fields of its own. Replicaro reads only the identity
+			// and credential fields it needs and ignores every other field,
+			// without validating, repairing, or rewriting it.
 			continue
 		}
 		if _, duplicate := values[key]; duplicate {

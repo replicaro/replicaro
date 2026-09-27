@@ -4,7 +4,8 @@ import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 
 import { getAppUpdateStatus, getEngineInfo, getJobs, openAppUpdateDownload, runJob, skipAppUpdateVersion } from "../services/api";
 import { BackupRunPicker } from "../components/BackupRunPicker";
-import { backupTargetIsActive } from "../services/backupJobs";
+import { backupTargetIsActive, manualRunNotice } from "../services/backupJobs";
+import { jobCurrentSource } from "../jobSourceDisplay";
 import { Icon, Modal, Tooltip, useToast } from "../components/ui";
 import type { AppUpdateStatus, BackupJob, EngineInfo } from "../types";
 
@@ -91,17 +92,17 @@ export default function MainLayout() {
 
     const startBackup = useCallback(async (job: BackupJob, repositoryId?: string) => {
         if (runOwner.current) return;
-        const destination = repositoryId
-            ? job.targets.find((target) => target.repositoryId === repositoryId)?.repositoryName ?? "vault"
-            : job.targets.length === 1 ? job.targets[0].repositoryName : "all destination vaults";
         const owner = { session: runSession.current, generation: ++runGeneration.current };
         runOwner.current = owner;
         const owns = () => runSession.current === owner.session && runGeneration.current === owner.generation && runOwner.current === owner;
         setRunningSelection(repositoryId ?? "all");
         setRunPending(true);
         try {
-            await runJob(job.id, repositoryId);
-            toast("info", `"${job.name}" started for ${destination}`);
+            const result = await runJob(job.id, repositoryId);
+            // Each destination vault is admitted separately, so the notice is
+            // built from the per-vault results rather than from what was asked for.
+            const notice = manualRunNotice(job.name, job.targets, result.results);
+            toast(notice.kind, notice.message);
             if (owns()) { setRunDialog(null); setSelectedJobID(""); }
         } catch (error) {
             if (owns()) toast("error", (error as Error).message);
@@ -205,12 +206,13 @@ export default function MainLayout() {
                 <BackupRunPicker job={selectedJob} busy={runningSelection} onRun={(repositoryId) => void startBackup(selectedJob, repositoryId)} />
             </> : <>
                 <p className="muted modal-intro">{t("ui.layouts.mainlayout.choose.a.backup.job.to.run")}</p>
+                {/* The job's current source is shown: its "Update job source" alias when set, as on the job card. Display only; running a job never sends a source. */}
                 {jobs.length === 0 ? <p className="muted">{t("ui.layouts.mainlayout.create.an.enabled.backup.job.first")}</p> : <div className="job-picker">{jobs.map((job) => {
                     const allActive = job.targets.length > 0 && job.targets.every(backupTargetIsActive);
                     const row = <button type="button" key={job.id} className="job-picker-row" aria-label={!job.enabled ? job.name : undefined} disabled={!job.enabled || Boolean(runningSelection) || allActive} onClick={() => {
                         if (!job.enabled || runOwner.current) return;
                         if (job.targets.length > 1) setSelectedJobID(job.id); else void startBackup(job);
-                    }}><span><strong>{job.name}</strong><span className="mono faint">{displayPath(job.source)} · {t("ui.backup.destinationVaultCount", { count: job.targets.length })}</span></span><Icon name="play" size={14} /></button>;
+                    }}><span><strong>{job.name}</strong><span className="mono faint">{displayPath(jobCurrentSource(job))} · {t("ui.backup.destinationVaultCount", { count: job.targets.length })}</span></span><Icon name="play" size={14} /></button>;
                     return job.enabled ? row : <Tooltip key={job.id} content={t("ui.backup.disabledJobHelp")}><span className="job-picker-disabled-tooltip" tabIndex={0} aria-label={t("ui.backup.disabledNamedJobHelp", { jobName: job.name })}>{row}</span></Tooltip>;
                 })}</div>}
             </>}

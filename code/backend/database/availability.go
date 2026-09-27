@@ -24,7 +24,25 @@ const (
 	AvailabilityReasonIdentityMismatch   = "identity_mismatch"
 	AvailabilityReasonObservationFailed  = "observation_failed"
 	AvailabilityReasonObservationTimeout = "observation_timeout"
+
+	// AvailabilityReasonUnavailableTooLong marks the one failed operation
+	// raised when an enabled job's storage has stayed unavailable for
+	// UnavailableIssueAfter since the first missed scheduled run. It is an
+	// admission result reason only, never a persisted availability reason.
+	AvailabilityReasonUnavailableTooLong = "unavailable_30_days"
 )
+
+// UnavailableIssueAfter is how long a paused scheduled occurrence may wait
+// before the user gets one failed operation (and the ordinary failure
+// notification) about it. Pausing itself sends nothing, so without this a
+// share deleted on the server would look paused forever.
+//
+// The trigger is a missed occurrence of an enabled scheduled backup job, so
+// manual-only jobs and a vault with no enabled scheduled backup job never
+// raise it: the vault's own scheduled checks and maintenance only pause (see
+// scheduler/repository_tasks.go). That is intentional; there is no scheduled
+// run whose absence the user needs to hear about.
+const UnavailableIssueAfter = 30 * 24 * time.Hour
 
 const (
 	AdmissionAdmittedRegular    = "admitted_regular"
@@ -34,18 +52,24 @@ const (
 	AdmissionPolicyNotReady     = "policy_not_ready"
 	AdmissionPaused             = "paused"
 	AdmissionNoPending          = "no_pending"
+	// AdmissionUnavailableIssue queues the one failed operation for storage
+	// that has been unavailable for UnavailableIssueAfter.
+	AdmissionUnavailableIssue = "unavailable_issue"
 )
 
 type StorageAvailabilityObservation struct {
-	State        string
-	ReasonCode   string
-	CheckedAt    time.Time
-	ObservedKey  string
-	ResolvedPath string
-	// ConclusiveFailure is run-local routing only. It lets a genuine storage
-	// validation error create a visible failed attempt through the existing
-	// executor without persisting a new status or retry mechanism.
+	State      string
+	ReasonCode string
+	CheckedAt  time.Time
+	// ConclusiveFailure only steers this run and is never persisted. It lets a real
+	// storage validation error show up as a failed attempt through the normal
+	// executor, with no extra status or retry state.
 	ConclusiveFailure bool
+	// Conversion is set only for an available source whose binding is still
+	// in the legacy format; the admission transaction applies it. Admission
+	// never writes the alias (resolved_source_path): there is no automatic
+	// relocation, and only the user sets the alias.
+	Conversion *SourceBindingConversion
 }
 
 type TargetAvailabilityObservation struct {
@@ -122,25 +146,41 @@ func validateAvailabilityObservation(value StorageAvailabilityObservation, now t
 		if value.ReasonCode != AvailabilityReasonNotChecked &&
 			value.ReasonCode != AvailabilityReasonObservationFailed &&
 			value.ReasonCode != AvailabilityReasonObservationTimeout &&
-			value.ReasonCode != AvailabilityReasonIdentityMismatch {
+			value.ReasonCode != AvailabilityReasonIdentityMismatch &&
+			value.ReasonCode != AvailabilityReasonStorageMissing {
 			return fmt.Errorf("unknown storage availability reason is invalid")
 		}
 	default:
 		return fmt.Errorf("storage availability state is invalid")
 	}
+	// A folder that is missing while its recorded mount point is still
+	// present is a conclusive failure (deleted or moved), so storage_missing
+	// is a valid conclusive reason alongside identity mismatch and observation failure.
 	if value.ConclusiveFailure && (value.State != StorageUnknown ||
 		value.ReasonCode != AvailabilityReasonIdentityMismatch &&
-			value.ReasonCode != AvailabilityReasonObservationFailed) {
+			value.ReasonCode != AvailabilityReasonObservationFailed &&
+			value.ReasonCode != AvailabilityReasonStorageMissing) {
 		return fmt.Errorf("conclusive storage failure classification is invalid")
+	}
+	if value.Conversion != nil && value.State != StorageAvailable {
+		return fmt.Errorf("source binding conversion requires an available observation")
 	}
 	return nil
 }
 
-func validateSourceObservedKey(observation StorageAvailabilityObservation, expected string) error {
-	if observation.State == StorageAvailable && observation.ObservedKey != expected {
-		return fmt.Errorf("available source identity does not match the persisted binding")
+// applySourceObservation applies a source observation to the job row. The only
+// change it can make is the one-time conversion of a legacy binding; it never
+// writes the job's alias.
+func applySourceObservation(tx *sql.Tx, jobID string, source StorageAvailabilityObservation) error {
+	if source.Conversion == nil {
+		return nil
 	}
-	return nil
+	return convertLegacySourceBindingTx(tx, jobID, *source.Conversion)
+}
+
+func unavailableIssueDue(firstDeferredDueAt string, now time.Time) bool {
+	first, err := time.Parse(time.RFC3339Nano, firstDeferredDueAt)
+	return err == nil && !now.Before(first.Add(UnavailableIssueAfter))
 }
 
 func advanceScheduleAfter(schedule string, dueAt, now time.Time) (string, error) {
@@ -264,10 +304,10 @@ func clearPairPending(tx *sql.Tx, jobID, repositoryID string, now time.Time) err
 	return err
 }
 
-// RestorePreNativeUnavailable returns only a scheduled occurrence whose full
-// destination admission conclusively stopped before native backup launch. It
-// reuses the existing coalesced pair state; no retry counter, timer row, or
-// remote coordination is introduced.
+// RestorePreNativeUnavailable puts back a scheduled occurrence only when its
+// full destination check definitely stopped it before the native backup
+// started. It reuses the coalesced pair state; there is no retry counter,
+// timer row, or remote coordination.
 func RestorePreNativeUnavailable(db *sql.DB, operationID, reason string, checkedAt time.Time) error {
 	return restorePreNativeUnavailable(db, operationID, reason, checkedAt, false)
 }
@@ -350,10 +390,113 @@ func restorePreNativeUnavailable(db *sql.DB, operationID, reason string, checked
 	return tx.Commit()
 }
 
-// ConsumeScheduledBackupOccurrence closes restoration only after this process
-// reached the requested native-backup boundary or produced a terminal outcome
-// that is not conclusive pre-native unavailability. Manual operations have no
-// restoration row.
+// ConsumeOverdueUnavailableOccurrence turns a pre-native filesystem pause
+// into the 30-day issue when the paused occurrence has already waited
+// UnavailableIssueAfter. It returns false, changing nothing, when the
+// operation holds no eligible scheduled occurrence, the job is disabled, or
+// the first missed run is newer than that; the caller then restores the
+// occurrence as an ordinary pause.
+//
+// Why this exists: the scheduler raises the 30-day issue only from its own
+// preliminary probe (CoordinateScheduledAdmission). A vault can pass that
+// probe and then time out every time under the vault lock (marker read,
+// protected root, native validation on a hung share), and a source can pass
+// it and then fail the final check at the child boundary. Without this, such
+// an occurrence would be restored silently on every tick and the user would
+// never hear about it.
+//
+// On escalation the occurrence is consumed (same bookkeeping as
+// ConsumeScheduledBackupOccurrence) and the pair's pending state is cleared
+// so the 30-day count restarts. Each job/vault pair escalates on its own,
+// even for a source outage. The scheduler path raises one issue per job for
+// a source outage, but a source pause that shows up only here, on a job with
+// several vaults, can raise one 30-day issue per vault. That needs a source
+// that keeps passing the probe and failing the final check for 30 days, and
+// a duplicate notice then is cheaper than coordinating sibling operations
+// that are already queued or running, so it is accepted.
+func ConsumeOverdueUnavailableOccurrence(db *sql.DB, operationID, reason string, now time.Time, source bool) (bool, error) {
+	if operationID == "" || now.IsZero() {
+		return false, ErrInvalidTargets
+	}
+	now = now.UTC()
+	tx, err := db.Begin()
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var groupID, jobID, repositoryID, firstDue, lastDue, restoreState string
+	var missed int64
+	err = tx.QueryRow(`SELECT group_id,job_id,repository_id,coalesced_missed_count,
+		first_deferred_due_at,last_due_at,restore_state
+		FROM scheduled_operation_restorations WHERE operation_id=?`, operationID).
+		Scan(&groupID, &jobID, &repositoryID, &missed, &firstDue, &lastDue, &restoreState)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil || restoreState != "eligible" {
+		return false, err
+	}
+	savedFirst, _, err := parseRestorationRange(missed, firstDue, lastDue)
+	if err != nil {
+		return false, err
+	}
+	var enabled bool
+	if err := tx.QueryRow(`SELECT enabled FROM backup_jobs WHERE id=?`, jobID).Scan(&enabled); err != nil {
+		return false, err
+	}
+	if !enabled || !unavailableIssueDue(savedFirst.Format(time.RFC3339Nano), now) {
+		return false, nil
+	}
+	if _, err := tx.Exec(`UPDATE scheduled_operation_restorations SET restore_state='started'
+		WHERE operation_id=? AND restore_state='eligible'`, operationID); err != nil {
+		return false, err
+	}
+	if _, err := tx.Exec(`UPDATE scheduled_admission_groups SET any_started=1
+		WHERE id=? AND job_id=?`, groupID, jobID); err != nil {
+		return false, err
+	}
+	stamp := now.Format(time.RFC3339Nano)
+	availabilityColumns := "target_availability=?,target_reason_code=?,target_checked_at=?"
+	if source {
+		availabilityColumns = "source_availability=?,source_reason_code=?,source_checked_at=?"
+	}
+	if _, err := tx.Exec(`UPDATE job_target_schedule_state SET
+		pending_catchup=0,coalesced_missed_count=0,first_deferred_due_at='',`+
+		availabilityColumns+`,updated_at=? WHERE job_id=? AND repository_id=?`,
+		StorageUnavailable, reason, stamp, stamp, jobID, repositoryID); err != nil {
+		return false, err
+	}
+	if err := reconcileScheduledAdmissionGroupsTx(tx, jobID); err != nil {
+		return false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// ScheduledOccurrenceEligible reports whether the operation still holds an
+// eligible scheduled occurrence, i.e. a restore would put it back as a pending
+// catch-up. The runner asks before restoring, because a successful restore
+// can remove the restoration row together with its admission group. It uses
+// the answer to skip the failure notification for a pause: pauses are shown
+// as "source unavailable" / "vault unavailable" status, and the user is only
+// notified once storage has been unavailable for UnavailableIssueAfter.
+func ScheduledOccurrenceEligible(db *sql.DB, operationID string) (bool, error) {
+	var state string
+	err := db.QueryRow(`SELECT restore_state FROM scheduled_operation_restorations WHERE operation_id=?`,
+		operationID).Scan(&state)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	return state == "eligible", err
+}
+
+// ConsumeScheduledBackupOccurrence marks the occurrence's restoration row as
+// started (no longer restorable) only after this process reached the point of
+// launching the requested native backup, or the
+// operation ended for any reason other than storage being confirmed unavailable
+// before that backup. Manual operations have no restoration row.
 func ConsumeScheduledBackupOccurrence(db *sql.DB, operationID string) error {
 	if operationID == "" {
 		return ErrInvalidTargets
@@ -398,6 +541,17 @@ func queueAdmittedPair(
 	if err := requireKopiaPolicyReady(tx, repositoryID); err != nil {
 		return "", err
 	}
+	return queueOperationRow(tx, jobID, jobName, repositoryID, repositoryName, engine, now)
+}
+
+// queueOperationRow inserts one queued backup operation. The unavailable-too-
+// long issue uses it directly because that operation never reaches native
+// work, so Kopia policy readiness is irrelevant to it.
+func queueOperationRow(
+	tx *sql.Tx,
+	jobID, jobName, repositoryID, repositoryName, engine string,
+	now time.Time,
+) (string, error) {
 	id := uuid.NewString()
 	title := "Backup: " + jobName + " → " + repositoryName
 	if _, err := tx.Exec(`INSERT INTO operations
@@ -444,25 +598,15 @@ func CoordinateScheduledAdmission(db *sql.DB, request ScheduledAdmissionRequest)
 	if err := requireJobConnectionUnreserved(tx, request.JobID); err != nil {
 		return nil, err
 	}
-	var jobName, source, sourceKey, schedule, nextRun, lastRun string
+	var jobName, source, schedule, nextRun, lastRun string
 	var enabled bool
-	if err := tx.QueryRow(`SELECT name,source,source_storage_key,schedule,
+	if err := tx.QueryRow(`SELECT name,source,schedule,
 		COALESCE(next_run,''),COALESCE(last_run,''),enabled
 		FROM backup_jobs WHERE id=?`, request.JobID).Scan(
-		&jobName, &source, &sourceKey, &schedule, &nextRun, &lastRun, &enabled); err != nil {
+		&jobName, &source, &schedule, &nextRun, &lastRun, &enabled); err != nil {
 		return nil, err
 	}
-	// Source aliases remain identity-bearing local state. Preserve the database
-	// boundary check even though destination observations deliberately no longer
-	// claim that an address-derived storage key proves a vault.
-	if err := validateSourceObservedKey(request.Source, sourceKey); err != nil {
-		return nil, err
-	}
-	resolvedSource := request.Source.ResolvedPath
-	if request.Source.State != StorageAvailable {
-		resolvedSource = source
-	}
-	if err := setResolvedSourcePathTx(tx, request.JobID, source, resolvedSource, request.Source.CheckedAt); err != nil {
+	if err := applySourceObservation(tx, request.JobID, request.Source); err != nil {
 		return nil, err
 	}
 	targets, err := loadScheduledTargets(tx, request.JobID)
@@ -487,8 +631,9 @@ func CoordinateScheduledAdmission(db *sql.DB, request ScheduledAdmissionRequest)
 		if err := validateAvailabilityObservation(observation, now); err != nil {
 			return nil, err
 		}
-		// Preliminary target observations never publish aliases. The once-per-
-		// operation repository proof commits only a fully verified runtime path.
+		// Preliminary target observations only record availability. A vault
+		// always runs at its registered location; destination proof happens
+		// later, once per operation, under the vault lock.
 		if err := updatePairObservations(tx, request.JobID, target.repositoryID, request.Source, observation, now); err != nil {
 			return nil, err
 		}
@@ -544,6 +689,82 @@ func CoordinateScheduledAdmission(db *sql.DB, request ScheduledAdmissionRequest)
 	results := make([]TargetAdmissionResult, 0, len(resultTargets))
 	admitted := false
 	groupID := ""
+	pairBusy := func(repositoryID string) (bool, error) {
+		var active int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM operations
+			WHERE job_id=? AND repository_id=? AND status IN ('queued','running')`,
+			request.JobID, repositoryID).Scan(&active); err != nil {
+			return false, err
+		}
+		return active != 0, nil
+	}
+	sourceOutage := request.Source.State != StorageAvailable && !request.Source.ConclusiveFailure
+	// A source outage is reported once per job, carried by the first idle
+	// pair whose pending occurrence has waited UnavailableIssueAfter. Every
+	// overdue pending pair of the job is consumed with it so the count
+	// restarts for all of them. If every overdue pair is busy, nothing is
+	// raised or consumed on this tick.
+	sourceIssueCarrier := ""
+	if enabled && sourceOutage {
+		for _, target := range resultTargets {
+			if target.pending == 0 || !unavailableIssueDue(target.firstDeferredDueAt, now) {
+				continue
+			}
+			busy, err := pairBusy(target.repositoryID)
+			if err != nil {
+				return nil, err
+			}
+			if !busy {
+				sourceIssueCarrier = target.repositoryID
+				break
+			}
+		}
+	}
+	queueRestorable := func(target scheduledTargetRow, requirePolicy bool) (string, error) {
+		var operationID string
+		var err error
+		if requirePolicy {
+			operationID, err = queueAdmittedPair(tx, request.JobID, jobName, source,
+				target.repositoryID, target.repositoryName, target.engine, now)
+		} else {
+			operationID, err = queueOperationRow(tx, request.JobID, jobName,
+				target.repositoryID, target.repositoryName, target.engine, now)
+		}
+		if err != nil {
+			return "", err
+		}
+		if groupID == "" {
+			groupID = uuid.NewString()
+			if _, err := tx.Exec(`INSERT INTO scheduled_admission_groups
+				(id,job_id,generation,admitted_at,previous_job_last_run)
+				SELECT ?,?,COALESCE(MAX(generation),0)+1,?,?
+				FROM scheduled_admission_groups WHERE job_id=?`,
+				groupID, request.JobID, now.Format(time.RFC3339Nano), lastRun, request.JobID); err != nil {
+				return "", err
+			}
+		}
+		if target.missed <= 0 || target.firstDeferredDueAt == "" || target.lastDueAt == "" {
+			return "", fmt.Errorf("scheduled admission restoration state is invalid")
+		}
+		if _, _, err := parseRestorationRange(
+			target.missed, target.firstDeferredDueAt, target.lastDueAt,
+		); err != nil {
+			return "", err
+		}
+		if _, err := tx.Exec(`INSERT INTO scheduled_operation_restorations
+			(operation_id,group_id,job_id,repository_id,coalesced_missed_count,
+			 first_deferred_due_at,last_due_at)
+			VALUES(?,?,?,?,?,?,?)`,
+			operationID, groupID, request.JobID, target.repositoryID, target.missed,
+			target.firstDeferredDueAt, target.lastDueAt); err != nil {
+			return "", err
+		}
+		if err := clearPairPending(tx, request.JobID, target.repositoryID, now); err != nil {
+			return "", err
+		}
+		admitted = true
+		return operationID, nil
+	}
 	for _, target := range resultTargets {
 		observation := targetObservations[target.repositoryID]
 		result := TargetAdmissionResult{RepositoryID: target.repositoryID}
@@ -557,25 +778,58 @@ func CoordinateScheduledAdmission(db *sql.DB, request ScheduledAdmissionRequest)
 			results = append(results, result)
 			continue
 		}
-		if request.Source.State != StorageAvailable && !request.Source.ConclusiveFailure {
+		if sourceOutage {
 			result.Status = AdmissionStorageUnavailable
 			result.ReasonCode = request.Source.ReasonCode
+			if sourceIssueCarrier != "" && unavailableIssueDue(target.firstDeferredDueAt, now) {
+				if target.repositoryID == sourceIssueCarrier {
+					// Queued through the ordinary operation path so the failure,
+					// its log, Issues entry, and notification come from the same
+					// code as any failed backup. The executor fails it before
+					// admission, hooks, or native work.
+					operationID, err := queueRestorable(target, false)
+					if err != nil {
+						return nil, err
+					}
+					result.Status = AdmissionUnavailableIssue
+					result.OperationID = operationID
+					result.RequiresSourceFailureCheck = true
+					result.ReasonCode = AvailabilityReasonUnavailableTooLong
+				} else if err := clearPairPending(tx, request.JobID, target.repositoryID, now); err != nil {
+					return nil, err
+				}
+			}
 			results = append(results, result)
 			continue
 		}
 		if observation.State != StorageAvailable && !request.Source.ConclusiveFailure && !observation.ConclusiveFailure {
 			result.Status = AdmissionStorageUnavailable
 			result.ReasonCode = observation.ReasonCode
+			if unavailableIssueDue(target.firstDeferredDueAt, now) {
+				// A vault outage is reported per job and vault.
+				busy, err := pairBusy(target.repositoryID)
+				if err != nil {
+					return nil, err
+				}
+				if !busy {
+					operationID, err := queueRestorable(target, false)
+					if err != nil {
+						return nil, err
+					}
+					result.Status = AdmissionUnavailableIssue
+					result.OperationID = operationID
+					result.RequiresTargetFailureCheck = true
+					result.ReasonCode = AvailabilityReasonUnavailableTooLong
+				}
+			}
 			results = append(results, result)
 			continue
 		}
-		var active int
-		if err := tx.QueryRow(`SELECT COUNT(*) FROM operations
-			WHERE job_id=? AND repository_id=? AND status IN ('queued','running')`,
-			request.JobID, target.repositoryID).Scan(&active); err != nil {
+		busy, err := pairBusy(target.repositoryID)
+		if err != nil {
 			return nil, err
 		}
-		if active != 0 {
+		if busy {
 			result.Status = AdmissionBusy
 			results = append(results, result)
 			continue
@@ -589,38 +843,8 @@ func CoordinateScheduledAdmission(db *sql.DB, request ScheduledAdmissionRequest)
 			}
 			return nil, err
 		}
-		operationID, err := queueAdmittedPair(tx, request.JobID, jobName, source,
-			target.repositoryID, target.repositoryName, target.engine, now)
+		operationID, err := queueRestorable(target, true)
 		if err != nil {
-			return nil, err
-		}
-		if groupID == "" {
-			groupID = uuid.NewString()
-			if _, err := tx.Exec(`INSERT INTO scheduled_admission_groups
-				(id,job_id,generation,admitted_at,previous_job_last_run)
-				SELECT ?,?,COALESCE(MAX(generation),0)+1,?,?
-				FROM scheduled_admission_groups WHERE job_id=?`,
-				groupID, request.JobID, now.Format(time.RFC3339Nano), lastRun, request.JobID); err != nil {
-				return nil, err
-			}
-		}
-		if target.missed <= 0 || target.firstDeferredDueAt == "" || target.lastDueAt == "" {
-			return nil, fmt.Errorf("scheduled admission restoration state is invalid")
-		}
-		if _, _, err := parseRestorationRange(
-			target.missed, target.firstDeferredDueAt, target.lastDueAt,
-		); err != nil {
-			return nil, err
-		}
-		if _, err := tx.Exec(`INSERT INTO scheduled_operation_restorations
-			(operation_id,group_id,job_id,repository_id,coalesced_missed_count,
-			 first_deferred_due_at,last_due_at)
-			VALUES(?,?,?,?,?,?,?)`,
-			operationID, groupID, request.JobID, target.repositoryID, target.missed,
-			target.firstDeferredDueAt, target.lastDueAt); err != nil {
-			return nil, err
-		}
-		if err := clearPairPending(tx, request.JobID, target.repositoryID, now); err != nil {
 			return nil, err
 		}
 		result.OperationID = operationID
@@ -636,7 +860,6 @@ func CoordinateScheduledAdmission(db *sql.DB, request ScheduledAdmissionRequest)
 		} else {
 			result.Status = AdmissionAdmittedCatchUp
 		}
-		admitted = true
 		results = append(results, result)
 	}
 	if admitted {
@@ -983,10 +1206,10 @@ func AdmitManualBackupTargets(db *sql.DB, request ManualAdmissionRequest) ([]Tar
 	if err := requireJobConnectionUnreserved(tx, request.JobID); err != nil {
 		return nil, err
 	}
-	var jobName, source, sourceKey, sourceBindingState string
-	if err := tx.QueryRow(`SELECT name,source,source_storage_key,source_binding_state
+	var jobName, source, sourceBindingState string
+	if err := tx.QueryRow(`SELECT name,source,source_binding_state
 		FROM backup_jobs WHERE id=?`, request.JobID).Scan(
-		&jobName, &source, &sourceKey, &sourceBindingState); err != nil {
+		&jobName, &source, &sourceBindingState); err != nil {
 		return nil, err
 	}
 	if normalizedJobSourceBindingState(sourceBindingState) == "unbound_imported" {
@@ -995,18 +1218,11 @@ func AdmitManualBackupTargets(db *sql.DB, request ManualAdmissionRequest) ([]Tar
 	if err := validateAvailabilityObservation(request.Source, now); err != nil {
 		return nil, err
 	}
-	if err := validateSourceObservedKey(request.Source, sourceKey); err != nil {
-		return nil, err
-	}
 	selected, err := observationMap(request.Targets)
 	if err != nil {
 		return nil, err
 	}
-	resolvedSource := request.Source.ResolvedPath
-	if request.Source.State != StorageAvailable {
-		resolvedSource = source
-	}
-	if err := setResolvedSourcePathTx(tx, request.JobID, source, resolvedSource, request.Source.CheckedAt); err != nil {
+	if err := applySourceObservation(tx, request.JobID, request.Source); err != nil {
 		return nil, err
 	}
 	targets, err := loadScheduledTargets(tx, request.JobID)
@@ -1032,7 +1248,8 @@ func AdmitManualBackupTargets(db *sql.DB, request ManualAdmissionRequest) ([]Tar
 		if err := validateAvailabilityObservation(observation, now); err != nil {
 			return nil, err
 		}
-		// Full admission owns destination proof and verified alias publication.
+		// Destination proof happens later, in full admission under the vault
+		// lock; this only records the preliminary availability observation.
 		if err := updatePairObservations(tx, request.JobID, repositoryID, request.Source, observation, now); err != nil {
 			return nil, err
 		}

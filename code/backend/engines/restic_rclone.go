@@ -164,10 +164,10 @@ func resticCommandFailure(nativeErr error, processStarted bool) error {
 		if nativeCause == nil {
 			nativeErr = nil
 		} else {
-			// Adapter-owned native classifications wrapped around the command
-			// carrier must survive separation from a simultaneous capture failure.
-			// Otherwise callers lose the established safe guidance even though the
-			// requested native failure itself remains conclusive.
+			// Keep the adapter's classification (such as the cold-storage guidance)
+			// when the native error is split from an output-capture failure that
+			// happened at the same time. Otherwise callers lose the user guidance
+			// even though the Restic command failure itself is still known.
 			if errors.Is(nativeErr, ErrColdStorageArchivedObject) {
 				nativeCause = errors.Join(ErrColdStorageArchivedObject, nativeCause)
 			}
@@ -297,10 +297,10 @@ func encodeResticRcloneProgramOption(program string) (string, error) {
 }
 
 func (session *resticRcloneSession) close() error {
-	// Rclone exclusively owns its opaque persisted config, including token
-	// refresh. Closing reopens the exact local path after native access and removes
-	// request-local resources. These failures are follow-up cleanup truth; neither
-	// changes Restic's result nor requires another provider/account probe.
+	// Rclone alone manages its persisted config, including token refresh.
+	// Closing revalidates the local config path after Restic has used it and
+	// removes per-request resources. Failures here are reported as follow-up
+	// cleanup errors; they don't change Restic's result or need another provider probe.
 	return errors.Join(
 		session.binding.Revalidate(context.WithoutCancel(session.ctx)),
 		session.cleanup(), session.binding.Close(),

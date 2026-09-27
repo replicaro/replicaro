@@ -14,10 +14,10 @@ import (
 	"github.com/local/replicaro/models"
 )
 
-// BackupSourceReadFailure qualifies aggregate presentation only. The wrapped
-// requested operation remains failed, including its original native exit cause.
-// Keeping those facts separate prevents a saved, incomplete snapshot from
-// admitting retention or advancing successful-backup health and statistics.
+// BackupSourceReadFailure only changes how the result is presented. The wrapped
+// requested operation is still a failure, with its original native exit cause.
+// Keeping the two separate means a saved but incomplete snapshot cannot trigger
+// retention or count toward successful-backup health and statistics.
 type BackupSourceReadFailure struct {
 	SnapshotID string
 	Err        error
@@ -92,7 +92,11 @@ func resticPartialSnapshot(capture *command.CapturedOutput, runErr error) (model
 	return snapshot, scanner.Err() == nil && summaries == 1 && snapshot.ID != ""
 }
 
-func kopiaPartialSnapshot(capture *command.CapturedOutput, runErr error) (models.Snapshot, bool) {
+// readPath is the exact folder passed to "kopia snapshot create". It differs
+// from the recorded snapshot source when the job has an "Update job source"
+// alias: Kopia then reads the alias while --override-source records the
+// job's immutable source.
+func kopiaPartialSnapshot(capture *command.CapturedOutput, runErr error, readPath string) (models.Snapshot, bool) {
 	if capture == nil || !backupExit(runErr, 1) {
 		return models.Snapshot{}, false
 	}
@@ -100,8 +104,10 @@ func kopiaPartialSnapshot(capture *command.CapturedOutput, runErr error) (models
 	if err != nil {
 		return models.Snapshot{}, false
 	}
-	// This is one bounded result record, never an inventory or a substitute for
-	// native repository verification. Oversized/ambiguous evidence stays failed.
+	// Read at most 8 MiB of stdout as a single snapshot result record. This is not
+	// a repository listing and never a substitute for native repository
+	// verification. Output that is too large or ambiguous leaves the backup
+	// reported as failed.
 	data, err := io.ReadAll(io.LimitReader(reader, 8*1024*1024+1))
 	_ = reader.Close()
 	if err != nil || len(data) > 8*1024*1024 {
@@ -137,7 +143,8 @@ func kopiaPartialSnapshot(capture *command.CapturedOutput, runErr error) (models
 		return models.Snapshot{}, false
 	}
 	for _, item := range row.RootEntry.Summary.Errors {
-		if item.Path == "" || !kopiaSourceReadError(item.Error) {
+		if item.Path == "" || !(kopiaSourceReadError(item.Error) || kopiaSourcePathError(item.Error, snapshot.Source, item.Path) ||
+			(readPath != "" && readPath != snapshot.Source && kopiaSourcePathError(item.Error, readPath, item.Path))) {
 			return models.Snapshot{}, false
 		}
 	}
@@ -168,6 +175,72 @@ func kopiaSourceReadError(message string) bool {
 	return strings.HasPrefix(message, "unable to open file: unable to open local file: ") ||
 		strings.HasPrefix(message, "cannot create iterator: unable to read directory: ") ||
 		strings.HasPrefix(message, "unable to read symlink: ")
+}
+
+// The prefixes above were observed from pinned Kopia on Linux, where they wrap
+// file-open, directory-read, and symlink-read failures. Windows source reads
+// (and Linux reads that fail after a file opened) surface instead as raw Go
+// *os.PathError text, "<op> <absolute path>: <message>", for example "read
+// \\server\share\a.mp4: ..." or "GetFileInformationByHandleEx
+// \\server\share\dir: ...". That shape alone proves nothing, because
+// repository and object-writer failures can carry path errors too. It
+// qualifies only when the absolute path is exactly the snapshot's native
+// source root joined with the manifest item's own relative path, which ties
+// the failure to reading that source item rather than to writing the
+// repository.
+//
+// For a job with an "Update job source" alias the recorded source (set by
+// --override-source) is the immutable source, but Kopia actually opened
+// files under the alias, so its path errors name the alias. The caller
+// therefore also accepts the exact folder it passed to Kopia as the root.
+// That is the same proof, just against the root Kopia really read; every
+// other condition (exact join, one path per item, count, final line) is
+// unchanged. Do not widen this to prefix or case-insensitive matching.
+func kopiaSourcePathError(message, sourceRoot, itemPath string) bool {
+	op, rest, found := strings.Cut(message, " ")
+	if !found || op == "" || strings.ContainsAny(op, ": \t\r\n\\/") {
+		return false
+	}
+	windows := kopiaWindowsSourceRoot(sourceRoot)
+	separator := "/"
+	root := sourceRoot
+	if windows {
+		separator = `\`
+		root = kopiaNormalizeWindowsPath(root)
+		itemPath = strings.ReplaceAll(itemPath, "/", separator)
+		rest = kopiaNormalizeWindowsPath(rest)
+	} else if !strings.HasPrefix(root, "/") {
+		return false
+	}
+	for _, segment := range strings.Split(itemPath, separator) {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	base := strings.TrimRight(root, separator)
+	if windows && base == "" {
+		return false
+	}
+	prefix := base + separator + itemPath + ": "
+	return strings.HasPrefix(rest, prefix) && strings.TrimSpace(rest[len(prefix):]) != ""
+}
+
+func kopiaWindowsSourceRoot(root string) bool {
+	if strings.HasPrefix(root, `\\`) {
+		return true
+	}
+	return len(root) >= 3 && root[1] == ':' && (root[2] == '\\' || root[2] == '/') &&
+		((root[0] >= 'A' && root[0] <= 'Z') || (root[0] >= 'a' && root[0] <= 'z'))
+}
+
+// Windows may spell one path with either separator and with or without the
+// extended-length prefix (\\?\UNC\server\share versus \\server\share).
+func kopiaNormalizeWindowsPath(path string) string {
+	path = strings.ReplaceAll(path, "/", `\`)
+	if strings.HasPrefix(path, `\\?\UNC\`) {
+		return `\\` + path[len(`\\?\UNC\`):]
+	}
+	return strings.TrimPrefix(path, `\\?\`)
 }
 
 func canonicalKopiaPartialID(id string) bool {

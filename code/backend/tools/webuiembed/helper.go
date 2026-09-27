@@ -36,7 +36,7 @@ func prepareHelper(target, outputRoot string) error {
 	if _, err := os.Lstat(out); !os.IsNotExist(err) {
 		return fmt.Errorf("helper preparation requires a fresh output root: %s", out)
 	}
-	// Explicit target verification precedes output creation and native-byte use.
+	// Verify the selected target before creating output or using native bytes.
 	verify := exec.Command("go", "run", "-mod=readonly", "./tools/targetverify", "--target", target)
 	verify.Stdout, verify.Stderr = os.Stdout, os.Stderr
 	if err := verify.Run(); err != nil {

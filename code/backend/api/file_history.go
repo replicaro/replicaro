@@ -51,9 +51,10 @@ func visibleNativeRestoreSnapshot(ctx context.Context, db *sql.DB, repo models.R
 }
 
 func visibleCachedRestoreSnapshots(ctx context.Context, db *sql.DB, repo models.Repository, authority database.MetadataReadAuthority, snapshotIDs []string) (map[string]models.Snapshot, error) {
-	// Restore Browse is intentionally snapshot-scoped: a ready snapshot remains
+	// Restore Browse deliberately works per snapshot: a ready snapshot stays
 	// usable while another snapshot is indexing or the whole-vault generation is
-	// dirty. Actual restore still performs its fresh locked authoritative checks.
+	// dirty. The restore itself still re-checks against fresh data under the
+	// vault lock.
 	knownJobs, err := database.JobIDsForRepository(db, repo.ID)
 	if err != nil {
 		return nil, err
@@ -161,10 +162,10 @@ func fileSearch(writerDB, readDB *sql.DB, w http.ResponseWriter, r *http.Request
 		badRequest(w, err.Error())
 		return
 	}
-	// This authoritative read and the following coherent cache transaction are
-	// the request's complete database handshake. A later main mutation linearizes
-	// after this read and is gated on the next request; no second main read is
-	// needed to make this response truthful.
+	// The authority read at the top of this handler and the cache transaction
+	// below are all the database work this request does. A main-database change
+	// committed after that read is ordered after it and is picked up by the next
+	// request, so this response needs no second main read to be correct.
 	results, revision, state, err := database.SearchReadyMetadataFilesPageForAuthority(
 		r.Context(), readDB, authority, query, metadataPageSize+1, offset, expectedRevision,
 	)
@@ -624,9 +625,10 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 			engines.RequestedOperationOutcome(restoreErr)
 		if itemIndex == len(normalized)-1 || operationCtx.Err() != nil ||
 			stageKnown && operationStatus == engines.RequestedOperationInterrupted {
-			// The last requested restore child has returned, or cancellation has
-			// already made every later selection ineligible. Close before per-item
-			// bookkeeping so a late request cannot rewrite established native truth.
+			// The last requested restore child has returned, or cancellation means no
+			// later selection will run. Close the cancel gate before per-item
+			// bookkeeping so a late cancel request cannot change results the engine has
+			// already reported.
 			closeCancelGate()
 		}
 		result := RestoreSelectionItemResult{

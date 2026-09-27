@@ -15,9 +15,10 @@ const vaultProgressHeader = "X-Replicaro-Vault-Progress"
 type vaultProgressKey struct{}
 type vaultProgressSink func(kind, stream, message string)
 
-// Progress is request-scoped presentation. The existing synchronous handlers
-// still own admission, durable intents, locks, native results, and failure
-// recovery; disconnecting this stream never creates a second job authority.
+// Progress is display-only and scoped to one request. The synchronous
+// handlers still own admission checks, durable intents, locks, native
+// results, and failure recovery; closing this stream never hands the job to
+// anything else.
 func reportVaultProgress(ctx context.Context, message string) {
 	if sink, ok := ctx.Value(vaultProgressKey{}).(vaultProgressSink); ok {
 		sink("stage", "", message)
@@ -147,8 +148,9 @@ func withVaultProgress(next http.Handler) http.Handler {
 		}
 		ctx := context.WithValue(r.Context(), vaultProgressKey{}, vaultProgressSink(writeEvent))
 		ctx = command.ContextWithLiveOutput(ctx, func(stream, output string) {
-			// Native adapters enable this observer only at admitted ordinary
-			// command boundaries; private probes and authorization stay opaque.
+			// Native adapters turn this observer on only for normal engine commands that
+			// have passed admission; output from private probes and authorization is
+			// never streamed.
 			writeEvent("native", stream, output)
 		})
 		response := &vaultProgressResponse{header: make(http.Header)}

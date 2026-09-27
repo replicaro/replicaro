@@ -435,8 +435,8 @@ func (e *kopiaEngine) validateRepository(ctx context.Context, repo models.Reposi
 	return output, err
 }
 func (e *kopiaEngine) Create(ctx context.Context, repo models.Repository) (output string, err error) {
-	// The explicit storage-create boundary is safe for ordinary native output.
-	// Later client and policy control commands are separate private work.
+	// Only the native storage-create command streams live output to the user.
+	// The client and policy commands that follow are internal setup and do not.
 	repo = normalizedStorageRepository(repo, KopiaID)
 	args, input, err := kopiaStorageInvocation(repo, "create")
 	if err != nil {
@@ -523,6 +523,19 @@ func (e *kopiaEngine) Backup(ctx context.Context, repo models.Repository, source
 		}
 		args = append(args, "--override-source", options.OwnerJobID+"@replicaro:"+logicalSource)
 	}
+	if options.FullSourceRead {
+		// Kopia compares each file with the previous snapshots of the same
+		// SourceInfo and reuses the stored content when name, size, mtime, mode
+		// and owner match. With --override-source that SourceInfo still points
+		// at snapshots of the previous folder after Update job source, or at
+		// snapshots of another folder in a vault that already held this job's
+		// history when it was added or re-attached, so a file whose metadata
+		// happens to match would be recorded with that folder's bytes. Hashing
+		// 100% of the files for this snapshot makes it reflect the folder
+		// actually read; later snapshots compare against it and are correct
+		// again. Content is still deduplicated, nothing is stored twice.
+		args = append(args, "--force-hash=100")
+	}
 	if options.OwnerProfileID != "" && options.OwnerJobID != "" {
 		for _, tag := range backupPresentationTags(repo) {
 			args = append(args, "--tags", tag)
@@ -537,7 +550,7 @@ func (e *kopiaEngine) Backup(ctx context.Context, repo models.Repository, source
 		defer capture.Close()
 	}
 	if runErr != nil {
-		if partial, confirmed := kopiaPartialSnapshot(capture, runErr); confirmed {
+		if partial, confirmed := kopiaPartialSnapshot(capture, runErr, source); confirmed {
 			return partial, out, &BackupSourceReadFailure{SnapshotID: partial.ID, Err: runErr}
 		}
 		return models.Snapshot{}, out, runErr
@@ -741,7 +754,9 @@ func (e *kopiaEngine) listPath(ctx context.Context, repo models.Repository, id, 
 
 type kopiaCapturedCommandRunner func(context.Context, models.Repository, []string, time.Duration) (*command.CapturedOutput, string, error)
 
-// Bound the returned context across a traversal; native capture/publication is unchanged.
+// appendKopiaIndexDiagnostic keeps the diagnostic text collected across a
+// traversal under 256 KiB, dropping the oldest text first. The native commands
+// and their captured output are not affected.
 func appendKopiaIndexDiagnostic(previous, next string) string {
 	const limit = 256 << 10
 	const omitted = "\n[earlier indexing diagnostics omitted]\n"
@@ -1484,14 +1499,30 @@ func validateKopiaBinding(repo models.Repository, output string) error {
 	if err != nil {
 		return err
 	}
-	if expected.Connector == "fs" && actual.Connector == "fs" {
-		expected.Location, err = vaultidentity.CanonicalLocation("fs", expected.Location)
-		if err != nil {
-			return err
-		}
-		actual.Location, err = vaultidentity.CanonicalLocation("fs", actual.Location)
-	}
-	if err != nil || actual != expected {
+	// Filesystem paths are compared lexically. Both sides have already been
+	// through storageidentity.NormalizeConfiguredPath in ResolveEffectiveAddress,
+	// and kopiaStorageArgs passes the saved (already normalized) location as
+	// --path, which Kopia records as given, so a matching config reports the
+	// identical string.
+	//
+	// This deliberately does not use vaultidentity.CanonicalLocation, which
+	// resolves links (and on macOS reads parent directories) on the vault
+	// share. The check runs in-process with no deadline on every
+	// ensureKopiaRepository, Info, and reconnect status readback, so a hung NFS
+	// or SMB mount would park it in the kernel indefinitely (inside
+	// ensureKopiaRepository that also means holding the vault's Kopia
+	// initialization lock). Whether the vault folder is reachable is decided
+	// before this by the out-of-process storage helper, where a hang can be
+	// timed out and killed. If Kopia reports the vault under a different
+	// spelling, such as a link alias, this check fails with "bound to a different
+	// repository". That is intended.
+	//
+	// Other unbounded calls remain: ensureKopiaRepository stats the vault's marker
+	// files in-process (kopiaRepositoryExists), and admission reads the native
+	// identity marker in-process. Neither is bounded by the admission deadline,
+	// so a share that hangs exactly there can still stall this vault's work.
+	// That is a known limitation.
+	if actual != expected {
 		return fmt.Errorf("kopia configuration is bound to a different repository")
 	}
 	return nil
@@ -1872,6 +1903,9 @@ func parseKopiaSnapshotReader(output io.Reader) (models.Snapshot, error) {
 	return found, nil
 }
 
+// kopiaRepositoryExists stats the marker files directly on the vault path,
+// in-process and without a deadline. It is not covered by the admission
+// deadline; see the note in the Kopia config address check.
 func kopiaRepositoryExists(location string) bool {
 	for _, name := range []string{"kopia.repository.f", "kopia.blobcfg.f", "kopia.maintenance.f"} {
 		if _, err := os.Stat(filepath.Join(location, name)); err == nil {

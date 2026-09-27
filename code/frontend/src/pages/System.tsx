@@ -52,6 +52,16 @@ function sameSettings(left: SettingsType, right: SettingsType): boolean {
     return JSON.stringify(left) === JSON.stringify(right);
 }
 
+// Locale shown while a Language choice is an unsaved draft. An explicit choice
+// names a bundled catalog directly (activateLocale falls back to English, as
+// the backend does). Only the backend resolves the OS language, so "system"
+// uses the read-only systemLocale from the last settings GET, which the backend
+// sends even while a specific language is saved; saveSettings strips it again.
+function languagePreviewLocale(language: SettingsType["language"], saved: SettingsType): string | undefined {
+    const selection = language ?? "system";
+    return selection === "system" ? saved.systemLocale : selection;
+}
+
 export default function System() {
     const toast = useToast();
     const location = useLocation();
@@ -117,7 +127,12 @@ export default function System() {
             let confirmedSettings = attemptedSettings;
             if ((attemptedSettings.language ?? "system") !== (previouslySavedSettings?.language ?? "system")) {
                 try { confirmedSettings = await getSettings(); }
-                catch { /* The saved choice is durable; the next load retries locale resolution. */ }
+                catch {
+                    // The saved choice is durable; the next load retries locale
+                    // resolution. Until then keep showing the previewed catalog
+                    // instead of the stale effectiveLocale from the prior save.
+                    confirmedSettings = { ...attemptedSettings, effectiveLocale: languagePreviewLocale(attemptedSettings.language, previouslySavedSettings) };
+                }
             }
             setSavedSettings(confirmedSettings);
             setSettings((current) => {
@@ -289,6 +304,8 @@ export default function System() {
 		if (savedSettings) {
 			setSettings(savedSettings);
 			applyThemePreference(savedSettings.theme);
+            // Drop any unsaved Language preview before the page unmounts.
+            activateLocale(savedSettings.effectiveLocale);
 		}
         setPendingNavigation(null);
         if (target) navigate(target);
@@ -348,7 +365,13 @@ export default function System() {
 				<label className="field system-control-field"><span>{t("ui.pages.system.theme")}</span><select value={settings.theme} onChange={(event) => { const theme = event.target.value as SettingsType["theme"]; applyThemePreference(theme); setSettings({ ...settings, theme }); }}><option value="system">{t("ui.pages.system.system")}</option><option value="light">{t("ui.pages.system.light")}</option><option value="neutral">{t("ui.pages.system.neutral")}</option><option value="dark">{t("ui.pages.system.dark")}</option></select></label>
 				<div className="setting-hint system-control-hint">{t("ui.pages.system.system.follows.your.operating.system.s.light.or.dark.theme.setting")}</div>
                 <div className="system-language-controls">
-                    <label className="field system-control-field system-language-field"><span>{t("system.language.label")}</span><select value={settings.language ?? "system"} disabled={saving} onChange={(event) => setSettings({ ...settings, language: event.target.value as SettingsType["language"] })}><option value="system">{t("system.language.system")}</option><option value="en">{t("system.language.english")}</option>{Object.entries(languageNames).map(([locale, name]) => <option key={locale} value={locale} lang={locale}>{name}</option>)}</select></label>
+                    <label className="field system-control-field system-language-field"><span>{t("system.language.label")}</span><select value={settings.language ?? "system"} disabled={saving} onChange={(event) => {
+                        const language = event.target.value as SettingsType["language"];
+                        // Preview the choice across the UI without saving it, like
+                        // the theme. Save persists it; discarding restores the saved locale.
+                        if (savedSettings) activateLocale(languagePreviewLocale(language, savedSettings));
+                        setSettings({ ...settings, language });
+                    }}><option value="system">{t("system.language.system")}</option><option value="en">{t("system.language.english")}</option>{Object.entries(languageNames).map(([locale, name]) => <option key={locale} value={locale} lang={locale}>{name}</option>)}</select></label>
                     {/* Keep this recovery action in English so it remains recognizable in every UI language. */}
                     <button type="button" className="btn" lang="en" dir="ltr" translate="no" disabled={saving} onClick={() => void save(true)}>Reset to English</button>
                 </div>

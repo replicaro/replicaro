@@ -116,9 +116,9 @@ func requestedOperationPreparationFailure(engine string, err error) error {
 
 func requestedOperationCommandFailure(engine string, nativeErr, followupErr error, processStarted bool) error {
 	if nativeCause, outputCause := command.FailureCauses(nativeErr); outputCause != nil {
-		// Output capture is wrapper follow-up truth even when the native process
-		// also failed or was interrupted. Preserve the native adapter message for
-		// native truth while keeping the typed output cause separate.
+		// An output-capture failure is a wrapper follow-up error even when the native
+		// process also failed or was interrupted. Keep the native adapter message as
+		// the native error and report the typed output cause separately.
 		followupErr = errors.Join(followupErr, outputCause)
 		if nativeCause == nil {
 			nativeErr = nil
@@ -165,10 +165,10 @@ func addRequestedOperationFollowup(engine string, operationErr, followupErr erro
 	return errors.Join(operationErr, followupErr)
 }
 
-// RequestedOperationOutcome returns the one requested-command result for the
-// ordinary backup-engine boundary. The Restic-specific run-local carrier
-// preserves separate cleanup truth without changing the requested native
-// result.
+// RequestedOperationOutcome extracts the requested native command's result
+// from a backup-engine error. For ResticOperationFailure, output-processing and
+// cleanup errors are returned as the follow-up error, so they never change the
+// requested native result.
 func RequestedOperationOutcome(err error) (
 	status RequestedOperationStatus,
 	processStarted bool,

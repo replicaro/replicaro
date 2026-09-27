@@ -42,7 +42,18 @@ func nativeProcessFenceInactive(path string) (bool, error) {
 }
 
 func cleanupClosedNativeProcessFence(path string) error {
-	inactive, err := nativeProcessFenceInactive(path)
+	return removeInactiveNativeProcessFence(path, nativeProcessFenceInactive)
+}
+
+// The settled check and the removal use the same observation. Checking once
+// more right before removing would reopen the window the settle loop exists
+// to tolerate.
+func cleanupNativeProcessFenceAfterClose(path string) error {
+	return removeInactiveNativeProcessFence(path, awaitClosedNativeProcessFence)
+}
+
+func removeInactiveNativeProcessFence(path string, inactiveCheck func(string) (bool, error)) error {
+	inactive, err := inactiveCheck(path)
 	if err != nil {
 		return err
 	}

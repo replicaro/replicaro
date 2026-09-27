@@ -1,5 +1,6 @@
 import { formatDisplayDate, formatDisplayNumber, getEffectiveLocale, renderMessage, t } from "../i18n";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 
 import {
@@ -30,7 +31,7 @@ import type {
 } from "../types";
 import { dashboardIssueEvent, logTag } from "./dashboardIssue";
 import type { TimelineEvent } from "./dashboardIssue";
-import { formatReadableLog } from "./nativeLogFormat";
+import { formatReadableLog, noSummaryDiagnosticsLine } from "./nativeLogFormat";
 import { NativeLogPager, retainReadableLog } from "./nativeLogPaging";
 
 type TimelineFilter = "all" | "backups" | "restores" | "checks" | "maintenance" | "other" | "issues";
@@ -51,6 +52,29 @@ const MAX_RETAINED_TERMINAL_OPERATIONS = 200;
 const CANONICAL_UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 const logPresentation = (kind?: string) => ({concise: true, operationKind: kind, maintenanceOnly: kind === "prune" || kind === "maintenance"});
+
+// Backup, restore, integrity check, and maintenance results get one fixed line
+// of advice under the errors / warnings summary heading, but only when that
+// summary actually lists at least one error or warning; a clean result gets
+// no advice. Many native errors and warnings for these operations are
+// transient (a share that briefly dropped, a file changing mid-read, a lock
+// held by another client), so the advice is not guessed from the error text.
+// It is not attached to live output or to other kinds such as snapshot
+// deletion ("delete"). "prune" counts as maintenance, as in logPresentation.
+// It is rendered as markup inside the <pre> (bold italic) and is never part
+// of the formatted readable string, the diagnostics, or Raw, so log
+// formatting and paging are unaffected.
+const retryAdviceOperationKinds = new Set(["backup", "restore", "check", "maintenance", "prune"]);
+
+function withRetryAdvice(readable: string, kind?: string): ReactNode {
+    if (!kind || !retryAdviceOperationKinds.has(kind)) return readable;
+    const headingEnd = readable.indexOf("\n");
+    const heading = headingEnd < 0 ? readable : readable.slice(0, headingEnd);
+    const rest = headingEnd < 0 ? "" : readable.slice(headingEnd);
+    const firstSummaryLine = rest.slice(1).split("\n", 1)[0];
+    if (headingEnd < 0 || !firstSummaryLine || firstSummaryLine === noSummaryDiagnosticsLine) return readable;
+    return <>{heading}{"\n"}<strong><em>{t("ui.pages.overview.retryAdvice")}</em></strong>{rest}</>;
+}
 
 async function loadDashboardSnapshot(operationID: string, requiredOperationIDs: string[] = []) {
 	const exactIDs = [...new Set([...requiredOperationIDs, ...(operationID ? [operationID] : [])])];
@@ -281,8 +305,8 @@ export default function Overview() {
 		setStats(snapshot.stats);
 		setJobs(snapshot.jobs);
 		setRepos(snapshot.repos);
-		// Only exact terminal rows learned by this run-local disappearance
-		// coordinator survive the server's ordinary newest-200 snapshot.
+		// Only terminal rows that this run's disappearance tracking fetched by ID
+		// are kept when they fall outside the server's newest-200 snapshot.
 		const operationByID = new Map(retainedTerminalOperations.current);
 		snapshot.operations.forEach((operation) => operationByID.set(operation.id, operation));
 		setOperations([...operationByID.values()]);
@@ -374,9 +398,9 @@ export default function Overview() {
 				let snapshot = await loadDashboardSnapshot(dashboardOperationIDRef.current, requiredIDs);
 				if (!active) return;
 
-				// A later disappearance means the first full snapshot can no longer be
-				// paired with the newest jobs/logs/dashboard truth. Coalesce all such
-				// IDs into one full rerun; later arrivals need only their exact rows.
+				// A later disappearance means the first full snapshot no longer lines up
+				// with the newest jobs/logs/dashboard data. Coalesce all such IDs into
+				// one full rerun; later arrivals only need their own rows.
 				if (pendingTerminalIDs.current.size > 0) {
 					const additionalIDs = [...pendingTerminalIDs.current];
 					pendingTerminalIDs.current.clear();
@@ -415,8 +439,8 @@ export default function Overview() {
 					setActiveOperationsLoaded(true);
 					pendingActiveCommit.current = null;
 				}
-				// Keep failed exact identities in the transition detector so the next
-				// ordinary active poll can retry without showing them as still active.
+				// Keep the failed IDs in the transition detector so the next active
+				// poll can retry them without showing them as still active.
 				const retryIDs = new Set((pendingActive ?? []).map((operation) => operation.id));
 				refreshIDs.forEach((id) => retryIDs.add(id));
 				pendingTerminalIDs.current.forEach((id) => retryIDs.add(id));
@@ -560,6 +584,10 @@ export default function Overview() {
             engine: operation?.engine ?? event?.engine ?? openOutputEngine,
         }, live, page?.readableBody, page?.readableDiagnostics);
     };
+
+    const completedReadableLog = (text: string, operation?: OperationEntry, event?: TimelineEvent,
+        page?: OperationLogResponse | null) =>
+        withRetryAdvice(readableLog(text, operation, event, page), operation?.kind ?? event?.operationKind);
 
     const timeline = useMemo<TimelineEvent[]>(() => {
         const repoById = new Map(repos.map((repo) => [repo.id, repo]));
@@ -1063,7 +1091,7 @@ export default function Overview() {
 									? t("ui.pages.overview.log.could.not.be.loaded")
 									: completedOperationLogLoadState === "pending"
 										? t("ui.pages.overview.loading.log")
-										: completedOperationLog ? showRawLog ? completedOperationLog : readableLog(completedOperationLog, detailedOperation, undefined, completedOperationLogPage) : t("ui.pages.overview.no.output.recorded")}</pre>
+										: completedOperationLog ? showRawLog ? completedOperationLog : completedReadableLog(completedOperationLog, detailedOperation, undefined, completedOperationLogPage) : t("ui.pages.overview.no.output.recorded")}</pre>
 								{showRawLog && operationLogHasMultiplePages(completedOperationLogPage) && completedOperationLogPage && (
 									<div className="log-page-controls">
 										<button type="button" className="btn" disabled={completedOperationLogPage.offset === 0 || completedOperationLogLoadState === "pending"} onClick={() => void loadCompletedOperationLogPage(completedOperationLogPage.previousOffset)}>{t("ui.pages.overview.previous.log.page")}</button>
@@ -1145,7 +1173,7 @@ export default function Overview() {
 										<button type="button" className="text-button" aria-pressed={showRawLog} onClick={() => setShowRawLog((raw) => !raw)}>{showRawLog ? t("ui.pages.overview.show.readable.log") : t("ui.pages.overview.show.raw.log")}</button>
                                         <pre className="output timeline-output">{openOutputLoadFailed
 											? t("ui.pages.overview.log.could.not.be.loaded")
-											: openOutputLoading ? t("ui.pages.overview.loading.log") : openOutputText ? showRawLog ? openOutputText : readableLog(openOutputText, operations.find(operation => operation.id === event.operationID), event, openOutputPage) : t("ui.pages.overview.no.output.recorded")}</pre>
+											: openOutputLoading ? t("ui.pages.overview.loading.log") : openOutputText ? showRawLog ? openOutputText : completedReadableLog(openOutputText, operations.find(operation => operation.id === event.operationID), event, openOutputPage) : t("ui.pages.overview.no.output.recorded")}</pre>
 										{showRawLog && event.operationID && operationLogHasMultiplePages(openOutputPage) && openOutputPage && (
 											<div className="log-page-controls">
 												<button type="button" className="btn" disabled={openOutputPage.offset === 0} onClick={() => void loadTimelineOperationLogPage(event.operationID!, openOutputPage.previousOffset)}>{t("ui.pages.overview.previous.log.page")}</button>

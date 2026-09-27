@@ -65,3 +65,8 @@ func nativeProcessFenceInactive(path string) (bool, error) {
 }
 
 func cleanupClosedNativeProcessFence(_ string) error { return nil }
+
+// The Windows fence is an in-process map entry that Close removes
+// synchronously, so there is no inherited-handle window to settle and no file
+// to remove.
+func cleanupNativeProcessFenceAfterClose(_ string) error { return nil }

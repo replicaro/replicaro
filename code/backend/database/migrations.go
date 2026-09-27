@@ -4,15 +4,20 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/operationlog"
 )
 
-// Schema 70 binds the local/network identity contract to descriptor/helper v4.
-// Reject older databases explicitly; never reinterpret fixed/removable bindings
-// or delete an installation as an automatic compatibility step.
+// Schema 70 binding columns hold either a legacy storage-identity descriptor
+// or the recorded mount-point and filesystem-type facts; a legacy binding is
+// converted in place at its first successful probe (see
+// storageidentity.DecodeBinding), so no schema bump is needed. Reject older
+// databases explicitly; never delete an installation as an automatic
+// compatibility step.
 const CurrentSchemaVersion = 70
 
 var ErrDatabaseResetRequired = errors.New("database schema is incompatible; delete replicaro.db and restart")
@@ -159,6 +164,7 @@ func Migrate(db *sql.DB) error {
 		target_reason_code TEXT NOT NULL DEFAULT 'not_checked',
 		target_checked_at TEXT NOT NULL DEFAULT '',
 		updated_at TEXT NOT NULL DEFAULT '',
+		full_source_read_pending INTEGER NOT NULL DEFAULT 0 CHECK (full_source_read_pending IN (0,1)),
 		PRIMARY KEY (job_id, repository_id),
 		FOREIGN KEY (job_id, repository_id)
 			REFERENCES backup_job_targets(job_id, repository_id) ON DELETE CASCADE,
@@ -399,9 +405,9 @@ func Migrate(db *sql.DB) error {
 	if _, err := tx.Exec(schema); err != nil {
 		return err
 	}
-	// Schema 70 predates the optional password-mutation disposition. Adding the
-	// conservative default in place keeps existing current-schema operations
-	// fail-closed without admitting any older schema version.
+	// Some schema 70 databases were created before the password-mutation
+	// disposition column existed. Add it in place with the conservative default so
+	// existing operations stay fail-closed; older schema versions are still rejected.
 	var dispositionColumns int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('vault_password_change_operations')
 		WHERE name='native_mutation_disposition'`).Scan(&dispositionColumns); err != nil {
@@ -414,8 +420,33 @@ func Migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	// Same in-place treatment for the per-target "re-read every source file"
+	// flag (see markJobTargetFullSourceRead for when it is set). Existing rows
+	// start at 0 on purpose: an alias changed before this column existed is
+	// not retroactively re-read, and the schema version stays 70. The
+	// schedule-state trigger keeps inserting new rows with the default 0; the
+	// few paths that need a new pair flagged set it explicitly.
+	var fullReadColumns int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('job_target_schedule_state')
+		WHERE name='full_source_read_pending'`).Scan(&fullReadColumns); err != nil {
+		return err
+	}
+	if fullReadColumns == 0 {
+		if _, err := tx.Exec(`ALTER TABLE job_target_schedule_state
+			ADD COLUMN full_source_read_pending INTEGER NOT NULL DEFAULT 0
+			CHECK (full_source_read_pending IN (0,1))`); err != nil {
+			return err
+		}
+	}
 	if _, err := tx.Exec(`INSERT INTO settings (key,value) VALUES ('installationId',?)
 		ON CONFLICT(key) DO NOTHING`, uuid.NewString()); err != nil {
+		return err
+	}
+	discardedReconnects, err := retireAutomaticRelocationState(tx)
+	if err != nil {
+		return err
+	}
+	if err := refreshMetadataGroupingRootsOnce(tx); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DROP TABLE IF EXISTS temp.startup_stuck_restic_repositories`); err != nil {
@@ -438,10 +469,10 @@ func Migrate(db *sql.DB) error {
 		return err
 	}
 
-	// Restore admitted scheduled occurrences that did not reach the requested
-	// native backup boundary. Process activation alone is not consumption; a
-	// non-skipped native backup step is the conservative crash-time start truth,
-	// while a skipped step durably confirms that the requested child did not run.
+	// Put back admitted scheduled occurrences whose requested native backup never
+	// started. Starting the operation process does not consume an occurrence. After
+	// a crash, any non-skipped native backup step is conservatively treated as a
+	// start, while a skipped step records that the requested backup did not run.
 	queuedRows, err := tx.Query(`SELECT o.id FROM operations o
 		LEFT JOIN scheduled_operation_restorations r ON r.operation_id=o.id
 		WHERE o.kind='backup' AND (
@@ -591,9 +622,9 @@ func Migrate(db *sql.DB) error {
 		)`); err != nil {
 		return err
 	}
-	// A conclusive Restic backup may have committed immediately before a crash
-	// that preceded retention-step persistence. Record definite no-start truth;
-	// do not infer a native result or launch the missed command on startup.
+	// A Restic backup may have completed just before a crash, before its retention
+	// step was recorded. Record the retention step as skipped (it never started);
+	// do not guess a native result or launch the missed command on startup.
 	if _, err := tx.Exec(`INSERT INTO operation_steps
 		(id,operation_id,domain,kind,status,started_at,finished_at)
 		SELECT lower(hex(randomblob(16))),o.id,'native','retention','skipped',
@@ -628,6 +659,14 @@ func Migrate(db *sql.DB) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	// Best effort, after the rows are gone: a leftover staged or previous
+	// config copy is harmless residue (no credentials), and the next start no
+	// longer knows its token, so a failure here is only logged.
+	for _, intent := range discardedReconnects {
+		if err := engines.DiscardKopiaReconnectArtifacts(intent.repositoryID, intent.intentID); err != nil {
+			log.Printf("discarded Kopia reconnect files for vault %s could not be removed: %v", intent.repositoryID, err)
+		}
+	}
 	// Startup status repair remains authoritative even when its corresponding
 	// local diagnostic append fails; the file can be absent or incomplete.
 	for _, operationID := range queuedIDs {
@@ -659,4 +698,56 @@ func Migrate(db *sql.DB) error {
 			"Application stopped before the operation completed; the operation was marked interrupted.")
 	}
 	return nil
+}
+
+// retireAutomaticRelocationState removes what automatic relocation left
+// behind. Automatic relocation (cached vault aliases, mounted fallback, and the
+// Kopia reconnect that published an alias) was removed: a vault now runs only
+// at its registered location, and a moved vault is reconnected by the user
+// through the existing connect/update flow.
+//
+//   - resolved_repository_path is cleared. Nothing writes it any more, so this
+//     is idempotent and runs on every start. A Kopia vault whose native config
+//     still points at a former alias reports its ordinary configuration error.
+//   - Filesystem Kopia reconnect intents without a pending confirmed
+//     connection update are automatic-relocation intents; resuming them would
+//     publish an alias again, so they are discarded, and Migrate then deletes
+//     their staged and previous config copies. Intents already in cleanup
+//     only remove staged local files and are left for the normal startup
+//     recovery. Confirmed connection updates keep their intents.
+//
+// Job aliases (resolved_source_path) are deliberately kept: an alias created by
+// automatic relocation stays the job's user-visible location until the user
+// changes it. This cleanup needs no schema change.
+type discardedKopiaReconnect struct{ repositoryID, intentID string }
+
+func retireAutomaticRelocationState(tx *sql.Tx) ([]discardedKopiaReconnect, error) {
+	if _, err := tx.Exec(`UPDATE repositories SET resolved_repository_path='',resolved_repository_observed_at=''
+		WHERE resolved_repository_path<>'' OR resolved_repository_observed_at<>''`); err != nil {
+		return nil, err
+	}
+	const automatic = `state<>'cleanup'
+		  AND repository_id IN (SELECT id FROM repositories WHERE connector='fs')
+		  AND NOT EXISTS (SELECT 1 FROM repository_connection_intents c
+			WHERE c.canonical_identity=kopia_filesystem_reconnect_intents.repository_id)`
+	rows, err := tx.Query(`SELECT repository_id,intent_id FROM kopia_filesystem_reconnect_intents WHERE ` + automatic)
+	if err != nil {
+		return nil, err
+	}
+	discarded := []discardedKopiaReconnect{}
+	for rows.Next() {
+		var intent discardedKopiaReconnect
+		if err := rows.Scan(&intent.repositoryID, &intent.intentID); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		discarded = append(discarded, intent)
+	}
+	if err := errors.Join(rows.Err(), rows.Close()); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(`DELETE FROM kopia_filesystem_reconnect_intents WHERE ` + automatic); err != nil {
+		return nil, err
+	}
+	return discarded, nil
 }

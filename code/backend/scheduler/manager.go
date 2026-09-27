@@ -15,7 +15,7 @@ const repositoryTaskConcurrency = 2
 
 var schedulerInterval = time.Minute
 var runRepositoryTask = func(ctx context.Context, db *sql.DB, repo models.Repository, operation string) (string, error) {
-	return RunRepositoryTaskContextWithRuntime(ctx, db, repo, operation, operationruntime.FromContext(ctx))
+	return runRepositoryTaskWithRuntime(ctx, db, repo, operation, operationruntime.FromContext(ctx), true)
 }
 
 type repositoryTaskCoordinator struct {
@@ -59,6 +59,12 @@ func (c *repositoryTaskCoordinator) admit(repo models.Repository, operation stri
 			return
 		}
 		runCtx := operationruntime.ContextWithManager(c.ctx, c.runtime)
+		if deferred, err := deferUnavailableRepositoryTask(runCtx, c.db, repo, operation); deferred || err != nil {
+			if err != nil && c.ctx.Err() == nil {
+				log.Printf("scheduler repository %s deferral: %v", operation, err)
+			}
+			return
+		}
 		if _, err := runRepositoryTask(runCtx, c.db, repo, operation); err != nil && c.ctx.Err() == nil {
 			log.Printf("scheduler repository %s: %v", operation, err)
 		}

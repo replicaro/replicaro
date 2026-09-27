@@ -90,11 +90,19 @@ type Snapshot struct {
 	LogicalSizeBytes *int64 `json:"-"`
 	// TotalFileCount is the optional recursive native header total, including unchanged files.
 	TotalFileCount *int64 `json:"-"`
+	// MetadataGroupingRoot is the File History grouping root for a single-root
+	// snapshot when it differs from the native root path (see
+	// database.MetadataGroupingRoot). It only decides which cached source a
+	// snapshot's files are listed under; SourceRoots keep the exact native
+	// paths, and restore, browse, and every engine command use those. Empty
+	// means "group by the native root". Never serialized.
+	MetadataGroupingRoot string `json:"-"`
 }
 
-// ClassifySnapshotPresentation is the sole presentation classifier. A valid
-// foreign profile is hidden; every nonexact marker state remains visible
-// unmanaged. Managed presentation never substitutes for native retention scope.
+// ClassifySnapshotPresentation is the only place that decides how a snapshot
+// is shown. A valid marker for another profile hides it; any other marker that
+// isn't a valid match for a known job shows it as unmanaged. Showing a
+// snapshot as managed never decides which snapshots native retention covers.
 func ClassifySnapshotPresentation(snapshot Snapshot, profileUUID string, knownJobs map[string]bool) SnapshotPresentation {
 	marker := snapshot.OwnershipMarker
 	if marker.Status != SnapshotOwnershipValid {

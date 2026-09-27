@@ -36,8 +36,9 @@ func SupportsConnector(engine, connector string) bool {
 	}
 	connector = strings.ToLower(strings.TrimSpace(connector))
 	if IsResticRcloneConnector(connector) {
-		// Runner coverage is diagnostic evidence. It cannot downgrade an
-		// implemented integration; native engine capability checks still apply.
+		// Every Restic-rclone connector is available to Restic whether or not our
+		// test runners cover it; don't gate availability on runner coverage.
+		// Restic's own capability checks still apply.
 		return engine == ResticID
 	}
 	return supportedStorageConnectors[connector]
@@ -318,7 +319,6 @@ func validateStoragePort(value string) error {
 }
 
 func normalizedStorageRepository(repo models.Repository, engine string) models.Repository {
-	repo = repo.RuntimeView()
 	if strings.TrimSpace(repo.Engine) == "" {
 		repo.Engine = engine
 	}

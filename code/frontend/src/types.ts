@@ -18,8 +18,6 @@ export interface Repository {
 	archiveWriteClass?: "DEEP_ARCHIVE" | "GLACIER";
 	sftpPathMode?: "home" | "absolute";
     location: string;
-	resolvedRepositoryPath?: string;
-	resolvedRepositoryObservedAt?: string;
     isNetwork?: boolean;
     description: string;
     hasPassword: boolean;
@@ -254,6 +252,9 @@ export interface BackupJob {
     id: string;
     name: string;
     source: string;
+	sourceBindingState?: "bound" | "unbound_imported";
+	// The job's alias, set only by "Update job source" (or kept from an
+	// earlier version). Backups read from it; `source` stays immutable.
 	resolvedSourcePath?: string;
 	resolvedSourceObservedAt?: string;
     targets: BackupJobTarget[];
@@ -312,6 +313,25 @@ export interface BackupJobTarget {
     targetAvailabilityCheckedAt: string;
     policyStatus: "pending" | "ready" | "error";
     policyError?: string;
+}
+
+// One folder-check warning from "Update job source". `reason` is the first
+// matching check: an empty folder, a different folder name, or fewer than half
+// of the latest backup's top-level items present.
+export interface JobSourceFolderCheck {
+	reason: "empty" | "name" | "items";
+	chosen: string;
+	current: string;
+	chosenName: string;
+	sourceName: string;
+	matched: number;
+	total: number;
+}
+
+export interface JobSourceUpdateResult {
+	saved: boolean;
+	check?: JobSourceFolderCheck;
+	job?: BackupJob;
 }
 
 export type StorageAvailability = "available" | "unavailable" | "unknown";
@@ -485,6 +505,8 @@ export type ThemePreference = "system" | "light" | "neutral" | "dark";
 export interface Settings {
     language?: LanguagePreference;
     effectiveLocale?: string;
+    /** Read-only: the catalog the "system" preference resolves to now. */
+    systemLocale?: string;
     defaultEngine: "restic" | "kopia";
     autoStart: boolean;
     logRetentionDays: number;

@@ -88,9 +88,11 @@ type reservedConnectionPayload struct {
 	UpdateExistingVault   bool
 }
 
-// StageRecoveredLocalJobAdmissions atomically closes local job admission before
-// a connection may publish recovery metadata or activate native configuration.
-// The reserved reviewed definition remains authoritative across retries.
+// StageRecoveredLocalJobAdmissions checks, in one transaction, that the existing
+// local jobs this connection will attach to still match the reviewed
+// definitions and are idle. It runs before the connection may publish recovery
+// metadata or activate native configuration. Retries always compare against
+// the reviewed definitions stored with the reservation.
 func StageRecoveredLocalJobAdmissions(
 	db *sql.DB,
 	connectionID string,
@@ -196,9 +198,8 @@ func StageRecoveredLocalJobAdmissions(
 			RetentionWeekly: nullableRetentionValue(retentionWeekly), RetentionMonthly: nullableRetentionValue(retentionMonthly),
 			RetentionYearly: nullableRetentionValue(retentionYearly)}
 		if name != reviewed.Name || source != reviewed.Source || schedule != reviewed.Schedule ||
-			sourceStorageVersion != reviewed.SourceStorageVersion ||
-			sourceStorageKey != reviewed.SourceStorageKey ||
-			sourceStorageJSON != reviewed.SourceStorageDescriptorJSON ||
+			!equivalentSourceBinding(sourceStorageVersion, sourceStorageKey, sourceStorageJSON,
+				reviewed.SourceStorageVersion, reviewed.SourceStorageKey, reviewed.SourceStorageDescriptorJSON) ||
 			!models.RetentionPolicyEqual(loadedRetention, reviewed) || excludes != reviewed.Excludes || tag != reviewed.Tag ||
 			beforeScriptPath != reviewed.BeforeScriptPath ||
 			beforeScriptMustSucceed != reviewed.BeforeScriptMustSucceed ||
@@ -659,8 +660,9 @@ func AttachRecoveredRepository(
 	affectedProfileIDs := []string{repo.ID}
 	for _, job := range normalizedJobs {
 		job.Name = strings.TrimSpace(job.Name)
-		// Historical source spelling is metadata, not display-label padding.
-		// First local binding performs configured-route eligibility checks.
+		// Only the name is trimmed. The source keeps its recorded spelling because it
+		// is job metadata, not a display label. Whether the source path is usable on
+		// this computer is checked when the job is first bound locally.
 		if job.ID == "" || strings.TrimSpace(job.Name) == "" || job.Source == "" || job.Enabled {
 			return "", nil, fmt.Errorf("recovered jobs must have stable IDs and be disabled")
 		}
@@ -730,9 +732,8 @@ func AttachRecoveredRepository(
 				RetentionWeekly: nullableRetentionValue(retentionWeekly), RetentionMonthly: nullableRetentionValue(retentionMonthly),
 				RetentionYearly: nullableRetentionValue(retentionYearly)}
 			if name != job.Name || source != job.Source ||
-				sourceStorageVersion != job.SourceStorageVersion ||
-				sourceStorageKey != job.SourceStorageKey ||
-				sourceStorageJSON != job.SourceStorageDescriptorJSON ||
+				!equivalentSourceBinding(sourceStorageVersion, sourceStorageKey, sourceStorageJSON,
+					job.SourceStorageVersion, job.SourceStorageKey, job.SourceStorageDescriptorJSON) ||
 				sourceBindingState != normalizedJobSourceBindingState(job.SourceBindingState) ||
 				schedule != job.Schedule || !models.RetentionPolicyEqual(loadedRetention, job) || excludes != job.Excludes ||
 				tag != job.Tag || beforeScriptPath != job.BeforeScriptPath ||
@@ -788,6 +789,10 @@ func AttachRecoveredRepository(
 		if _, err := tx.Exec(`INSERT INTO backup_job_targets (job_id, repository_id) VALUES (?, ?)`, job.ID, repo.ID); err != nil {
 			return "", nil, err
 		}
+		// The vault holds this job's snapshots from wherever it ran before.
+		if err := markJobTargetFullSourceRead(tx, job.ID, repo.ID); err != nil {
+			return "", nil, err
+		}
 	}
 	dormantActiveAffected, err := reconcileDormantWithActiveJobs(tx, normalizedJobs)
 	if err != nil {
@@ -808,8 +813,8 @@ func AttachRecoveredRepository(
 		if digestErr != nil {
 			return "", nil, digestErr
 		}
-		// Connection attaches recovered jobs disabled and leaves the one existing
-		// reconciler responsible for native desired-policy convergence.
+		// Recovered jobs are attached disabled. Applying the desired Kopia policy to
+		// the repository is left to the normal policy reconciler.
 		if err := InitializeKopiaPolicyStateTx(tx, repo.ID, derivedDigest, false); err != nil {
 			return "", nil, err
 		}
@@ -904,8 +909,17 @@ func ReconnectRecoveredRepository(db *sql.DB, repo models.Repository, jobs []mod
 		}
 		reviewedUpdate = reviewed.UpdateExistingVault
 	}
-	if !reviewedUpdate && (storedLocation != repo.Location || storedIdentity != repo.CanonicalIdentity ||
-		storedVersion != repo.StorageIdentityVersion || storedKey != repo.StorageIdentityKey || storedJSON != repo.StorageIdentityJSON) {
+	// An exact reconnect keeps the saved location and must not replace the
+	// stored binding. Filesystem vaults compare the location only: the
+	// reconnect's fresh probe may record different facts, and a legacy row may
+	// have been converted since the review. The non-update statement below
+	// never writes the storage columns.
+	locationChanged := storedLocation != repo.Location
+	if repo.Connector != "fs" {
+		locationChanged = locationChanged || storedIdentity != repo.CanonicalIdentity ||
+			storedVersion != repo.StorageIdentityVersion || storedKey != repo.StorageIdentityKey || storedJSON != repo.StorageIdentityJSON
+	}
+	if !reviewedUpdate && locationChanged {
 		return "", nil, fmt.Errorf("saved vault location can only change through confirmed Update existing vault")
 	}
 	for _, job := range jobs {
@@ -964,9 +978,9 @@ func ReconnectRecoveredRepository(db *sql.DB, repo models.Repository, jobs []mod
 		return "", nil, fmt.Errorf("saved vault changed before reconnect commit")
 	}
 	if reviewedUpdate || storedProfile != repo.ProfileUUID {
-		// The authoritative profile switch dirties the independently stored cache.
-		// A later forced complete refresh rebuilds presentation for the new profile;
-		// cache failure cannot roll back the already verified attachment.
+		// Switching profiles marks the separately stored presentation cache stale. A
+		// later forced full refresh rebuilds it for the new profile; a cache failure
+		// cannot roll back the attachment, which is already verified.
 		if _, err := tx.Exec(`UPDATE repositories SET required_generation=required_generation+1 WHERE id=?`, repo.ID); err != nil {
 			return "", nil, err
 		}

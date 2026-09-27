@@ -61,8 +61,9 @@ func prepareOperationNotification(db *sql.DB, operationID, kind, title, status s
 		return nil
 	}
 
-	// Registration precedes terminal operation visibility; dispatch begins only
-	// after the caller confirms terminal persistence.
+	// The step is registered before the operation is shown as finished; the
+	// returned function sends the notification only after the caller has saved
+	// the operation's final state.
 	return func() {
 		notifications.Dispatch(settings.WebhookURL, nativeEnabled, webhookEnabled, event, func(err error) {
 			stepStatus, result := "succeeded", "notification delivery completed"

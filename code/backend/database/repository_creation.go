@@ -75,15 +75,17 @@ func canonicalUUID(value string) bool {
 	return err == nil && parsed != uuid.Nil && parsed.String() == value
 }
 
-// Repository creation keeps the local inherited process fence because a
-// native child or descendant can outlive the request. Its path is derived from
-// the one durable operation UUID rather than becoming another source of truth.
+// Repository creation keeps a local process fence that native children
+// inherit, because a native child or its descendants can outlive the request.
+// The fence path is derived from the durable operation UUID, so it is not a
+// second record that has to be kept in sync.
 func RepositoryCreationFencePath(db *sql.DB, operationID string) (string, error) {
 	return NativeOperationFencePath(db, operationID)
 }
 
-// NativeOperationFenceReferenced checks durable consumers before a closed
-// native-operation proof is removed.
+// NativeOperationFenceReferenced reports whether any saved record (Kopia policy
+// state or a pending repository creation) still uses the fence, so a closed
+// native-operation fence is removed only once nothing depends on it.
 func NativeOperationFenceReferenced(db *sql.DB, fencePath string) (bool, error) {
 	if fencePath == "" {
 		return false, fmt.Errorf("native operation fence path is required")
@@ -267,12 +269,13 @@ func normalizeCreation(repo models.Repository, reviewedOptions ...map[string]str
 		maintenance: maintenance, objectLockJSON: objectLockJSON, reviewedJSON: string(reviewedJSON)}, nil
 }
 
-// ReserveRepositoryCreation creates the one recovery intent at the real
-// non-atomic boundary between native creation, protected publication, and
-// local attachment. The configured destination is not durable repository
-// identity, but it remains the narrow reservation key until native identity
-// and the protected vault UUID exist; otherwise concurrent creates could each
-// start a different native repository at the same destination.
+// ReserveRepositoryCreation records the recovery intent for a creation. The
+// creation is not atomic: native creation, publishing the protected sidecar,
+// and local attachment are separate steps. The configured destination is not
+// a durable repository identity, but it serves as the reservation key until
+// the native identity and protected vault UUID exist; otherwise concurrent
+// creates could each start a different native repository at the same
+// destination.
 func ReserveRepositoryCreation(db *sql.DB, repo models.Repository, reviewedOptions ...map[string]string) (RepositoryCreationIntent, error) {
 	normalized, err := normalizeCreation(repo, reviewedOptions...)
 	if err != nil {
@@ -284,7 +287,15 @@ func ReserveRepositoryCreation(db *sql.DB, repo models.Repository, reviewedOptio
 	}
 	defer func() { _ = tx.Rollback() }()
 	var pending int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM repository_creation_intents WHERE canonical_identity=?`, normalized.identity).Scan(&pending); err != nil {
+	// For filesystem vaults the canonical identity is the exact normalized
+	// location (engine-independent), so this also makes a Restic and a Kopia
+	// creation at the same folder conflict. Intents created before the
+	// location key existed carry their old descriptor key as canonical
+	// identity; the location match keeps them owning their folder until they
+	// complete or are forgotten.
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM repository_creation_intents
+		WHERE canonical_identity=? OR (?='fs' AND connector='fs' AND location=?)`,
+		normalized.identity, normalized.repo.Connector, normalized.repo.Location).Scan(&pending); err != nil {
 		return RepositoryCreationIntent{}, err
 	}
 	if pending != 0 {
@@ -343,9 +354,18 @@ func LoadRepositoryCreationRetry(db *sql.DB, id string, repo models.Repository, 
 	if err != nil {
 		return RepositoryCreationIntent{}, err
 	}
-	if intent.CanonicalIdentity != normalized.identity ||
-		intent.StorageIdentityVersion != normalized.storageVersion ||
-		intent.StorageIdentityKey != normalized.storageKey || intent.StorageIdentityJSON != normalized.storageJSON ||
+	// A retry is matched to its intent by exact location for filesystem vaults.
+	// The facts recorded at reservation stay authoritative for the intent (a
+	// retry may observe different facts, for example once the native engine
+	// has created the vault folder), and completion copies the intent's
+	// values, never the retry's.
+	storageMismatch := intent.Location != normalized.repo.Location
+	if normalized.repo.Connector != "fs" {
+		storageMismatch = intent.CanonicalIdentity != normalized.identity ||
+			intent.StorageIdentityVersion != normalized.storageVersion ||
+			intent.StorageIdentityKey != normalized.storageKey || intent.StorageIdentityJSON != normalized.storageJSON
+	}
+	if storageMismatch ||
 		intent.Engine != normalized.repo.Engine || intent.Connector != normalized.repo.Connector ||
 		intent.ColdStorage != normalized.repo.ColdStorage || intent.ArchiveWriteClass != normalized.repo.ArchiveWriteClass ||
 		intent.Name != normalized.repo.Name || intent.Description != normalized.repo.Description ||
@@ -369,9 +389,9 @@ func CancelPreparedRepositoryCreation(db *sql.DB, id string) error {
 	return nil
 }
 
-// ForgetRepositoryCreationIntent removes no remote repository content and is
-// called only after the API proves the one native operation is inactive and
-// removes the exact local engine and rclone artifacts.
+// ForgetRepositoryCreationIntent removes no remote repository content. The API
+// calls it only after confirming the native operation is no longer running and
+// removing the local engine and rclone artifacts.
 func ForgetRepositoryCreationIntent(db *sql.DB, id string) error {
 	result, err := db.Exec(`DELETE FROM repository_creation_intents
 		WHERE id=? AND phase IN ('native_started','native_ready')`, id)
@@ -485,12 +505,14 @@ func FindRepositoryCreationIntentWithOptions(db *sql.DB, engine, connector, loca
 	return scanCreationIntent(db.QueryRow(`SELECT `+creationIntentColumns+` FROM repository_creation_intents WHERE canonical_identity=?`, identity).Scan)
 }
 
-func FindRepositoryCreationIntentByStorage(db *sql.DB, version, key, descriptorJSON string) (RepositoryCreationIntent, error) {
-	if _, err := validateStorageBinding(version, key, descriptorJSON); err != nil {
-		return RepositoryCreationIntent{}, err
-	}
+// FindRepositoryCreationIntentByLocation finds the pending filesystem creation
+// that owns an exact normalized location, including intents reserved before
+// the location key existed. Pending filesystem creations are never looked up
+// by recorded storage facts.
+func FindRepositoryCreationIntentByLocation(db *sql.DB, location string) (RepositoryCreationIntent, error) {
 	return scanCreationIntent(db.QueryRow(`SELECT `+creationIntentColumns+
-		` FROM repository_creation_intents WHERE canonical_identity=? AND storage_identity_key=?`, key, key).Scan)
+		` FROM repository_creation_intents WHERE connector='fs' AND location=?
+		ORDER BY created_at, id LIMIT 1`, location).Scan)
 }
 
 // CompleteRepositoryCreation atomically attaches the exact native-ready vault
@@ -585,8 +607,9 @@ func CompleteRepositoryCreation(db *sql.DB, intent RepositoryCreationIntent, rep
 		return "", err
 	}
 	if intent.Engine == "kopia" {
-		// One post-attachment reconciler owns Kopia policy mutation and exact
-		// readback; dirty/not-ready admission remains fail-closed until it succeeds.
+		// Only the post-attachment reconciler changes the Kopia policy and reads it
+		// back. While the policy state is dirty or not ready, work that needs the
+		// policy is refused.
 		if _, err := RefreshKopiaPolicyStatesTx(tx, []string{intent.ID}); err != nil {
 			return "", err
 		}

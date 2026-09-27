@@ -10,9 +10,9 @@ import (
 	"sync"
 )
 
-// CapturedOutputPublisher receives exact ordinary stdout and stderr after the
-// process tree has been drained. The publisher is presentation-only: it must
-// consume the readers synchronously and must not let a logging failure affect
+// CapturedOutputPublisher receives the complete, unmodified stdout and stderr
+// after the process tree has been drained. It is for presentation only: it must
+// consume the readers synchronously, and a logging failure must never affect
 // the native result.
 type CapturedOutputPublisher func(engine, kind, status, diagnostic string, stdout, stderr io.Reader) bool
 
@@ -82,10 +82,9 @@ func newCapturedOutput() (*CapturedOutput, error) {
 	return &CapturedOutput{stdout: stdout, stderr: stderr}, nil
 }
 
-// CleanupCapturedOutput removes only abandoned files from the command-output
-// directory after the application has acquired its single-instance guard. It
-// does not inspect capacity, enforce quotas, rotate logs, or adapt behavior to
-// available disk space.
+// CleanupCapturedOutput removes abandoned files from the command-output
+// directory once the application holds its single-instance guard. It only
+// deletes leftovers: no capacity or disk-space checks, quotas, or log rotation.
 func CleanupCapturedOutput() error {
 	directory, err := capturedOutputDirectory()
 	if err != nil {
@@ -185,10 +184,10 @@ func (output *CapturedOutput) finish() error {
 	return errorsJoin(output.stdout.finish(), output.stderr.finish())
 }
 
-// OpenStdout returns a fresh reader positioned at the start of exact stdout.
+// OpenStdout returns a fresh reader positioned at the start of the captured stdout.
 func (output *CapturedOutput) OpenStdout() (*os.File, error) { return output.stdout.open() }
 
-// OpenStderr returns a fresh reader positioned at the start of exact stderr.
+// OpenStderr returns a fresh reader positioned at the start of the captured stderr.
 func (output *CapturedOutput) OpenStderr() (*os.File, error) { return output.stderr.open() }
 
 func (output *CapturedOutput) publish(ctx context.Context, engine, status, diagnostic string) bool {

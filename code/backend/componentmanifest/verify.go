@@ -33,7 +33,8 @@ var componentIdentities = map[string]struct{ owner, repository string }{
 	"rclone": {"rclone", "rclone"},
 }
 
-// Artifact is one exact public-metadata acquisition selection.
+// Artifact is the download and checksum data for one component and target,
+// selected from the public metadata.
 type Artifact struct {
 	Component       string
 	Target          string
@@ -127,9 +128,9 @@ func VerifySourceTree(backendRoot, target string) error {
 	return verify(l, "")
 }
 
-// VerifySourceTreeForAcquisition verifies the selected target's unaffected
-// state before one selected component binary and its acquisition provenance are
-// replaced. The selected component's metadata and license remain in scope.
+// VerifySourceTreeForAcquisition verifies a target's source tree before the
+// selected component's binary and acquisition provenance are replaced. It skips
+// only that component's binary check; its metadata and license are still verified.
 func VerifySourceTreeForAcquisition(backendRoot, target, selectedComponent string) error {
 	if componentIdentities[selectedComponent].repository == "" {
 		return fmt.Errorf("unsupported component")
@@ -351,9 +352,9 @@ func memberSet(names ...string) map[string]bool {
 	return result
 }
 
-// decodeObjectMembers validates only one JSON object frame. Values remain raw
-// until the selected target or selected component consumes them, so semantic
-// members inside unrelated bounded rows cannot gate selected-target work.
+// decodeObjectMembers validates a single JSON object level. Values stay raw
+// until the selected target or component decodes them, so content in rows for
+// other targets cannot block work on the selected one.
 func decodeObjectMembers(data []byte, allowed map[string]bool, allowUnknown bool) (map[string]json.RawMessage, error) {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	token, err := decoder.Token()

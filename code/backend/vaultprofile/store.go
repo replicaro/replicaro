@@ -35,8 +35,9 @@ const canonicalRootObject = "vault.replicaro"
 const previousRootObject = "vault.replicaro.previous"
 const pendingRootPrefix = "vault.replicaro.pending."
 
-// Internal aliases keep the root safe-publication implementation readable in
-// existing helper and provider-proof code. They are not schema aliases.
+// Root and profile objects share one safe-publication implementation. These
+// aliases keep profile-side helpers and the real-provider tests readable;
+// they are not schema aliases.
 const canonicalProfileObject = canonicalRootObject
 const previousProfileObject = previousRootObject
 const pendingProfilePrefix = pendingRootPrefix
@@ -65,9 +66,9 @@ func reconnectRequired(err error) error {
 	return &reconnectRequiredError{err: err}
 }
 
-// IsReconnectRequired identifies only conclusive protected-control-plane
-// attachment, password, or identity facts. Transport and ambiguous read
-// failures deliberately remain outside this classification.
+// IsReconnectRequired reports only errors that confirm a problem with the
+// protected attachment, password, or identity. Transport errors and ambiguous
+// read failures are deliberately not treated as reconnect-required.
 func IsReconnectRequired(err error) bool {
 	return errors.Is(err, errReconnectRequired)
 }
@@ -83,9 +84,10 @@ type Store struct {
 }
 
 // WithSession reuses native sidecar setup during one sequential operation. It
-// caches no objects or authority: every read and publication still validates
-// its own record, and every command reopens and validates the native config.
-// The callback must not retain the Store or change its repository binding.
+// caches no objects or validation results: every read and publication still
+// validates its own record, and every command reopens and validates the
+// native config. The callback must not retain the Store or change its
+// repository binding.
 func (s Store) WithSession(ctx context.Context, operation func(Store) error) (err error) {
 	if s.operationSession != nil {
 		return operation(s)
@@ -203,9 +205,9 @@ type remoteConfig struct {
 	env       []string
 }
 
-// BaseRemoteConfiguration exposes only the already-established canonical
-// base-root translation needed by the read-only Vault Size helper role.
-// It deliberately contains no crypt remote or vault password.
+// BaseRemoteConfiguration holds only the translated base-root remote that the
+// read-only Vault Size helper needs. It deliberately contains no crypt remote
+// or vault password.
 type BaseRemoteConfiguration struct {
 	Root string
 	Env  []string
@@ -266,9 +268,10 @@ type OwnershipObjects struct {
 	Local ReadResult
 }
 
-// RootCareAuthority is a fresh protected-control-plane readback. It is kept
-// transient so Kopia policy reconciliation cannot substitute stale local
-// owner, integrity, maintenance, or Object Lock state for the vault's current authority.
+// RootCareAuthority is a fresh read of the protected root. It is kept
+// transient so Kopia policy reconciliation always uses the vault's current
+// owner, integrity, maintenance, and Object Lock settings, never stale local
+// copies.
 type RootCareAuthority struct {
 	IntegritySchedule         string
 	MaintenanceSchedule       string
@@ -324,12 +327,11 @@ type PublishOptions struct {
 
 func (s Store) session(ctx context.Context) (session *storeSession, err error) {
 	if s.operationSession != nil && *s.operationSession != nil {
-		if !reflect.DeepEqual(s.Repository.RuntimeView(), (*s.operationSession).repository) {
+		if !reflect.DeepEqual(s.Repository, (*s.operationSession).repository) {
 			return nil, fmt.Errorf("sidecar operation repository binding changed")
 		}
 		return *s.operationSession, nil
 	}
-	s.Repository = s.Repository.RuntimeView()
 	started := time.Now()
 	defer func() { reportTiming(ctx, "profile session setup", time.Since(started)) }()
 	if err := models.ValidateVaultPassword(s.Repository.Passphrase); err != nil {
@@ -619,11 +621,11 @@ func (s Store) ReadDetailed(ctx context.Context) (result ReadResult, err error) 
 	return s.readDetailed(ctx, session)
 }
 
-// ReadDiscoveryRootDetailed is the one root-only bootstrap boundary used when
-// connecting storage whose protected vault tuple is not known yet. It retains
-// the ordinary bounded decrypt, schema, canonical/fallback, and root-structure
-// checks, but leaves tuple matching to the immediate known-root reread. All
-// ordinary reads and every publication continue through exact tuple validation.
+// ReadDiscoveryRootDetailed reads only the root when connecting storage whose
+// vault tuple is not known yet. It keeps the normal bounded decrypt, schema,
+// canonical/fallback, and root-structure checks, but leaves tuple matching to
+// the known-root reread that follows. All other reads and every publication
+// still validate the full tuple.
 func (s Store) ReadDiscoveryRootDetailed(ctx context.Context) (result ReadResult, err error) {
 	if s.ProfileUUID != "" {
 		return ReadResult{}, fmt.Errorf("vault-root discovery cannot read a profile object")
@@ -869,8 +871,8 @@ func ValidateAttachmentResult(
 	generation int64,
 ) (Profile, error) {
 	if result.Degraded || result.Generation != "canonical" {
-		// Previous generations are recovery evidence, never current attachment
-		// authority for repository mutations or owner-only work.
+		// A previous generation can help recovery, but it never authorizes repository
+		// mutations or owner-only work for the current attachment.
 		return Profile{}, fmt.Errorf("verify vault profile attachment: canonical profile is unavailable")
 	}
 	profile, err := Parse(result.Data)
@@ -1007,9 +1009,10 @@ func (s Store) AssertRootCare(ctx context.Context, integritySchedule, maintenanc
 	return authority, nil
 }
 
-// AssertPasswordChangeAuthority is the rotation-only owner/attachment proof.
-// Unlike AssertRootOwner it admits only this operation's exact fence and never
-// makes fenced roots valid for ordinary administration.
+// AssertPasswordChangeAuthority checks owner and attachment for password
+// rotation only. Unlike AssertRootOwner it accepts a fence only if it belongs
+// to this operation, and it never makes a fenced root valid for other
+// administration.
 func (s Store) AssertPasswordChangeAuthority(ctx context.Context, clientUUID, profileUUID string, generation int64,
 	operationUUID string, allowUnfenced, requireProfileFence bool,
 ) error {
@@ -1062,10 +1065,11 @@ func (s Store) AssertPasswordChangeAuthority(ctx context.Context, clientUUID, pr
 	return nil
 }
 
-// AssertPasswordChangeRootState is the publishing-recovery root proof. Profile
-// objects may already be re-encrypted at this phase, so it verifies only the
-// unchanged vault identity/owner and either this exact old-password fence or
-// the final unfenced new-password root.
+// AssertPasswordChangeRootState checks the root while recovering the
+// publishing phase of a password change. Profile objects may already be
+// re-encrypted at this point, so it checks only that the vault identity and
+// owner are unchanged and that the root has either this operation's
+// old-password fence or the final unfenced new-password state.
 func (s Store) AssertPasswordChangeRootState(ctx context.Context, profileUUID, operationUUID string, fenced bool) error {
 	fail := func() error {
 		return fmt.Errorf("%w: the protected vault root is not in the expected password-change state", ErrPasswordChangeAuthority)
@@ -1107,7 +1111,6 @@ func (s Store) Create(ctx context.Context, plaintext []byte) error {
 // Publish is the single crash-recoverable state machine used for profile
 // creation, connection, and synchronization.
 func (s Store) Publish(ctx context.Context, plaintext []byte, options PublishOptions) error {
-	s.Repository = s.Repository.RuntimeView()
 	if !exactUUID(s.Repository.ID) {
 		return fmt.Errorf("repository vault UUID is invalid")
 	}
@@ -1122,9 +1125,8 @@ func (s Store) Publish(ctx context.Context, plaintext []byte, options PublishOpt
 }
 
 // PublishUnderLock publishes a profile while the caller already holds the
-// managed vault UUID lock. It is used by profile synchronization and creation
-// paths that must keep their database and remote publication sections under
-// one admission gate.
+// managed vault UUID lock. Profile synchronization and creation use it because
+// their database and remote publication steps must stay under that one lock.
 func (s Store) PublishUnderLock(ctx context.Context, plaintext []byte, options PublishOptions) error {
 	return s.publishUnderLock(ctx, plaintext, options)
 }
@@ -1309,8 +1311,8 @@ func (s Store) ensureExpectedCurrent(ctx context.Context, session *storeSession,
 	if err != nil {
 		return err
 	}
-	// Keep all three publication checkpoints, but read the fixed canonical
-	// address directly. Listing is recovery discovery, not additional authority.
+	// Keep all three publication checkpoints, but read the fixed canonical name
+	// directly. Listing is only needed for recovery discovery, not for this check.
 	data, readErr := s.readObjectBounded(ctx, session, canonical)
 	if readErr == nil {
 		if fmt.Sprintf("%x", sha256.Sum256(data)) != expected {
@@ -1770,7 +1772,6 @@ func remotePath(parts ...string) string {
 }
 
 func (s Store) ListRoot(ctx context.Context) (values []objectStat, err error) {
-	s.Repository = s.Repository.RuntimeView()
 	if s.Repository.Connector == "fs" {
 		info, err := os.Stat(s.Repository.Location)
 		if errors.Is(err, os.ErrNotExist) {

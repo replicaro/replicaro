@@ -262,25 +262,6 @@ func PhysicalIdentityWithOptions(connector, location string, options map[string]
 		effective.Endpoint, effective.AccountName}, "\x00"), nil
 }
 
-// PhysicalIdentityWithStorageKey is the narrow storage-aware entry point for
-// filesystem vaults. The validated storage key becomes the existing single
-// physical-vault identity; remote connector identity behavior is unchanged.
-func PhysicalIdentityWithStorageKey(connector, location, storageKey string, options map[string]string) (string, error) {
-	if !IsFilesystem(connector) {
-		if strings.TrimSpace(storageKey) != "" {
-			return "", fmt.Errorf("storage keys apply only to filesystem vaults")
-		}
-		return PhysicalIdentityWithOptions(connector, location, options)
-	}
-	if strings.TrimSpace(storageKey) == "" {
-		return "", fmt.Errorf("filesystem storage identity key is required")
-	}
-	if _, err := storageidentity.ParseCanonicalKey(storageKey); err != nil {
-		return "", fmt.Errorf("invalid filesystem storage identity key: %w", err)
-	}
-	return storageKey, nil
-}
-
 func EngineIdentity(engine, connector, location string) (string, error) {
 	physical, err := PhysicalIdentity(connector, location)
 	if err != nil {
@@ -614,10 +595,10 @@ func ResolveEffectiveAddress(connector, location string, options map[string]stri
 				return EffectiveAddress{}, endpointErr
 			}
 		}
-		// The URL has already been decoded exactly once. Only slash boundaries
-		// are structural in this admitted S3 namespace; spaces, including Unicode
-		// spaces at a prefix edge, and literal percent sequences name objects.
-		// Keep the other providers' existing public path grammars independent.
+		// The URL has already been decoded exactly once. In an S3 location only
+		// slashes are structural; spaces (including Unicode spaces at a prefix edge)
+		// and literal percent sequences are part of object names. Do not apply this
+		// rule to the other providers' path grammars.
 		source := strings.Trim(parsed.Path, "/")
 		if result.Endpoint != "" {
 			endpoint, endpointErr := url.Parse(result.Endpoint)

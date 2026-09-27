@@ -129,10 +129,9 @@ func AdvanceVaultPasswordChange(db *sql.DB, repositoryID, from, to string) error
 	return nil
 }
 
-// AdvanceVaultPasswordChangeAfterCandidateVerification records only the
-// orchestration fact that the pending credential was verified against the
-// exact native repository. It deliberately preserves the requested native
-// command's status, output, and error truth.
+// AdvanceVaultPasswordChangeAfterCandidateVerification records that the
+// pending password was verified against the native repository. It deliberately
+// leaves the requested native command's status, output, and error unchanged.
 func AdvanceVaultPasswordChangeAfterCandidateVerification(db *sql.DB, repositoryID, operationUUID string) error {
 	result, err := db.Exec(`UPDATE vault_password_change_operations SET phase='publishing',updated_at=?
 		WHERE repository_id=? AND operation_uuid=? AND phase='native_started' AND

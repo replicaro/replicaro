@@ -20,7 +20,6 @@ import (
 // DetectRepositorySignatures inspects only exact-root, engine-owned marker
 // structures and does not authenticate or execute an engine.
 func DetectRepositorySignatures(repo models.Repository) ([]string, error) {
-	repo = repo.RuntimeView()
 	if repo.Connector != "fs" {
 		return nil, fmt.Errorf("remote repository signatures require connector-backed root inspection")
 	}
@@ -48,7 +47,6 @@ func DetectRepositorySignatures(repo models.Repository) ([]string, error) {
 // Exact-root configuration bytes are preferred; normalized validation output
 // is the remote-repository fallback.
 func RepositoryFingerprint(repo models.Repository, validationOutput string) (string, error) {
-	repo = repo.RuntimeView()
 	if repo.Connector == "fs" {
 		markers := []string{}
 		switch repo.Engine {

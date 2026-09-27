@@ -51,12 +51,11 @@ var applyDesktopSettings = desktop.ApplySettings
 // Credential activation checks native access here; its callers also require
 // the same physical vault address and matching protected root/profile records
 // before saving credentials. If a different repository readable with the saved
-// password replaced the old one at that address while old sidecars remained,
-// activation could report success. Ordinary backup admission checks the actual
-// native repository identity before backup work, so this is not a demonstrated
-// wrong-repository backup risk. Detecting that narrow false success during
-// credential activation is out of scope without a concrete need for an earlier
-// guarantee; an additional remote probe would slow every reconnect.
+// password replaced the old one at that address while the old sidecars
+// remained, activation could still report success. Backup admission checks the
+// actual native repository identity before any backup work. Catching this case
+// during activation would need another remote probe on every reconnect, so it
+// is left to that check.
 var validateRotatedCredentials = func(ctx context.Context, repo models.Repository) error {
 	engine, err := resolveEngine(repo)
 	if err != nil {
@@ -161,9 +160,9 @@ func persistSelectedIntegrityOwnerAdmission(
 	status, output := "succeeded", "vault ownership is current"
 	if ownerErr != nil {
 		status, output = "failed", ownerErr.Error()
-		// Only conclusive authority loss disables the recovered local schedule.
-		// Provider, credential, cancellation, and transitional failures remain
-		// fail-closed without rewriting the profile's configuration.
+		// Only a confirmed loss of ownership or attachment disables the recovered
+		// local schedule. Provider, credential, cancellation, and transitional
+		// failures still fail the check but leave the profile's configuration alone.
 		if errors.Is(ownerErr, vaultprofile.ErrNotVaultOwner) ||
 			errors.Is(ownerErr, vaultprofile.ErrVaultProfileAttachmentLost) {
 			if disableErr := database.DisableRepositoryIntegrity(db, repo.ID, output); disableErr != nil {
@@ -263,25 +262,19 @@ func cleanupNativeOperationFence(db *sql.DB, fencePath string) error {
 	if referenced {
 		return fmt.Errorf("native operation fence remains durably referenced")
 	}
-	return command.CleanupClosedNativeProcessFence(fencePath)
+	// Both callers (attaching a created vault and forgetting a pending
+	// creation) reach this after the same request has already shown the fence
+	// inactive, so the cleanup normally passes on its first look. An unrelated
+	// process launch can still hold an inherited copy of the descriptor for a
+	// few milliseconds, and the after-close cleanup re-checks for a short,
+	// bounded window to absorb that. A fence that stays held is refused and
+	// left in place.
+	return command.CleanupNativeProcessFenceAfterClose(fencePath)
 }
 
-func cleanupCreationFenceWithRetry(db *sql.DB, fencePath string) error {
-	var cleanupErr error
-	for attempt := 0; attempt < 3; attempt++ {
-		cleanupErr = cleanupCreationNativeFence(db, fencePath)
-		if cleanupErr == nil {
-			return nil
-		}
-		if attempt < 2 {
-			time.Sleep(5 * time.Millisecond)
-		}
-	}
-	return cleanupErr
-}
-
-// Prepared cancellation removes exact local artifacts before deleting their
-// sole durable owner. Failures retain a visible, retryable intent where possible.
+// Cancelling a prepared creation removes its local artifacts before deleting
+// the creation intent, the only durable record of them. On failure the intent
+// is kept, visible and retryable, where possible.
 func cleanupPreparedRepositoryCreation(db *sql.DB, intent database.RepositoryCreationIntent) error {
 	if intent.Phase != database.RepositoryCreationPrepared {
 		return fmt.Errorf("only a prepared repository creation can be cancelled")
@@ -531,22 +524,28 @@ func handlerAtWithSecurityModeAndRcloneAuth(
 		updater = updaters[0]
 	}
 	return handlerAtWithSecurityModeRcloneAuthAndRuntime(
-		db, db, endpoint, record, activate, mode, rcloneAuth, updater, operationruntime.New(),
+		db, db, endpoint, nil, record, activate, mode, rcloneAuth, updater, false, operationruntime.New(),
 	)
 }
 
 func handlerAtWithSecurityModeRcloneAuthAndRuntime(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
+	lanOrigins runtimeendpoint.LANOrigins,
 	record rendezvous.Record,
 	activate func() error,
 	mode SecurityMode,
 	rcloneAuth *rcloneAuthStore,
 	updater *appupdate.Service,
+	keepStartAtLogin bool,
 	runtimeManager *operationruntime.Manager,
 ) http.Handler {
-	security := requestSecurity{endpoint: endpoint, mode: normalizedSecurityMode(mode), clientUUID: installationUUID(db)}
-	handler := handlerForExecutionInstanceWithReader(db, readDB, uuid.NewString(), rcloneAuth, updater, runtimeManager)
+	// This copy replaces the web UI handler's for every /api/ request, so it
+	// needs the same LAN origins or proxied API calls fail the Host check.
+	security := requestSecurity{
+		endpoint: endpoint, lanOrigins: lanOrigins, mode: normalizedSecurityMode(mode), clientUUID: installationUUID(db),
+	}
+	handler := handlerForExecutionInstanceWithReader(db, readDB, uuid.NewString(), rcloneAuth, updater, keepStartAtLogin, runtimeManager)
 	if record.Version != "" {
 		mux := http.NewServeMux()
 		activationHandler := rendezvous.Handler(record, activate)
@@ -570,14 +569,23 @@ func handlerForExecutionInstance(
 	updater *appupdate.Service,
 	runtimeManagers ...*operationruntime.Manager,
 ) http.Handler {
-	return handlerForExecutionInstanceWithReader(db, db, executionInstanceID, rcloneAuth, updater, runtimeManagers...)
+	return handlerForExecutionInstanceWithReader(db, db, executionInstanceID, rcloneAuth, updater, false, runtimeManagers...)
 }
 
+// keepStartAtLogin is true only in headless LAN mode (Linux, --lan-origin,
+// outside the container package). There the Start at login setting is what
+// keeps replicaro.service enabled: with it off, every settings apply and every
+// start runs `systemctl --user disable replicaro.service`, and a headless
+// install would silently not come back after the next reboot. Nothing in the
+// Settings UI tells a remote user that, so the backend keeps the setting on
+// and reports the capability as unavailable, which hides the option in the
+// existing Settings page.
 func handlerForExecutionInstanceWithReader(
 	db, readDB *sql.DB,
 	executionInstanceID string,
 	rcloneAuth *rcloneAuthStore,
 	updater *appupdate.Service,
+	keepStartAtLogin bool,
 	runtimeManagers ...*operationruntime.Manager,
 ) http.Handler {
 	runtimeManager := operationruntime.New()
@@ -604,6 +612,9 @@ func handlerForExecutionInstanceWithReader(
 		}
 		target := platforms.Current()
 		capabilities := desktop.Capabilities()
+		if keepStartAtLogin {
+			capabilities["startAtLogin"] = false
+		}
 		writeJSON(w, map[string]any{
 			"platform":     target,
 			"os":           runtime.GOOS,
@@ -623,7 +634,11 @@ func handlerForExecutionInstanceWithReader(
 	})
 
 	handle(mux, "/api/filesystem/directories", func(w http.ResponseWriter, r *http.Request) {
-		listing, err := browseDirectories(r.URL.Query().Get("path"))
+		listing, err := browseDirectoriesBounded(r.Context(), r.URL.Query().Get("path"))
+		if errors.Is(err, errDirectoryNotResponding) {
+			writeCodedError(w, http.StatusGatewayTimeout, "directory_not_responding", err.Error())
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err)
 			return
@@ -855,116 +870,7 @@ func handlerForExecutionInstanceWithReader(
 			handleRepositoryCreate(db, rcloneAuth, w, r)
 
 		case http.MethodDelete:
-
-			id := r.URL.Query().Get("id")
-
-			if id == "" {
-				badRequest(w, "missing repository id")
-				return
-			}
-			discardRecoveryProfile := false
-			switch value := r.URL.Query().Get("discardRecoveryProfile"); value {
-			case "":
-			case "true":
-				discardRecoveryProfile = true
-			default:
-				badRequest(w, "discardRecoveryProfile must be true when provided")
-				return
-			}
-			deletedRepo, repoErr := database.GetRepository(db, id)
-			if repoErr == nil {
-				unlock, lockOK, lockErr := vaultlock.YieldLowPriorityAndTryExclusiveContext(r.Context(), deletedRepo.ID)
-				if lockErr != nil {
-					writeError(w, http.StatusRequestTimeout, lockErr)
-					return
-				}
-				if !lockOK {
-					writeError(w, http.StatusConflict, errors.New(vaultRemovalBusyMessage))
-					return
-				}
-				defer unlock()
-			} else if !errors.Is(repoErr, sql.ErrNoRows) {
-				writeError(w, http.StatusInternalServerError, repoErr)
-				return
-			}
-
-			if err := database.CheckRepositoryDeletionEligibility(db, id); err != nil {
-				if errors.Is(err, database.ErrJobRunActive) || errors.Is(err, database.ErrRepositoryConnectionReserved) {
-					writeError(w, http.StatusConflict, err)
-				} else if errors.Is(err, sql.ErrNoRows) {
-					writeError(w, http.StatusNotFound, err)
-				} else {
-					writeError(w, http.StatusInternalServerError, err)
-				}
-				return
-			}
-			if !discardRecoveryProfile {
-				if err := profilesync.SyncRepositoryUnderLock(r.Context(), db, id); err != nil {
-					writeCodedError(w, http.StatusConflict, "vault_profile_sync_required",
-						fmt.Sprintf("vault removal stopped because its recovery profile could not be synchronized: %v", err))
-					return
-				}
-			}
-			stage, err := stageRepositoryArtifacts(deletedRepo, engines.RepositoryArtifactDelete)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, fmt.Errorf("local engine credential staging failed: %w", err))
-				return
-			}
-			deleteLocalState := deleteRepository
-			if discardRecoveryProfile {
-				deleteLocalState = deleteRepositoryDiscardingPendingProfile
-			}
-			deleteErr := deleteLocalState(db, id)
-			var cacheCleanupErr *database.MetadataCacheCleanupError
-			if deleteErr != nil && !errors.As(deleteErr, &cacheCleanupErr) {
-				if restoreErr := restoreRepositoryArtifacts(stage); restoreErr != nil {
-					writeError(w, http.StatusInternalServerError, fmt.Errorf("vault deletion failed and local engine artifacts could not be restored: %v; restore error: %w", deleteErr, restoreErr))
-					return
-				}
-				if errors.Is(deleteErr, database.ErrJobRunActive) || errors.Is(deleteErr, database.ErrVaultProfilePending) ||
-					errors.Is(deleteErr, database.ErrRepositoryConnectionReserved) {
-					writeError(w, http.StatusConflict, deleteErr)
-				} else if errors.Is(deleteErr, sql.ErrNoRows) {
-					writeError(w, http.StatusNotFound, deleteErr)
-				} else {
-					writeError(w, http.StatusInternalServerError, deleteErr)
-				}
-				return
-			}
-			profilesync.Wake(db)
-			warnings := []string{}
-			if discardRecoveryProfile {
-				warnings = append(warnings, fmt.Sprintf("Vault %q removed from Replicaro without updating its recovery profile.", deletedRepo.Name))
-			}
-			if cacheCleanupErr != nil {
-				warnings = append(warnings, "The vault was removed, but its local metadata cache requires manual cleanup.")
-			}
-			var cleanupErrors []error
-			if err := removeDeletedRcloneConfig(id); err != nil {
-				cleanupErrors = append(cleanupErrors, fmt.Errorf("vault was deleted but its local rclone config requires cleanup: %w", err))
-			}
-			if err := finalizeRepositoryArtifacts(stage); err != nil {
-				cleanupErrors = append(cleanupErrors, fmt.Errorf("vault was deleted but quarantined local engine artifacts require manual cleanup: %w", err))
-			}
-			if len(cleanupErrors) != 0 {
-				allErrors := make([]error, 0, len(warnings)+len(cleanupErrors))
-				for _, warning := range warnings {
-					allErrors = append(allErrors, errors.New(warning))
-				}
-				allErrors = append(allErrors, cleanupErrors...)
-				// Database deletion is already committed here. Preserve that truth in
-				// the API so a client cannot offer to keep or retry an absent vault.
-				writeCodedError(w, http.StatusInternalServerError, "vault_removal_cleanup_required", errors.Join(allErrors...).Error())
-				return
-			}
-
-			if len(warnings) != 0 {
-				writeJSON(w, map[string]any{
-					"warning": strings.Join(warnings, " "),
-				})
-				return
-			}
-			w.WriteHeader(http.StatusNoContent)
+			handleRepositoryRemoval(db, w, r)
 		}
 	})
 
@@ -1036,7 +942,10 @@ func handlerForExecutionInstanceWithReader(
 					writeError(w, http.StatusConflict, err)
 					return
 				}
-				if err := cleanupCreationFenceWithRetry(db, fencePath); err != nil {
+				// Inactivity was proven above, so this normally passes at once. The
+				// cleanup absorbs a momentary inherited holder and refuses a fence
+				// that stays held.
+				if err := cleanupCreationNativeFence(db, fencePath); err != nil {
 					writeJSONStatus(w, http.StatusOK, map[string]string{
 						"warning": "Pending creation was forgotten, but its inactive local creation fence still needs cleanup.",
 					})
@@ -1143,6 +1052,9 @@ func handlerForExecutionInstanceWithReader(
 			}
 			_, existingErr := database.GetJob(db, job.ID)
 			if errors.Is(existingErr, sql.ErrNoRows) {
+				if database.SourceBindingRecordsNoFacts(job) {
+					job = firstBindRestoredSource(r.Context(), job)
+				}
 				if _, err := database.CreateJob(db, job); err != nil {
 					writeError(w, http.StatusConflict, err)
 					return
@@ -1748,9 +1660,10 @@ func handlerForExecutionInstanceWithReader(
 				return
 			}
 			nativeContext, nativeProcessStarted := command.ContextWithProcessStartTracking(operationCtx)
-			// Engine-owned preparation can outlive the earlier owner read: Restic may
-			// auto-unlock and Kopia may connect or validate its operation config.
-			// Re-read canonical authority at the last boundary before native check.
+			// Engine-owned preparation can take longer than the earlier ownership check:
+			// Restic may auto-unlock and Kopia may connect or validate its operation
+			// config. Re-check ownership from the canonical record right before the
+			// native check runs.
 			nativeContext = engines.ContextWithIntegrityCheckAdmission(
 				nativeContext,
 				func(admissionContext context.Context) error {
@@ -1937,7 +1850,7 @@ func handlerForExecutionInstanceWithReader(
 			writeVisible(snapshots)
 			return
 		case "":
-			// Preserve the established File History endpoint behavior.
+			// File History calls this endpoint without a mode; keep returning the listing below for it.
 		default:
 			badRequest(w, "invalid snapshot listing mode")
 			return
@@ -2829,7 +2742,7 @@ func handlerForExecutionInstanceWithReader(
 			}
 			if validationErr != nil {
 				if r.Method == http.MethodPost {
-					markSupportStorageObservation(w, "job_create_source", validationErr)
+					markSupportStorageObservation(w, storageavailability.StageJobCreateSource, validationErr)
 				}
 				writeError(w, http.StatusConflict, validationErr)
 				return
@@ -3046,6 +2959,8 @@ func handlerForExecutionInstanceWithReader(
 		}
 	})
 
+	handle(mux, "/api/jobs/source", handleJobSourceUpdate(db))
+
 	handle(mux, "/api/jobs/run", func(w http.ResponseWriter, r *http.Request) {
 
 		jobID := r.URL.Query().Get("id")
@@ -3068,7 +2983,7 @@ func handlerForExecutionInstanceWithReader(
 			expectedSource := job.Source
 			job, err = bindImportedJobSourceStorage(r.Context(), job)
 			if err != nil {
-				markSupportStorageObservation(w, "job_bind_source", err)
+				markSupportStorageObservation(w, storageavailability.StageJobBindSource, err)
 				writeError(w, http.StatusConflict, err)
 				return
 			}
@@ -3247,7 +3162,7 @@ func handlerForExecutionInstanceWithReader(
 		if *req.Enabled && job.SourceBindingState == "unbound_imported" {
 			bound, bindErr := bindImportedJobSourceStorage(r.Context(), job)
 			if bindErr != nil {
-				markSupportStorageObservation(w, "job_bind_source", bindErr)
+				markSupportStorageObservation(w, storageavailability.StageJobBindSource, bindErr)
 				writeError(w, http.StatusConflict, bindErr)
 				return
 			}
@@ -3352,6 +3267,12 @@ func handlerForExecutionInstanceWithReader(
 			}
 
 			settings.EffectiveLocale = locale.Effective(settings.Language)
+			// Resolve the OS preference separately only when another language
+			// is saved; on macOS each resolution runs a bounded `defaults read`.
+			settings.SystemLocale = settings.EffectiveLocale
+			if settings.Language != models.LanguageSystem {
+				settings.SystemLocale = locale.Effective(models.LanguageSystem)
+			}
 			writeJSON(w, settings)
 
 		case http.MethodPost:
@@ -3402,8 +3323,10 @@ func handlerForExecutionInstanceWithReader(
 				NativeNotificationsOnFailure: req.NativeNotificationsOnFailure || req.NotifyWindowsOnFailure,
 				NotifyWebhookOnSuccess:       req.NotifyWebhookOnSuccess,
 				NotifyWebhookOnFailure:       req.NotifyWebhookOnFailure,
-				StartWithWindows:             req.StartWithWindows || req.StartAtLogin,
-				StartAtLogin:                 req.StartAtLogin || req.StartWithWindows,
+				// In headless LAN mode a request cannot turn Start at login off;
+				// see keepStartAtLogin above.
+				StartWithWindows:             req.StartWithWindows || req.StartAtLogin || keepStartAtLogin,
+				StartAtLogin:                 req.StartAtLogin || req.StartWithWindows || keepStartAtLogin,
 				MinimizeToTray:               req.MinimizeToTray,
 				MaxConcurrentJobRuns:         req.MaxConcurrentJobRuns,
 				DisableAutomaticUpdateChecks: req.DisableAutomaticUpdateChecks,
@@ -3496,7 +3419,7 @@ func NewServerAtWithRcloneAuthShutdown(
 		updater = updaters[0]
 	}
 	return buildServerAtWithSecurityMode(
-		db, db, endpoint, record, activate, 5*time.Second, SecurityModeProduction, updater, nil,
+		db, db, endpoint, nil, record, activate, 5*time.Second, SecurityModeProduction, updater, nil, false,
 	)
 }
 
@@ -3513,7 +3436,7 @@ func NewServerAtWithRcloneAuthShutdownManualBrowser(
 		updater = updaters[0]
 	}
 	return buildServerAtWithSecurityMode(
-		db, db, endpoint, record, activate, 5*time.Second, SecurityModeProduction, updater, nil,
+		db, db, endpoint, nil, record, activate, 5*time.Second, SecurityModeProduction, updater, nil, false,
 		rcloneAuthNoOpenBrowser,
 	)
 }
@@ -3532,19 +3455,24 @@ func NewServerAtWithRcloneAuthShutdownManualBrowserAndRuntime(
 		updater = updaters[0]
 	}
 	return buildServerAtWithSecurityMode(
-		db, db, endpoint, record, activate, 5*time.Second, SecurityModeProduction, updater, runtimeManager,
+		db, db, endpoint, nil, record, activate, 5*time.Second, SecurityModeProduction, updater, runtimeManager, false,
 		rcloneAuthNoOpenBrowser,
 	)
 }
 
 // NewServerAtWithReaderAndRuntime keeps all mutations and coordinator identity
-// on db while routing reviewed API queries through readDB.
+// on db while routing reviewed API queries through readDB. lanOrigins (from
+// --lan-origin) widen only the Host/Origin checks; the listener, endpoint, and
+// rendezvous identity stay loopback. keepStartAtLogin must be true exactly in
+// headless LAN mode.
 func NewServerAtWithReaderAndRuntime(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
+	lanOrigins runtimeendpoint.LANOrigins,
 	record rendezvous.Record,
 	activate func() error,
 	rcloneAuthNoOpenBrowser bool,
+	keepStartAtLogin bool,
 	runtimeManager *operationruntime.Manager,
 	updaters ...*appupdate.Service,
 ) (*http.Server, func() error) {
@@ -3553,17 +3481,21 @@ func NewServerAtWithReaderAndRuntime(
 		updater = updaters[0]
 	}
 	return buildServerAtWithSecurityMode(
-		db, readDB, endpoint, record, activate, 5*time.Second, SecurityModeProduction, updater, runtimeManager,
-		rcloneAuthNoOpenBrowser,
+		db, readDB, endpoint, lanOrigins, record, activate, 5*time.Second, SecurityModeProduction, updater, runtimeManager,
+		keepStartAtLogin, rcloneAuthNoOpenBrowser,
 	)
 }
 
 // NewContainerServerAtWithReaderAndRuntime keeps the ordinary public
 // loopback-origin security contract while enabling the package's temporary
 // container-side relay for pinned rclone's exact loopback OAuth callback.
+// lanOrigins are accepted as in the host build. There is no keepStartAtLogin
+// here: the container package never manages a login service, so Start at
+// login behaves as it always has even with --lan-origin.
 func NewContainerServerAtWithReaderAndRuntime(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
+	lanOrigins runtimeendpoint.LANOrigins,
 	record rendezvous.Record,
 	activate func() error,
 	rcloneAuthRelayPort int,
@@ -3575,7 +3507,7 @@ func NewContainerServerAtWithReaderAndRuntime(
 		updater = updaters[0]
 	}
 	return buildContainerServerAtWithSecurityMode(
-		db, readDB, endpoint, record, activate, 5*time.Second, SecurityModeProduction,
+		db, readDB, endpoint, lanOrigins, record, activate, 5*time.Second, SecurityModeProduction,
 		updater, runtimeManager, rcloneAuthRelayPort,
 	)
 }
@@ -3594,7 +3526,7 @@ func NewServerAtWithSecurityMode(db *sql.DB, endpoint runtimeendpoint.Endpoint, 
 
 func newServerAtWithSecurityMode(db *sql.DB, endpoint runtimeendpoint.Endpoint, record rendezvous.Record, activate func() error, readHeaderTimeout time.Duration, mode SecurityMode) *http.Server {
 	server, closeRcloneAuth := buildServerAtWithSecurityMode(
-		db, db, endpoint, record, activate, readHeaderTimeout, mode, appupdate.New(db), nil,
+		db, db, endpoint, nil, record, activate, readHeaderTimeout, mode, appupdate.New(db), nil, false,
 	)
 	server.RegisterOnShutdown(func() {
 		if err := closeRcloneAuth(); err != nil {
@@ -3607,23 +3539,27 @@ func newServerAtWithSecurityMode(db *sql.DB, endpoint runtimeendpoint.Endpoint, 
 func buildServerAtWithSecurityMode(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
+	lanOrigins runtimeendpoint.LANOrigins,
 	record rendezvous.Record,
 	activate func() error,
 	readHeaderTimeout time.Duration,
 	mode SecurityMode,
 	updater *appupdate.Service,
 	runtimeManager *operationruntime.Manager,
+	keepStartAtLogin bool,
 	manualRcloneBrowser ...bool,
 ) (*http.Server, func() error) {
 	rcloneAuth := newRcloneAuthStore(manualRcloneBrowser...)
 	return buildServerWithRcloneAuth(
-		db, readDB, endpoint, record, activate, readHeaderTimeout, mode, updater, runtimeManager, rcloneAuth,
+		db, readDB, endpoint, lanOrigins, record, activate, readHeaderTimeout, mode, updater, runtimeManager,
+		rcloneAuth, keepStartAtLogin,
 	)
 }
 
 func buildContainerServerAtWithSecurityMode(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
+	lanOrigins runtimeendpoint.LANOrigins,
 	record rendezvous.Record,
 	activate func() error,
 	readHeaderTimeout time.Duration,
@@ -3633,14 +3569,15 @@ func buildContainerServerAtWithSecurityMode(
 	rcloneAuthRelayPort int,
 ) (*http.Server, func() error) {
 	return buildServerWithRcloneAuth(
-		db, readDB, endpoint, record, activate, readHeaderTimeout, mode, updater, runtimeManager,
-		newContainerRcloneAuthStore(rcloneAuthRelayPort),
+		db, readDB, endpoint, lanOrigins, record, activate, readHeaderTimeout, mode, updater, runtimeManager,
+		newContainerRcloneAuthStore(rcloneAuthRelayPort), false,
 	)
 }
 
 func buildServerWithRcloneAuth(
 	db, readDB *sql.DB,
 	endpoint runtimeendpoint.Endpoint,
+	lanOrigins runtimeendpoint.LANOrigins,
 	record rendezvous.Record,
 	activate func() error,
 	readHeaderTimeout time.Duration,
@@ -3648,10 +3585,11 @@ func buildServerWithRcloneAuth(
 	updater *appupdate.Service,
 	runtimeManager *operationruntime.Manager,
 	rcloneAuth *rcloneAuthStore,
+	keepStartAtLogin bool,
 ) (*http.Server, func() error) {
 	server := &http.Server{
 		Handler: applicationHandlerAtWithSecurityModeAndRcloneAuth(
-			db, readDB, endpoint, record, activate, mode, rcloneAuth, updater, runtimeManager,
+			db, readDB, endpoint, lanOrigins, record, activate, mode, rcloneAuth, updater, keepStartAtLogin, runtimeManager,
 		),
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       15 * time.Second,

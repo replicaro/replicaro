@@ -11,6 +11,7 @@ import (
 	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/integrations"
 	"github.com/local/replicaro/models"
+	"github.com/local/replicaro/storageidentity"
 	"github.com/local/replicaro/vaultidentity"
 )
 
@@ -18,10 +19,11 @@ var ErrRepositoryIdentityExists = fmt.Errorf("vault identity already exists")
 var ErrStorageIdentityRequired = fmt.Errorf("filesystem storage binding is required")
 var ErrVaultProfilePending = fmt.Errorf("vault recovery profile synchronization changed during removal")
 
-// AssertVaultUUIDAvailable enforces duplicate-registration rejection. Native
-// repository IDs may legitimately be shared by copied repositories, while the
-// protected vault UUID remains the local registration and locking authority;
-// the separately confirmed update path intentionally does not call this gate.
+// AssertVaultUUIDAvailable rejects registering a vault whose UUID is already
+// saved. Copied repositories can legitimately share a native repository ID, so
+// the protected vault UUID is what identifies and locks a vault locally. The
+// separately confirmed "Update existing vault" path deliberately skips this
+// check.
 func AssertVaultUUIDAvailable(db *sql.DB, vaultUUID string) error {
 	vaultUUID = strings.TrimSpace(vaultUUID)
 	if vaultUUID == "" {
@@ -163,7 +165,12 @@ func scanRepo(scan func(dest ...any) error) (models.Repository, error) {
 		r.HasCredentials = engines.RcloneVaultCredentialsReady(ctx, r)
 		cancel()
 	}
-	r.IsNetwork = isNetworkFilesystemLocation(r.Connector, r.Location)
+	// The network label must come from stored data only. ListRepositories
+	// runs this while it iterates rows on the single writer connection
+	// (the scheduler's due-check scan does so every minute), so any
+	// filesystem call on the vault path here lets one hung share stall
+	// every database write. See isNetworkFilesystemLocation.
+	r.IsNetwork = isNetworkFilesystemLocation(r.Connector, r.Location, storedRepositoryFacts(r))
 	r.ConnectorLabel = vaultidentity.ConnectorLabel(r.Connector, r.Location, r.ConnectorOptions)
 	if r.Connector == "sftp" {
 		if effective, resolveErr := vaultidentity.ResolveEffectiveAddress(r.Connector, r.Location, r.ConnectorOptions); resolveErr == nil {
@@ -172,6 +179,22 @@ func scanRepo(scan func(dest ...any) error) (models.Repository, error) {
 	}
 
 	return r, err
+}
+
+// storedRepositoryFacts returns the storage facts recorded in a filesystem
+// vault's binding. Legacy storage_identity_v4 rows, remote vaults, and rows
+// whose binding cannot be decoded yield no facts; scanRepo has already
+// rejected inconsistent bindings through validateRepositoryStoredBinding.
+func storedRepositoryFacts(repo models.Repository) storageidentity.Facts {
+	if repo.Connector != "fs" {
+		return storageidentity.Facts{}
+	}
+	facts, _, err := storageidentity.DecodeBinding(repo.StorageIdentityVersion,
+		repo.StorageIdentityKey, repo.StorageIdentityJSON, repo.Location)
+	if err != nil {
+		return storageidentity.Facts{}
+	}
+	return facts
 }
 
 func encodeRepositoryObjectLock(repo models.Repository) (string, error) {
@@ -184,26 +207,6 @@ func encodeRepositoryObjectLock(repo models.Repository) (string, error) {
 		return "", err
 	}
 	return string(encoded), nil
-}
-
-func SetResolvedRepositoryPath(db *sql.DB, repositoryID, configuredPath, resolvedPath string, observedAt time.Time) error {
-	return setResolvedRepositoryPath(db.Exec, repositoryID, configuredPath, resolvedPath, observedAt)
-}
-
-func setResolvedRepositoryPath(exec func(string, ...any) (sql.Result, error), repositoryID, configuredPath, resolvedPath string, observedAt time.Time) error {
-	stored := resolvedPath
-	if stored == configuredPath {
-		stored = ""
-	}
-	result, err := exec(`UPDATE repositories SET resolved_repository_path=?, resolved_repository_observed_at=?
-		WHERE id=? AND connector='fs'`, stored, observedAt.UTC().Format(time.RFC3339Nano), repositoryID)
-	if err != nil {
-		return err
-	}
-	if count, _ := result.RowsAffected(); count != 1 {
-		return sql.ErrNoRows
-	}
-	return nil
 }
 
 func ListRepositories(db *sql.DB) ([]models.Repository, error) {
@@ -234,10 +237,10 @@ func ListRepositories(db *sql.DB) ([]models.Repository, error) {
 	return repos, nil
 }
 
-// TakeStartupStuckResticRepositories returns the exact Restic vaults whose
-// in-progress work was failed by Migrate on this application start. The
-// handoff is connection-local and non-durable; Restic remains solely
-// responsible for deciding whether its own unlock command removes anything.
+// TakeStartupStuckResticRepositories returns the Restic vaults whose
+// in-progress work Migrate marked failed during this application start. The
+// list lives only on this connection and is not persisted. Whether the later
+// Restic unlock actually removes anything is decided by Restic itself.
 func TakeStartupStuckResticRepositories(db *sql.DB) ([]models.Repository, error) {
 	rows, err := db.Query(`SELECT repository_id FROM startup_stuck_restic_repositories ORDER BY repository_id`)
 	if err != nil {
@@ -354,8 +357,9 @@ func UpdateRepositorySecrets(db *sql.DB, repositoryID, passphrase string, option
 	return tx.Commit()
 }
 
-// RepairMissingRepositoryProfileBinding restores only an absent local pointer
-// after remote authority has independently proven one exact attachment.
+// RepairMissingRepositoryProfileBinding fills in a missing local profile pointer
+// only. Callers use it after the remote recovery metadata has independently
+// confirmed exactly one attachment for this vault.
 func RepairMissingRepositoryProfileBinding(db *sql.DB, repositoryID, clientUUID, profileUUID string, generation int64) error {
 	if strings.TrimSpace(repositoryID) == "" || strings.TrimSpace(clientUUID) == "" ||
 		strings.TrimSpace(profileUUID) == "" || generation < 1 {
@@ -783,11 +787,12 @@ func UpdateRepositoryLocalPreferences(db *sql.DB, id, concurrencyMode string, au
 	return tx.Commit()
 }
 
-// AdoptRepositoryVaultCare copies authority already validated from the
-// protected root into the installation-local scheduler state. This is not an
-// object-lock transition requested by the local profile, so it deliberately
-// does not apply the forward-only transition rules used by settings edits.
-// Concurrency and auto-unlock remain local profile preferences.
+// AdoptRepositoryVaultCare copies vault-care settings (check and maintenance
+// schedules, Object Lock) already validated against the protected root into
+// this installation's scheduler state. This is not an Object Lock change
+// requested by the local profile, so it deliberately skips the forward-only
+// transition rules that settings edits use. Concurrency and auto-unlock stay
+// local profile preferences.
 func AdoptRepositoryVaultCare(db *sql.DB, id, checkSchedule, maintenanceSchedule string, objectLock models.ObjectLockSettings) error {
 	if !ValidSchedule(checkSchedule) || !ValidSchedule(maintenanceSchedule) {
 		return fmt.Errorf("invalid repository task schedule")
@@ -834,9 +839,10 @@ func AdoptRepositoryVaultCare(db *sql.DB, id, checkSchedule, maintenanceSchedule
 		if _, err := RefreshKopiaPolicyStatesTx(tx, []string{id}); err != nil {
 			return err
 		}
-		// A former non-owner may have an equal-digest terminal error from its
-		// deliberately rejected reconciliation attempt. Takeover must reopen the
-		// exact policy state, but it must not displace an active durable fence.
+		// A computer that was not the vault owner may have left a terminal error with
+		// the same digest from a reconciliation attempt that was rejected on purpose.
+		// On takeover, reset the policy state to dirty so it is verified again, but
+		// leave it alone while a reconciliation is applying or holds an active fence.
 		result, err := tx.Exec(`UPDATE kopia_policy_state SET state='dirty',applied_digest='',last_error=''
 			WHERE repository_id=? AND state<>'applying' AND active_fence_path=''`, id)
 		if err != nil {
@@ -972,6 +978,20 @@ func SetRepositoryOperationStatus(db *sql.DB, id, operation, status string) erro
 		column = "last_maintenance_status"
 	}
 	_, err := db.Exec(`UPDATE repositories SET `+column+` = ? WHERE id = ?`, status, id)
+	return err
+}
+
+// DeferRepositoryTask moves one due scheduled vault check or maintenance to
+// next without running it. The update only applies while the stored due time
+// is still expectedDue, so a schedule change or a run that completed in the
+// meantime is never overwritten.
+func DeferRepositoryTask(db *sql.DB, id, operation, expectedDue string, next time.Time) error {
+	column := "next_check"
+	if operation == "maintenance" {
+		column = "next_maintenance"
+	}
+	_, err := db.Exec(`UPDATE repositories SET `+column+`=? WHERE id=? AND `+column+`=?`,
+		next.Format(time.RFC3339), id, expectedDue)
 	return err
 }
 

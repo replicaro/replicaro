@@ -225,30 +225,6 @@ func scanJob(scan func(dest ...any) error) (models.BackupJob, error) {
 	return j, err
 }
 
-func setResolvedSourcePathTx(tx *sql.Tx, jobID, configuredPath, resolvedPath string, observedAt time.Time) error {
-	return setResolvedSourcePath(tx.Exec, jobID, configuredPath, resolvedPath, observedAt)
-}
-
-func SetResolvedSourcePath(db *sql.DB, jobID, configuredPath, resolvedPath string, observedAt time.Time) error {
-	return setResolvedSourcePath(db.Exec, jobID, configuredPath, resolvedPath, observedAt)
-}
-
-func setResolvedSourcePath(exec func(string, ...any) (sql.Result, error), jobID, configuredPath, resolvedPath string, observedAt time.Time) error {
-	stored := resolvedPath
-	if stored == configuredPath {
-		stored = ""
-	}
-	result, err := exec(`UPDATE backup_jobs SET resolved_source_path=?, resolved_source_observed_at=? WHERE id=?`,
-		stored, observedAt.UTC().Format(time.RFC3339Nano), jobID)
-	if err != nil {
-		return err
-	}
-	if count, _ := result.RowsAffected(); count != 1 {
-		return sql.ErrNoRows
-	}
-	return nil
-}
-
 func nullableRetentionValue(value sql.NullInt64) *int {
 	if !value.Valid {
 		return nil
@@ -467,6 +443,10 @@ func CreateJob(db *sql.DB, job models.BackupJob) (string, error) {
 		return "", err
 	}
 	id := job.ID
+	// A job restored with its original UUID (a dormant recovery definition)
+	// is already carried by snapshots in its vaults; a server-assigned UUID
+	// cannot be, so only the former changes any File History grouping.
+	restoredID := id != ""
 	if id == "" {
 		id = uuid.New().String()
 	}
@@ -517,6 +497,13 @@ func CreateJob(db *sql.DB, job models.BackupJob) (string, error) {
 		if _, err := tx.Exec(`INSERT INTO backup_job_targets (job_id, repository_id) VALUES (?, ?)`, id, target.RepositoryID); err != nil {
 			return "", err
 		}
+		// Only a restored or supplied ID can already have snapshots in this
+		// vault; a freshly generated one keeps Kopia's normal first backup.
+		if restoredID {
+			if err := markJobTargetFullSourceRead(tx, id, target.RepositoryID); err != nil {
+				return "", err
+			}
+		}
 	}
 	targetIDs := make([]string, 0, len(job.Targets))
 	for _, target := range job.Targets {
@@ -533,6 +520,9 @@ func CreateJob(db *sql.DB, job models.BackupJob) (string, error) {
 	}
 	if err := tx.Commit(); err != nil {
 		return "", err
+	}
+	if restoredID {
+		RefreshStaleMetadataGrouping(db, targetIDs)
 	}
 	return id, nil
 }
@@ -576,6 +566,14 @@ func UpdateJob(db *sql.DB, job models.BackupJob) error {
 	}
 	if err := validateJobSourceTransition(existingJob, job, false); err != nil {
 		return err
+	}
+	if normalizedJobSourceBindingState(existingJob.SourceBindingState) == "bound" {
+		// A definition update never changes the local binding. Writing the
+		// stored value (rather than the caller's copy) keeps a binding that
+		// was converted after the caller read the job.
+		job.SourceStorageVersion = existingJob.SourceStorageVersion
+		job.SourceStorageKey = existingJob.SourceStorageKey
+		job.SourceStorageDescriptorJSON = existingJob.SourceStorageDescriptorJSON
 	}
 	if err := validateJobSourceBinding(job); err != nil {
 		return err
@@ -690,13 +688,43 @@ func UpdateJob(db *sql.DB, job models.BackupJob) error {
 		return err
 	}
 	for _, target := range job.Targets {
-		if _, err := tx.Exec(`INSERT INTO backup_job_targets (job_id, repository_id) VALUES (?, ?)
-			ON CONFLICT(job_id, repository_id) DO NOTHING`, job.ID, target.RepositoryID); err != nil {
+		inserted, err := tx.Exec(`INSERT INTO backup_job_targets (job_id, repository_id) VALUES (?, ?)
+			ON CONFLICT(job_id, repository_id) DO NOTHING`, job.ID, target.RepositoryID)
+		if err != nil {
 			return err
+		}
+		// A vault newly added to this job may be one it used before, still
+		// holding its snapshots from another folder. Targets the job already
+		// had hit the conflict, insert nothing, and keep their flag.
+		count, err := inserted.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if count == 1 {
+			if err := markJobTargetFullSourceRead(tx, job.ID, target.RepositoryID); err != nil {
+				return err
+			}
 		}
 	}
 	if _, err := RefreshKopiaPolicyStatesTx(tx, affected); err != nil {
 		return err
+	}
+	// File History groups a vault's Restic snapshots of a job under the job's
+	// source only while the job targets that vault, so a vault joining or
+	// leaving the job, or an unbound imported job's source changing, can move
+	// snapshots between grouping roots in exactly those vaults.
+	groupingChanged := []string{}
+	newActiveTargets := make(map[string]bool, len(job.Targets))
+	for _, target := range job.Targets {
+		newActiveTargets[target.RepositoryID] = true
+		if existingJob.Source != job.Source || !oldActiveTargets[target.RepositoryID] {
+			groupingChanged = append(groupingChanged, target.RepositoryID)
+		}
+	}
+	for repositoryID := range oldActiveTargets {
+		if !newActiveTargets[repositoryID] {
+			groupingChanged = append(groupingChanged, repositoryID)
+		}
 	}
 	if _, err := tx.Exec(`INSERT INTO activity_log (timestamp, level, message) VALUES (datetime('now'), 'INFO', ?)`, "Backup job updated: "+job.Name); err != nil {
 		return err
@@ -704,6 +732,7 @@ func UpdateJob(db *sql.DB, job models.BackupJob) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	RefreshStaleMetadataGrouping(db, groupingChanged)
 	return nil
 }
 
@@ -725,10 +754,17 @@ func validateJobSourceTransition(existing, next models.BackupJob, allowFirstBind
 	if existing.Source != next.Source {
 		return ErrJobSourceImmutable
 	}
-	if existingState != nextState ||
-		existing.SourceStorageVersion != next.SourceStorageVersion ||
-		existing.SourceStorageKey != next.SourceStorageKey ||
-		existing.SourceStorageDescriptorJSON != next.SourceStorageDescriptorJSON {
+	// The binding is immutable after first binding with two exceptions, and
+	// neither goes through this function: the one-time conversion of a legacy
+	// binding by a successful probe (convertLegacySourceBindingTx) and a user's
+	// "Update job source" (UpdateJobSourceAlias), which records the alias's
+	// facts. A caller that read the row before a legacy conversion still
+	// passes, and UpdateJob keeps the stored value. Do not widen this check to
+	// accept other binding changes: definition edits must never move the
+	// location a job reads from.
+	if existingState != nextState || !equivalentSourceBinding(
+		existing.SourceStorageVersion, existing.SourceStorageKey, existing.SourceStorageDescriptorJSON,
+		next.SourceStorageVersion, next.SourceStorageKey, next.SourceStorageDescriptorJSON) {
 		return ErrJobSourceImmutable
 	}
 	return nil
@@ -900,6 +936,9 @@ func DeleteJob(db *sql.DB, id string) error {
 	if count, _ := result.RowsAffected(); count == 0 {
 		return sql.ErrNoRows
 	}
+	// The job's Restic snapshots stay in its vaults as unmanaged snapshots and
+	// return to their native grouping root once the grouping is refreshed.
+	targetRepositoryIDs := append([]string(nil), affected...)
 	dormantAffected, err := deleteDormantRecoveryJobEverywhere(tx, id)
 	if err != nil {
 		return err
@@ -911,13 +950,17 @@ func DeleteJob(db *sql.DB, id string) error {
 	if err := markVaultProfilesDirty(tx, mergePortableTargetIDs(affected)); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	RefreshStaleMetadataGrouping(db, targetRepositoryIDs)
+	return nil
 }
 
-// ValidateJobDeletionAdmission proves that deleting a job is currently
-// admissible without changing its authoritative definition. Callers that must
-// perform exact native cleanup first use this gate before crossing that native
-// boundary; DeleteJob repeats the same checks transactionally afterward.
+// ValidateJobDeletionAdmission checks that the job can be deleted right now,
+// without changing its stored definition. Callers that must run native cleanup
+// first call this before starting it; DeleteJob repeats the same checks in its
+// transaction afterward.
 func ValidateJobDeletionAdmission(db *sql.DB, id string) error {
 	tx, err := db.Begin()
 	if err != nil {
@@ -1054,6 +1097,7 @@ func SetJobEnabledWithSourceBindingCommitted(db *sql.DB, id string, enabled bool
 	if err := rows.Close(); err != nil {
 		return false, err
 	}
+	targetRepositoryIDs := append([]string(nil), affected...)
 	job, err := scanJob(tx.QueryRow(`SELECT `+jobColumns+` FROM backup_jobs WHERE id = ?`, id).Scan)
 	if err != nil {
 		return false, err
@@ -1073,6 +1117,11 @@ func SetJobEnabledWithSourceBindingCommitted(db *sql.DB, id string, enabled bool
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
+	}
+	if bindSource {
+		// First binding sets the source File History groups this job's Restic
+		// snapshots under.
+		RefreshStaleMetadataGrouping(db, targetRepositoryIDs)
 	}
 	return true, nil
 }
@@ -1157,7 +1206,13 @@ func BindImportedJobSource(db *sql.DB, expectedSource string, bound models.Backu
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// First binding sets the source File History groups this job's Restic
+	// snapshots under.
+	RefreshStaleMetadataGrouping(db, jobTargetRepositoryIDs(db, bound.ID))
+	return nil
 }
 
 func SetJobEnabled(db *sql.DB, id string, enabled bool) error {

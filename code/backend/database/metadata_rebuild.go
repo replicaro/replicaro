@@ -21,9 +21,10 @@ type MetadataRebuildSnapshot struct {
 var publishMetadataReplacement = replaceMetadataCacheFile
 
 // RebuildMetadataCache runs only under the existing low-priority vault admission
-// and coordinator serialization. The original remains the recovery copy until
-// one same-directory atomic replacement publishes both contents and bucket count.
-// Nothing here writes a native repository or adds another remote locking scheme.
+// and coordinator serialization. The original stays the recovery copy until one
+// same-directory atomic replacement publishes both contents and bucket count.
+// This never writes to a native repository and adds no remote locking of its
+// own; any locks come from the engine's own listing commands.
 func RebuildMetadataCache(ctx context.Context, db *sql.DB, repositoryID string, count int64,
 	snapshots []MetadataRebuildSnapshot, listMissing func(context.Context, models.Snapshot) ([]models.SnapshotEntry, error),
 	finishNative func() error) (resultErr error) {
@@ -202,8 +203,8 @@ func RebuildMetadataCache(ctx context.Context, db *sql.DB, repositoryID string, 
 	if err := finishNative(); err != nil {
 		return err
 	}
-	// This is the existing one final authoritative binding/generation read. A
-	// newer local reservation leaves the original intact and the cache dirty.
+	// This is the single final read of the binding and generation. A newer
+	// local reservation leaves the original intact and the cache dirty.
 	latest, err := LoadMetadataReadAuthority(ctx, db, repositoryID)
 	if err != nil {
 		return err

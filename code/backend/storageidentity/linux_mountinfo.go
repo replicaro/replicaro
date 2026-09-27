@@ -6,19 +6,18 @@ import (
 	"fmt"
 	"io"
 	"path"
-	"path/filepath"
 	"strconv"
 	"strings"
 )
 
+// LinuxMount is one parsed /proc/self/mountinfo record. The parser is kept
+// platform-independent so it can be tested on any host.
 type LinuxMount struct {
-	// MountID is a run-local lookup fact, never a persistent storage identity.
+	// MountID is a run-local lookup key for the opened folder's mount. It is
+	// never persisted.
 	MountID    uint64
-	MajorMinor string
-	Root       string
 	MountPoint string
 	Filesystem string
-	Source     string
 }
 
 func ParseLinuxMountInfo(reader io.Reader) ([]LinuxMount, error) {
@@ -47,21 +46,14 @@ func ParseLinuxMountInfo(reader io.Reader) ([]LinuxMount, error) {
 		if err != nil || mountID == 0 {
 			return nil, fmt.Errorf("invalid mountinfo mount ID")
 		}
-		root, err := decodeMountInfo(left[3])
-		if err != nil {
-			return nil, err
-		}
+		// Only the mount ID, mount point, and filesystem type are recorded
+		// facts; the other fields (major:minor, root, source) are not read.
 		point, err := decodeMountInfo(left[4])
 		if err != nil {
 			return nil, err
 		}
-		source, err := decodeMountInfo(right[1])
-		if err != nil {
-			return nil, err
-		}
 		mounts = append(mounts, LinuxMount{
-			MountID: mountID, MajorMinor: left[2], Root: path.Clean(root), MountPoint: path.Clean(point),
-			Filesystem: strings.ToLower(right[0]), Source: source,
+			MountID: mountID, MountPoint: path.Clean(point), Filesystem: strings.ToLower(right[0]),
 		})
 	}
 	if err := scanner.Err(); err != nil {
@@ -106,125 +98,4 @@ func linuxMountByID(mounts []LinuxMount, id uint64) (LinuxMount, error) {
 		return LinuxMount{}, fmt.Errorf("observed mount is absent from mountinfo")
 	}
 	return selected, nil
-}
-
-type LinuxBlockFacts struct {
-	VolumeUUID string
-}
-
-type LinuxBlockFactsLookup func(LinuxMount) (LinuxBlockFacts, error)
-
-func DescriptorFromLinuxMount(value string, mount LinuxMount, blockFacts LinuxBlockFactsLookup) (Descriptor, error) {
-	relative, err := filepath.Rel(mount.MountPoint, value)
-	if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
-		return Descriptor{}, fmt.Errorf("storage path is outside selected mount")
-	}
-	relative = cleanRelative(filepath.ToSlash(relative))
-	filesystem := strings.ToLower(strings.TrimSpace(mount.Filesystem))
-	switch filesystem {
-	case "cifs", "smb3", "smbfs":
-		endpoint, share, err := ParseSMBSource(mount.Source)
-		if err != nil {
-			return Descriptor{}, err
-		}
-		d := Descriptor{Version: DescriptorVersion, Kind: KindSMB, Filesystem: filesystem,
-			Endpoint: endpoint, Share: share, MountRoot: cleanRoot(mount.Root), RelativePath: relative,
-			StorageClass: StorageClassNetwork}
-		return d, d.Validate()
-	case "nfs", "nfs4":
-		endpoint, export, err := ParseNFSSource(mount.Source)
-		if err != nil {
-			return Descriptor{}, err
-		}
-		d := Descriptor{Version: DescriptorVersion, Kind: KindNFS, Filesystem: filesystem,
-			Endpoint: endpoint, Export: export, MountRoot: cleanRoot(mount.Root), RelativePath: relative,
-			StorageClass: StorageClassNetwork}
-		return d, d.Validate()
-	}
-	if isAmbiguousLinuxMountFilesystem(filesystem) {
-		return pathOnlyDescriptor(value, filesystem, StorageClassOther)
-	}
-	if !isAuthoritativeLocalLinuxFilesystem(filesystem) &&
-		!strings.HasPrefix(mount.Source, "/dev/") && filesystem != "btrfs" {
-		return pathOnlyDescriptor(value, filesystem, StorageClassOther)
-	}
-	if strings.HasPrefix(mount.Source, "/dev/") || filesystem == "btrfs" {
-		if blockFacts == nil {
-			return Descriptor{}, fmt.Errorf("authoritative filesystem identity is unavailable")
-		}
-		facts, err := blockFacts(mount)
-		if err != nil {
-			return Descriptor{}, fmt.Errorf("authoritative filesystem identity is unavailable: %w", err)
-		}
-		uuid := strings.TrimSpace(facts.VolumeUUID)
-		if uuid == "" {
-			return pathOnlyDescriptorAtMount(value, filesystem, StorageClassLocal, mount.MountPoint)
-		}
-		d := Descriptor{Version: DescriptorVersion, Kind: KindVolume, Filesystem: filesystem,
-			VolumeID: strings.ToLower(strings.TrimSpace(uuid)), MountRoot: cleanRoot(mount.Root),
-			RelativePath: relative, StorageClass: StorageClassLocal}
-		return d, d.Validate()
-	}
-	// These explicitly classified local filesystems retain their authoritative
-	// local class and actual type in the one identityless source binding.
-	// Unknown and ambiguous filesystems above remain classed as other.
-	return pathOnlyDescriptorAtMount(value, filesystem, StorageClassLocal, mount.MountPoint)
-}
-
-func isAmbiguousLinuxMountFilesystem(filesystem string) bool {
-	if strings.HasPrefix(filesystem, "fuse") {
-		return true
-	}
-	switch filesystem {
-	case "9p", "afs", "ceph", "coda", "curlftpfs", "davfs", "davfs2",
-		"gcsfuse", "glusterfs", "sshfs":
-		return true
-	default:
-		return false
-	}
-}
-
-func isAuthoritativeLocalLinuxFilesystem(filesystem string) bool {
-	switch filesystem {
-	// These non-block-backed filesystems have local process/host storage
-	// semantics. Unknown and FUSE-backed filesystems remain ambiguous: a
-	// disconnected network mount can expose a different directory at the same
-	// pathname and therefore must not inherit local identity.
-	case "aufs", "overlay", "ramfs", "rootfs", "tmpfs", "zfs":
-		return true
-	default:
-		return false
-	}
-}
-
-func ParseSMBSource(source string) (endpoint, share string, err error) {
-	source = strings.ReplaceAll(strings.TrimSpace(source), `\`, "/")
-	if !strings.HasPrefix(source, "//") {
-		return "", "", fmt.Errorf("SMB mount source must be an exact UNC share")
-	}
-	parts := strings.Split(strings.TrimPrefix(source, "//"), "/")
-	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return "", "", fmt.Errorf("SMB mount source is ambiguous")
-	}
-	// Darwin may expose a mounted SMB source as //user@server/share. The
-	// authenticated user is not part of the physical share identity.
-	if index := strings.LastIndex(parts[0], "@"); index >= 0 {
-		parts[0] = parts[0][index+1:]
-		if parts[0] == "" {
-			return "", "", fmt.Errorf("SMB mount source is ambiguous")
-		}
-	}
-	return strings.ToLower(parts[0]), strings.ToLower(parts[1]), nil
-}
-
-func ParseNFSSource(source string) (endpoint, export string, err error) {
-	index := strings.Index(source, ":/")
-	if index <= 0 {
-		return "", "", fmt.Errorf("NFS mount source must identify server and export")
-	}
-	endpoint, export = source[:index], source[index+1:]
-	if endpoint == "" || export == "" || hasDotSegment(export) {
-		return "", "", fmt.Errorf("NFS mount source is ambiguous")
-	}
-	return strings.ToLower(endpoint), cleanRoot(export), nil
 }

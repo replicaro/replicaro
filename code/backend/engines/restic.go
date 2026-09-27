@@ -27,9 +27,9 @@ import (
 	"github.com/local/replicaro/models"
 )
 
-// ErrColdStorageArchivedObject identifies the exact pinned-Restic ordinary-S3
-// failure that has a Replicaro connection remedy. Native output remains
-// separate and available to callers for operation diagnostics.
+// ErrColdStorageArchivedObject marks the pinned Restic failure on a regular S3
+// connection that the user can fix by reconnecting the vault as Cold Storage.
+// Restic's own output is kept separately for operation diagnostics.
 var ErrColdStorageArchivedObject = errors.New(models.ColdStorageArchivedObjectHelp)
 
 type resticEngine struct {
@@ -75,9 +75,9 @@ func (e *resticEngine) descriptor(ctx context.Context) Descriptor {
 }
 
 func resticLiveOutputEnabled(_ models.Repository, args []string) bool {
-	// Investigation of the pinned engine commands found no evidence that ordinary
-	// output exposes stored passwords or keys. Restic therefore owns that output
-	// for every connector; Replicaro redacts only the public support export.
+	// We found no case where the pinned Restic commands print stored passwords or
+	// keys in their normal output, so live output is shown unchanged for every
+	// connector. Only the public support export is redacted.
 	return eligibleResticLiveCommand(args)
 }
 
@@ -102,9 +102,9 @@ func (e *resticEngine) Info(ctx context.Context, repo models.Repository) (output
 	return out, nil
 }
 func (e *resticEngine) Create(ctx context.Context, repo models.Repository) (output string, err error) {
-	// Vault creation is a requested ordinary native command. Its init output
-	// can reassure the user while the HTTP response is still pending; private
-	// config and identity probes retain their separate suppressed boundaries.
+	// Vault creation runs a user-requested restic init, so stream its output: it
+	// shows progress while the HTTP response is still pending. The private config
+	// and identity probes still keep their output hidden.
 	ctx = command.ContextWithLiveOutputEnabled(ctx)
 	out, err := e.runRepo(ctx, repo, []string{"init", "--repository-version", "2", "--compression", "auto"}, command.NoTotalDeadline)
 	return out, err
@@ -330,9 +330,9 @@ func (e *resticEngine) ListPath(ctx context.Context, repo models.Repository, id,
 	return e.listPath(ctx, repo, id, path, false)
 }
 
-// This is an indexing convention, not profile visibility or retention authority.
-// A deleted job keeps its native source layout. Profile markers are evaluated
-// separately by the ordinary presentation classifier.
+// This only decides how snapshots are indexed; it doesn't affect profile
+// visibility or retention. A deleted job keeps its native source layout.
+// Profile markers are handled separately by the presentation classifier.
 func resticHasJobTag(tags []string) bool {
 	count := 0
 	for _, tag := range tags {
@@ -637,15 +637,15 @@ func (e *resticEngine) Check(ctx context.Context, repo models.Repository, id str
 		// integrity check remains a native check instead of staging a restore.
 		args = append(args, id)
 	}
-	// Replicaro admits integrity checks only for the current vault owner and
-	// serializes all Replicaro work with the managed vault UUID lock. For the
+	// Replicaro runs integrity checks only for the current vault owner and
+	// serializes all of its own work with the managed vault UUID lock. For the
 	// supported external-backup overlap, Restic's publication order keeps this
 	// safe: an unindexed pack is a non-critical additional file, an
 	// indexed pack is verified even if its snapshot was not captured, and a pack
 	// published after enumeration is deferred to the next check. Success covers
 	// the repository view captured by this run, not every concurrent upload.
-	// Independently launched native mutations remain outside Replicaro's safety
-	// boundary and must not be overlapped with this no-lock check.
+	// Restic mutations started outside Replicaro aren't covered by any of this
+	// and must not run at the same time as this no-lock check.
 	out, err := e.runRepoWithGlobal(ctx, repo, []string{"--no-cache", "--no-lock"}, args, command.NoTotalDeadline)
 	return out, err
 }
@@ -770,10 +770,9 @@ func (e *resticEngine) runRepoCommand(ctx context.Context, repo models.Repositor
 	}
 	env := append([]string{"RESTIC_PASSWORD=" + repo.Passphrase, "RESTIC_CACHE_DIR=" + cache}, connectorEnv...)
 	if eligibleResticLiveCommand(args) {
-		// Restic's native progress cadence is scoped only to the same requested
-		// user-facing commands that own live presentation. Internal probes and
-		// setup commands must not inherit it, and no user option can override the
-		// adapter-owned environment value.
+		// Only the user-facing commands that show live progress get Restic's progress
+		// rate. Internal probes and setup commands must not inherit it, and user
+		// options can't override this environment value.
 		env = append(env, "RESTIC_PROGRESS_FPS=0.5")
 	}
 	commandArgs := append(append([]string{}, global...), "--repo", repository)
@@ -864,9 +863,9 @@ func (e *resticEngine) runRepoCommand(ctx context.Context, repo models.Repositor
 	started := processStarted() || runErr == nil
 	if closeStorage != nil {
 		closeErr := closeStorage()
-		// The selected local config is reopened after rclone can refresh it. A
-		// local cleanup failure is follow-up truth, not a provider postcheck or
-		// an alteration of the requested Restic command's native result.
+		// Closing reopens the selected local config after rclone may have refreshed
+		// it. A cleanup failure here is reported as a separate follow-up error; it is
+		// not a provider check and doesn't change the Restic command's own result.
 		if closeErr != nil {
 			return output, resticCommandCleanupFailure(runErr, &privateOutputError{
 				message: "local rclone session cleanup failed", cause: closeErr,
@@ -909,9 +908,9 @@ func resticCapturedNativeFailure(err error) bool {
 	if nativeErr != nil {
 		return true
 	}
-	// Test adapters may return a plain process error rather than the production
-	// command carrier. A typed output-only failure is the one case that must not
-	// be promoted to native failure truth.
+	// Test adapters may return a plain process error instead of the production
+	// command error type. The one case that must not count as a Restic failure is
+	// a typed failure that only affected output capture.
 	return outputErr == nil
 }
 
@@ -966,9 +965,9 @@ func resticFileBackedOutput(args []string) bool {
 	case "backup", "restore", "check", "prune", "forget", "snapshots", "ls":
 		return true
 	default:
-		// init, unlock, key passwd, and cat config return bounded control outcomes
-		// or one fixed repository-config protocol record. They do not enumerate
-		// repository content and retain the explicit legacy inline boundary.
+		// init, unlock, key passwd, and cat config return short control results or a
+		// single repository-config record. They don't list repository content, so
+		// their output stays in memory instead of being staged to a file.
 		return false
 	}
 }
@@ -1205,8 +1204,8 @@ func parseResticBackupReader(output io.Reader) (models.Snapshot, error) {
 		_, uniqueErr := decodeUniqueJSON([]byte(line))
 		ambiguousSize := false
 		if uniqueErr != nil && strings.Contains(uniqueErr.Error(), `duplicate JSON field "total_bytes_processed"`) {
-			// Preserve independently conclusive identity from the native summary,
-			// but never publish an ambiguous optional statistics value.
+			// A duplicated total_bytes_processed makes the size ambiguous. Still take the
+			// snapshot ID and time from the summary, but don't report a size.
 			var ignored any
 			uniqueErr = json.Unmarshal([]byte(line), &ignored)
 			ambiguousSize = true

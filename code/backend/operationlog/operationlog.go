@@ -49,9 +49,9 @@ type nativeBodyFingerprint struct {
 	endsWithLineBreak bool
 }
 
-// Section is one presentation boundary in an operation's local diagnostic
-// file. Ordinary native bodies retain engine-owned content; the support export
-// sanitizes only the bounded copy it reads for a public report.
+// Section is one entry in an operation's local diagnostic file. Native output
+// is stored as the engine wrote it; the support export sanitizes only the
+// bounded copy it reads for a public report.
 type Section struct {
 	Engine string
 	Domain string
@@ -158,10 +158,10 @@ func lockOperations(operationIDs []string) func() {
 	}
 }
 
-// StageNativeOutput copies exact ordinary stdout and stderr into owner-only
-// operation-log staging files without retaining either stream in memory. It is
-// presentation-only: callers deliberately ignore an error so native result
-// truth never depends on local diagnostic persistence.
+// StageNativeOutput copies stdout and stderr unchanged into owner-only
+// operation-log staging files without holding either stream in memory. It is
+// for display only: callers deliberately ignore its error so a failure to
+// save diagnostics never changes the operation's result.
 func StageNativeOutput(operationID, engine, kind, status, diagnostic string, stdout, stderr io.Reader) error {
 	if _, err := canonicalID(operationID); err != nil {
 		return err
@@ -574,9 +574,9 @@ func AppendFinal(operationID, engine, kind, status, output string) error {
 	return err
 }
 
-// FinalizeSection holds the narrow local file barrier across the authoritative
-// SQLite step transition and its owned append attempt. A diagnostic I/O error
-// remains result-neutral once persistence succeeds.
+// FinalizeSection holds the per-operation log lock across the SQLite step
+// update (the source of truth) and its log append. Once the database write
+// succeeds, a log I/O error doesn't change the result.
 func FinalizeSection(operationID string, section Section, persist func() error) error {
 	filename, err := path(operationID)
 	if err != nil {

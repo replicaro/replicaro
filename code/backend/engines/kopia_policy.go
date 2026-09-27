@@ -118,8 +118,8 @@ type KopiaManagedPolicySource struct {
 	KeepAnnual  int      `json:"keep_annual"`
 }
 
-// KopiaManagedPolicyDesiredState is intentionally Kopia-specific. It is not a
-// generalized engine lifecycle contract.
+// KopiaManagedPolicyDesiredState is intentionally Kopia-specific. Do not turn
+// it into a shared lifecycle type for other engines.
 type KopiaManagedPolicyDesiredState struct {
 	Version             int                        `json:"version"`
 	MaintenanceSchedule string                     `json:"maintenance_schedule"`
@@ -496,9 +496,9 @@ func EnsureKopiaMaintenanceOwner(ctx context.Context, engine Engine, repo models
 		}
 		args = append(args, "--list-parallelism", fmt.Sprint(concurrency.maintenanceList))
 	}
-	// Native identity is engine preparation. The protected owner/intent callback
-	// below must run after it and remain the final admission before maintenance
-	// set, with no native child in between.
+	// Check the native repository identity first. The vault-owner/intent callback
+	// below must run after it and be the last check before "maintenance set", with
+	// no other native command in between.
 	status, err := session.run(ctx, []string{"repository", "status", "--json"}, command.NoTotalDeadline)
 	if err != nil {
 		return status, err
@@ -531,10 +531,11 @@ func EnsureKopiaMaintenanceOwner(ctx context.Context, engine Engine, repo models
 	return output, nil
 }
 
-// ConfigureKopiaObjectLockForEnrollment is limited to the first unmanaged
-// import, where no protected Replicaro root exists yet to authorize through.
-// The connection intent and managed vault UUID lock are the durable boundary;
-// ordinary edits must go through the reconciler's fresh root-owner admission.
+// ConfigureKopiaObjectLockForEnrollment is only for the first import of an
+// unmanaged repository, when no protected Replicaro root exists yet to check
+// vault ownership against. The connection intent and the managed vault UUID
+// lock protect this step instead; later edits must go through the reconciler,
+// which re-checks root ownership first.
 func ConfigureKopiaObjectLockForEnrollment(ctx context.Context, engine Engine, repo models.Repository) (string, error) {
 	if !repo.ObjectLock.Enrolled || repo.ObjectLock.Paused {
 		return "", fmt.Errorf("initial object lock enrollment must be active")
@@ -549,10 +550,10 @@ func ConfigureKopiaObjectLockForEnrollment(ctx context.Context, engine Engine, r
 		return "", err
 	}
 	var output strings.Builder
-	// Initial enrollment has no protected root, so its immutable connection
-	// intent/profile callback is the Object Lock mutation authority. Let the
-	// shared helper invoke it after its last native-identity preparation and
-	// immediately before the first provider-wide command.
+	// Initial enrollment has no protected root, so the connection intent/profile
+	// callback decides whether the Object Lock change is allowed. The shared helper
+	// calls it after its last native-identity check and immediately before the
+	// first provider-wide command.
 	ctx = ContextWithKopiaObjectLockMutationAdmission(ctx, func(admissionContext context.Context) error {
 		return admitKopiaMaintenanceMutation(admissionContext)
 	})
@@ -766,11 +767,12 @@ func joinKopiaPolicyOutput(left, right string) string {
 
 type kopiaObjectLockMutationAdmissionKey struct{}
 
-// ContextWithKopiaObjectLockMutationAdmission keeps provider-wide mutation at
-// the exact owner-authorized boundary without teaching the engine adapter how
-// to read Replicaro's recovery sidecar. Ordinary job-policy reconciliation can
-// still run on non-owner attachments when the protected repository settings
-// already match.
+// ContextWithKopiaObjectLockMutationAdmission installs the authorization check
+// that must pass before any provider-wide Object Lock change (the vault-owner
+// check, or the connection-intent check during initial enrollment), so the
+// engine adapter does not need to know how to read Replicaro's recovery sidecar.
+// Normal job-policy reconciliation can still run on non-owner attachments when
+// the protected repository settings already match.
 func ContextWithKopiaObjectLockMutationAdmission(ctx context.Context, admit func(context.Context) error) context.Context {
 	return context.WithValue(ctx, kopiaObjectLockMutationAdmissionKey{}, admit)
 }
@@ -872,10 +874,10 @@ func applyKopiaObjectLockSettings(
 		if err != nil {
 			return err
 		}
-		// Initial enrollment has no protected root yet. Its connection intent
-		// authorizes this one profile-derived repository-wide maintenance value;
-		// ordinary Object Lock reconciliation leaves it to owner-only maintenance
-		// alignment so a nonowner's local profile setting cannot create drift.
+		// Initial enrollment has no protected root yet, so the connection intent
+		// allows setting list parallelism from this computer's profile here. Normal
+		// Object Lock reconciliation leaves that to the vault owner's maintenance
+		// alignment, so a non-owner's local profile setting cannot cause drift.
 		disableExtensionArgs = append(disableExtensionArgs, "--list-parallelism", fmt.Sprint(concurrency.maintenanceList))
 	}
 	retentionArgs := []string{"repository", "set-parameters"}
@@ -896,8 +898,8 @@ func applyKopiaObjectLockSettings(
 	if includeListParallelism {
 		finalMaintenanceArgs = append(finalMaintenanceArgs, "--list-parallelism", fmt.Sprint(concurrency.maintenanceList))
 	}
-	// Native identity is preparation; protected owner/intent authorization must
-	// follow it and remain the final admission before the first mutation.
+	// Check the native repository identity first; the vault-owner/intent check
+	// must follow it and be the last check before the first mutation.
 	status, err := session.run(ctx, []string{"repository", "status", "--json"}, command.NoTotalDeadline)
 	if err != nil {
 		return err
@@ -1041,8 +1043,8 @@ func (e *kopiaEngine) inspectManagedPoliciesScoped(ctx context.Context, repo mod
 			selectedTargets = append(selectedTargets, target)
 			continue
 		}
-		// A different path in this selected job namespace is locally
-		// authoritative ambiguity and must be retained so readiness rejects it.
+		// A different path in this job's namespace is ambiguous. Keep it in the
+		// selection so the readiness check rejects it.
 		selectedTargets = append(selectedTargets, target)
 	}
 	policies := make(map[string]json.RawMessage, len(selectedTargets))

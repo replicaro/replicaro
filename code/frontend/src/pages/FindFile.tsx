@@ -5,12 +5,15 @@ import { createPortal } from "react-dom";
 import { useNavigate, useParams } from "react-router-dom";
 
 import { DirectoryField } from "../components/DirectoryPicker";
+import { JobSourceLabel } from "../components/JobSourceLabel";
+import { fileHistorySourceJob, jobSourceTooltip, pathWithinJob } from "../jobSourceDisplay";
 import { MetadataIndexNotice } from "../components/MetadataIndexNotice";
 import { EmptyState, Icon, Loading, Modal, parseTime, Tooltip, useToast } from "../components/ui";
 import {
 	APIError,
 	browseFiles,
 	getFileHistory,
+	getJobs,
 	getMetadataStatus,
 	getOperation,
     getEngines,
@@ -25,7 +28,7 @@ import {
 } from "../services/api";
 import type { MetadataPreparationStatus } from "../services/api";
 import { defaultConflictMode, restoreCapability, restoreConflictModeLabel } from "../restoreCapabilities";
-import type { EngineDescriptor, FileBrowseEntry, FileSearchResult, FileVersion, MetadataIndexState, Repository, Snapshot } from "../types";
+import type { BackupJob, EngineDescriptor, FileBrowseEntry, FileSearchResult, FileVersion, MetadataIndexState, Repository, Snapshot } from "../types";
 
 type RestoreMode = "single" | "individual";
 type HistoryMap = Record<string, FileVersion[]>;
@@ -163,8 +166,12 @@ function splitDisplayPath(value: string, windows = false) {
 		: { parent: value.slice(0, separator + 1), name: value.slice(separator + 1) };
 }
 
-function FilePathLabel({ value, source, tooltipPath }: { value: string; source?: string; tooltipPath?: string }) {
+// withinJob: the row belongs to a job-owned source, so its tooltip shows the
+// item's path within the job (for example 2024\IMG_001.jpg) instead of a full
+// native path. Unmanaged sources keep the native presentation.
+function FilePathLabel({ value, source, tooltipPath: nativeTooltipPath, withinJob = false }: { value: string; source?: string; tooltipPath?: string; withinJob?: boolean }) {
     const path = displayFilePath(value, source);
+	const tooltipPath = withinJob && nativeTooltipPath !== undefined ? pathWithinJob(value, source ?? "") : nativeTooltipPath;
     const parts = splitDisplayPath(path, path.startsWith("\\") && !value.includes("\\"));
     const id = useId();
     const triggerRef = useRef<HTMLSpanElement>(null);
@@ -203,7 +210,7 @@ function FilePathLabel({ value, source, tooltipPath }: { value: string; source?:
             className="file-path-label tooltip-trigger"
             tabIndex={0}
             aria-label={tooltipPath}
-            title={`Native source: ${source ?? ""}\nNative path: ${value}`}
+            title={withinJob ? undefined : `Native source: ${source ?? ""}\nNative path: ${value}`}
             aria-describedby={id}
             onMouseEnter={() => { setTooltipPosition(undefined); setTooltipOpen(true); }}
             onMouseLeave={() => setTooltipOpen(false)}
@@ -226,7 +233,7 @@ function FilePathLabel({ value, source, tooltipPath }: { value: string; source?:
         </span>
     );
     return (
-        <Tooltip content={path}>
+        <Tooltip content={withinJob ? pathWithinJob(value, source ?? "") : path}>
             {label}
         </Tooltip>
     );
@@ -329,6 +336,9 @@ function FindFilePage({ repoId }: { repoId: string }) {
 	const toast = useToast();
 	const [repos, setRepos] = useState<Repository[] | null>(null);
 	const [engines, setEngines] = useState<EngineDescriptor[]>([]);
+	// Job names and current sources label job-owned File History sources. A
+	// failed load leaves every source shown by its recorded path.
+	const [jobs, setJobs] = useState<BackupJob[] | null>(null);
 	const [selected, setSelected] = useState("");
 	const [query, setQuery] = useState("");
 	const [searchCommand, setSearchCommand] = useState<SearchCommand | null>(null);
@@ -342,6 +352,7 @@ function FindFilePage({ repoId }: { repoId: string }) {
 
 	useEffect(() => {
 		let active = true;
+		getJobs().then((nextJobs) => { if (active) setJobs(nextJobs); }).catch(() => undefined);
 		Promise.all([getRepositories(), getEngines()])
 			.then(([nextRepos, engineResponse]) => {
 				if (!active) return;
@@ -421,6 +432,7 @@ function FindFilePage({ repoId }: { repoId: string }) {
 						key={repository.id}
 						repository={repository}
 						engines={engines}
+						jobs={jobs}
 						query={query}
 						searchCommand={searchCommand}
 						allVaults
@@ -432,6 +444,7 @@ function FindFilePage({ repoId }: { repoId: string }) {
 						key={selected}
 						repository={repos.find((repository) => repository.id === selected)!}
 						engines={engines}
+						jobs={jobs}
 						query={query}
 						searchCommand={searchCommand}
 						forceRefreshSequence={forceRefreshSequence}
@@ -455,6 +468,7 @@ function PortalSurface({ target, children }: { target?: Element; children: React
 function VaultFileHistory({
 	repository,
 	engines,
+	jobs,
 	query,
 	searchCommand,
 	forceRefreshSequence = 0,
@@ -466,6 +480,7 @@ function VaultFileHistory({
 }: {
 	repository: Repository;
 	engines: EngineDescriptor[];
+	jobs: BackupJob[] | null;
 	query: string;
 	searchCommand?: SearchCommand | null;
 	forceRefreshSequence?: number;
@@ -591,9 +606,9 @@ function VaultFileHistory({
 						typeof status.index.appliedGeneration === "number" &&
 						status.index.requiredGeneration !== status.index.appliedGeneration;
 					if (!controller.signal.aborted && generation.current === vaultGeneration && retryLeftDirtyGeneration) {
-						// Retry repairs failed entries; one ordinary access preparation then
-						// gives the authoritative header path a chance to certify the still-
-						// dirty generation. Access retains its normal persisted cooldown.
+						// Retry repairs failed entries; one normal access preparation then lets
+						// the header-based path confirm the still-dirty generation. Access keeps
+						// its normal persisted cooldown.
 						retryAccessPrepared = true;
 						status = await prepareMetadata(selected, "access");
 						continue;
@@ -689,6 +704,10 @@ function VaultFileHistory({
 		[selectedItems]
 	);
 	const selectedRepository = repository;
+	// A job-owned File History source is labelled by its job (see
+	// jobSourceDisplay.ts). Paths, selections, and restore requests still use
+	// the source and native roots returned by the backend.
+	const sourceJob = (source: string) => fileHistorySourceJob(source, repository.id, jobs);
 	const indexBlocked = Boolean(selected) && (indexing || indexState === null || !indexState.complete);
 	useEffect(() => {
 		onStatusChange(repository.id, { indexBlocked, searching, forcingMetadata });
@@ -1039,8 +1058,8 @@ function VaultFileHistory({
 			let operationAbsent = false;
 			const existing = await getOperation(payload.operationId, owner.observationController.signal)
 				.catch((reason) => {
-					// Exact lookup reports ordinary absence as HTTP 404. Only that
-					// response proves this freshly generated identity is available.
+					// The lookup reports a missing operation as HTTP 404. Only that
+					// response shows this freshly generated ID is not already in use.
 					if (isOperationNotFound(reason)) {
 						operationAbsent = true;
 						return [];
@@ -1076,12 +1095,12 @@ function VaultFileHistory({
 			} catch (reason) {
 				requestError = reason;
 			}
-			// Native execution can finish and make the durable row terminal before
-			// the POST reports its HTTP error. Keep exact handoff ownership until the
-			// separately bounded observer settles so that result truth is not lost.
+			// Native execution can finish and mark the durable row terminal before
+			// the POST reports its HTTP error. Keep ownership of the handoff until the
+			// separately bounded observer settles so the result is not lost.
 			// An HTTP error means the backend handler has returned: a durable row
-			// either already exists or this was a pre-row rejection. AbortError and
-			// transport failures are different because server work may still continue.
+			// either already exists or the request was rejected before creating one.
+			// AbortError and transport failures differ because server work may continue.
 			if (!requestError || requestError instanceof APIError) owner.observationController.abort();
 			const handedOff = await handoff;
 			owner.observationController.abort();
@@ -1138,13 +1157,18 @@ function VaultFileHistory({
 		const checked = !item.isSource && Boolean(selectedItems[resultKey(item)]);
 		const childPage = browsePages[key];
 		const childError = browseErrors[key];
-		const source = nativeRootLabel(item.source);
+		const job = sourceJob(item.source);
+		const source = job ? job.name : nativeRootLabel(item.source);
 		const label = item.isSource ? source : item.name;
 		const selectionLabel = checked
             ? t("ui.fileHistory.deselectFromSource", { item: item.isSource ? label : displayFilePath(item.path, item.source), source })
             : t("ui.fileHistory.selectFromSource", { item: item.isSource ? label : displayFilePath(item.path, item.source), source });
 		const disabledMessage = item.isSource ? "" : parentSelectionMessage(item);
-		const rowLabel = <strong>{label}</strong>;
+		// Source rows of a job show the job name with the "Job source:" tooltip;
+		// item rows under it show their path within the job.
+		const rowLabel = job
+			? <Tooltip content={item.isSource ? jobSourceTooltip(job) : pathWithinJob(item.path, item.source)}><span className="job-source-label" aria-label={label}><strong className="job-source-name">{label}</strong></span></Tooltip>
+			: <strong>{label}</strong>;
 		return <div className="browse-tree-node" key={key} role="listitem">
 			<div className={`browse-tree-row${checked ? " selected" : ""}`} style={{ paddingLeft: 10 + depth * 22 } as CSSProperties}>
 				{expandable ? <button type="button" className="browse-disclosure" aria-expanded={expanded} aria-label={expanded ? t("ui.fileHistory.collapseNamed", { name: label }) : t("ui.fileHistory.expandNamed", { name: label })} onClick={() => toggleBrowseNode(item)}>{expanded ? "▾" : "▸"}</button> : <span className="browse-disclosure-spacer" />}
@@ -1173,10 +1197,10 @@ function VaultFileHistory({
 			{selectedResults.map((result) => {
 				const key = resultKey(result);
 				const versions = presentVersions(histories[key]).sort(newestVersionFirst);
-					return <label className="field find-version-row" key={key}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} /><select value={chosenVersions[key] ?? ""} onChange={(event) => setChosenVersions((current) => ({ ...current, [key]: event.target.value }))} disabled={!versions.length}><option value="">{versions.length ? t("ui.pages.findfile.choose.a.version") : t("ui.pages.findfile.loading.history")}</option>{versions.map((version) => <option key={fileVersionKey(version)} value={fileVersionKey(version)}>{versionChoiceLabel(version)}</option>)}</select></label>;
+					return <label className="field find-version-row" key={key}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} withinJob={Boolean(sourceJob(result.source))} /><select value={chosenVersions[key] ?? ""} onChange={(event) => setChosenVersions((current) => ({ ...current, [key]: event.target.value }))} disabled={!versions.length}><option value="">{versions.length ? t("ui.pages.findfile.choose.a.version") : t("ui.pages.findfile.loading.history")}</option>{versions.map((version) => <option key={fileVersionKey(version)} value={fileVersionKey(version)}>{versionChoiceLabel(version)}</option>)}</select></label>;
 			})}
 		</div>}
-		<div className="find-selected-items"><span className="modal-section-label">{t("ui.pages.findfile.selected.items")}</span>{selectedResults.map((result) => { const key = resultKey(result); const version = selectedVersion(result); const isDir = version?.isDir ?? result.isDir; return <div className="find-selected-item" key={key}><Icon name={isDir ? "folder" : "file"} size={14} /><span style={{ display: "flex", minWidth: 0, flex: 1, flexDirection: "column", gap: 3 }}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} />{isDir && <span className="mono faint">{t("ui.pages.findfile.all.files.and.folders.inside")}</span>}</span><span className="mono faint">{versionTypeLabel(version, result.isDir)}</span><button onClick={() => toggleResult(result)} aria-label={t("ui.fileHistory.removeNamed", { name: displayFilePath(result.path, result.source) })}>{t("ui.pages.findfile.remove")}</button></div>; })}</div>
+		<div className="find-selected-items"><span className="modal-section-label">{t("ui.pages.findfile.selected.items")}</span>{selectedResults.map((result) => { const key = resultKey(result); const version = selectedVersion(result); const isDir = version?.isDir ?? result.isDir; return <div className="find-selected-item" key={key}><Icon name={isDir ? "folder" : "file"} size={14} /><span style={{ display: "flex", minWidth: 0, flex: 1, flexDirection: "column", gap: 3 }}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} withinJob={Boolean(sourceJob(result.source))} />{isDir && <span className="mono faint">{t("ui.pages.findfile.all.files.and.folders.inside")}</span>}</span><span className="mono faint">{versionTypeLabel(version, result.isDir)}</span><button onClick={() => toggleResult(result)} aria-label={t("ui.fileHistory.removeNamed", { name: displayFilePath(result.path, result.source) })}>{t("ui.pages.findfile.remove")}</button></div>; })}</div>
 		{restoreSelectionConflict && <div className="inline-error" role="alert">{restoreSelectionConflict}</div>}
 		<label className="field"><span>{t("ui.pages.findfile.restore.destination")}</span><DirectoryField value={effectiveTargetPath} onChange={setTargetPath} placeholder={t("ui.pages.findfile.choose.a.new.or.existing.destination")} /></label>
 			<button className="btn primary find-restore-button" disabled={!canRestore} onClick={reviewRestore}><Icon name="restore" size={14} />{t("ui.pages.findfile.review.restore")}</button>
@@ -1206,7 +1230,9 @@ function VaultFileHistory({
 								const checked = Boolean(selectedItems[key]);
 								const path = displayFilePath(result.path, result.source);
 								const selectionLabel = checked ? t("ui.fileHistory.deselectNamed", { name: path }) : t("ui.fileHistory.selectNamed", { name: path });
-								return <label key={key} className={`find-result${checked ? " selected" : ""}`}><SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={parentSelectionMessage(result)} onChange={() => toggleResult(result)} /><Icon name={result.isDir ? "folder" : "file"} size={18} /><span className="find-result-main"><strong><FilePathLabel value={result.path} source={result.source} /></strong><span className="mono">{t("ui.fileHistory.sourceLabel")} {sourceLabel(result)}</span></span></label>;
+								return <label key={key} className={`find-result${checked ? " selected" : ""}`}><SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={parentSelectionMessage(result)} onChange={() => toggleResult(result)} /><Icon name={result.isDir ? "folder" : "file"} size={18} /><span className="find-result-main"><strong><FilePathLabel value={result.path} source={result.source} withinJob={Boolean(sourceJob(result.source))} /></strong>{(() => { const job = sourceJob(result.source); return job
+									? <span className="mono job-source-line">{t("ui.fileHistory.sourceLabel")} <JobSourceLabel job={job} /></span>
+									: <span className="mono">{t("ui.fileHistory.sourceLabel")} {sourceLabel(result)}</span>; })()}</span></label>;
 							})}</div>
 							{searchPage.hasMore && <button className="btn find-presentation-load-more" onClick={() => void loadMoreResults()} disabled={searchPage.loading}>{searchPage.loading && <span className="spinner" />}{t("ui.pages.findfile.load.more.matches")}</button>}
 						</section>
