@@ -45,6 +45,20 @@ func IsFilesystem(connector string) bool {
 // same effective address used by storage engines. It never includes credentials.
 func ConnectorLabel(connector, location string, options map[string]string) string {
 	connector = strings.ToLower(strings.TrimSpace(connector))
+	if connector == "webdav" {
+		// Like S3, the host tells two WebDAV vaults apart at a glance; the path
+		// is shown separately in the vault's location line. The Location never
+		// holds the port, so a non-default one is added here; otherwise two
+		// vaults that differ only by port would look the same.
+		effective, err := ResolveEffectiveAddress(connector, location, options)
+		if err != nil {
+			return connector
+		}
+		if port := normalizedPort(effective.Port, effective.UseTLS); port != "" {
+			return "webdav: " + bracketedHost(effective.Host) + ":" + port
+		}
+		return "webdav: " + effective.Host
+	}
 	if connector != "s3" {
 		return connector
 	}
@@ -388,6 +402,13 @@ func ValidateStorageLocation(connector, location string) error {
 	if connector == "fs" {
 		return storageidentity.ValidateConfiguredPath(location)
 	}
+	if connector == "webdav" {
+		// The WebDAV parser applies the same credential, query, and fragment
+		// rules with WebDAV-specific messages, and unlike url.Parse its errors
+		// never repeat a pasted URL that may hold a password.
+		_, err := parseWebDAVLocation(location)
+		return err
+	}
 	return ValidateSafeLocation(location)
 }
 
@@ -504,9 +525,15 @@ func ResolveEffectiveAddress(connector, location string, options map[string]stri
 	if connector == "" || location == "" {
 		return EffectiveAddress{}, fmt.Errorf("vault storage type and location are required")
 	}
+	if connector == rcloneRemoteConnector {
+		return resolveRcloneRemoteAddress(location, options)
+	}
 	if identityFields, rcloneProvider := rcloneProviderIdentityFields[connector]; rcloneProvider &&
 		strings.HasPrefix(norm.NFC.String(strings.TrimSpace(location)), "Replicaro/") {
 		return resolveRcloneProviderAddress(connector, location, options, identityFields)
+	}
+	if connector == "webdav" {
+		return resolveWebDAVAddress(location, options)
 	}
 	result := EffectiveAddress{Connector: connector}
 	if connector == "fs" {
@@ -767,20 +794,9 @@ func resolveRcloneProviderAddress(
 	options map[string]string,
 	identityFields []string,
 ) (EffectiveAddress, error) {
-	root := norm.NFC.String(strings.TrimSpace(location))
-	const prefix = "Replicaro/"
-	name := strings.TrimPrefix(root, prefix)
-	normalizedName := norm.NFC.String(strings.TrimSpace(name))
-	if !strings.HasPrefix(root, prefix) || name != normalizedName ||
-		normalizedName == "" || normalizedName == "." || normalizedName == ".." ||
-		strings.ContainsAny(name, `/\`) || utf8.RuneCountInString(name) > 50 ||
-		len([]byte(root)) > 210 || strings.HasSuffix(name, " ") || strings.HasSuffix(name, ".") {
-		return EffectiveAddress{}, fmt.Errorf("Restic rclone location must be one exact Replicaro/<name> vault folder")
-	}
-	for _, character := range root {
-		if unicode.IsControl(character) {
-			return EffectiveAddress{}, fmt.Errorf("Restic rclone location contains a control character")
-		}
+	root, err := rcloneVaultRoot(location)
+	if err != nil {
+		return EffectiveAddress{}, err
 	}
 	if len(identityFields) == 0 {
 		return EffectiveAddress{}, fmt.Errorf("rclone provider %q has no credential-independent namespace identity", connector)
@@ -803,4 +819,25 @@ func resolveRcloneProviderAddress(
 		Location:  root,
 		Endpoint:  strings.Join(identity, "\x1f"),
 	}, nil
+}
+
+// rcloneVaultRoot checks the stored location of a Restic-rclone vault, which
+// is always the exact generated folder Replicaro/<vault name>.
+func rcloneVaultRoot(location string) (string, error) {
+	root := norm.NFC.String(strings.TrimSpace(location))
+	const prefix = "Replicaro/"
+	name := strings.TrimPrefix(root, prefix)
+	normalizedName := norm.NFC.String(strings.TrimSpace(name))
+	if !strings.HasPrefix(root, prefix) || name != normalizedName ||
+		normalizedName == "" || normalizedName == "." || normalizedName == ".." ||
+		strings.ContainsAny(name, `/\`) || utf8.RuneCountInString(name) > 50 ||
+		len([]byte(root)) > 210 || strings.HasSuffix(name, " ") || strings.HasSuffix(name, ".") {
+		return "", fmt.Errorf("Restic rclone location must be one exact Replicaro/<name> vault folder")
+	}
+	for _, character := range root {
+		if unicode.IsControl(character) {
+			return "", fmt.Errorf("Restic rclone location contains a control character")
+		}
+	}
+	return root, nil
 }

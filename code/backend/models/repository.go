@@ -244,6 +244,12 @@ type Repository struct {
 	NativeRepositoryID           string             `json:"native_repository_id"`
 	IsVaultOwner                 bool               `json:"isVaultOwner"`
 	ObjectLock                   ObjectLockSettings `json:"objectLock"`
+	// ReconnectRequired is the vault's saved "needs reconnect" state (see
+	// package vaultreconnect). It drives the vault card's Reconnect button and
+	// message, so it survives a reload and shows in every browser.
+	ReconnectRequired bool `json:"reconnectRequired"`
+	// RcloneRemote is set only for an Any Rclone Remote vault.
+	RcloneRemote *RcloneRemoteSettings `json:"rcloneRemote,omitempty"`
 
 	// Secrets and connector configuration stay server-side.
 	Passphrase        string            `json:"-"`
@@ -257,6 +263,18 @@ type Repository struct {
 	// RcloneConfigPath is an operation-only override for a still-owned native
 	// authorization stage. Attached repositories always resolve by ID.
 	RcloneConfigPath string `json:"-"`
+}
+
+// RcloneRemoteSettings are an Any Rclone Remote vault's settings that aren't
+// secret, for the vault card's remote label and for Reconnect. The rclone
+// config password and the environment variable values are never included;
+// VariableNames only tells which variables are saved.
+type RcloneRemoteSettings struct {
+	ConfigFile      string   `json:"configFile"`
+	ConfigEncrypted bool     `json:"configEncrypted"`
+	Remote          string   `json:"remote"`
+	Path            string   `json:"path"`
+	VariableNames   []string `json:"variableNames"`
 }
 
 // ValidateVaultPassword rejects values that cannot be delivered unchanged to
@@ -305,7 +323,9 @@ type VaultSizeStatus struct {
 	Running             bool   `json:"running"`
 	Pending             bool   `json:"pending"`
 	Paused              bool   `json:"paused"`
-	Failure             string `json:"failure,omitempty"`
+	// Failure is a stable code, such as "vault_size_refresh_failed", that the
+	// UI maps to translated text.
+	Failure string `json:"failure,omitempty"`
 }
 
 func ValidEngine(engine string) bool {

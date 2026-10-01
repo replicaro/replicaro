@@ -26,6 +26,7 @@ import (
 	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultlock"
 	"github.com/local/replicaro/vaultprofile"
+	"github.com/local/replicaro/vaultreconnect"
 )
 
 var ErrAlreadyRunning = errors.New("this backup target already has a queued or running operation; wait for it to finish before running it again")
@@ -158,6 +159,13 @@ type applicationWarning struct{ err error }
 type afterScriptFailure struct{ err error }
 type afterScriptSuppressed struct{ err error }
 
+// optionalScriptFailure is a before or after script that is not marked "must
+// succeed" and failed. Its step is already recorded as a warning; this value
+// carries the fact to the final classification so a backup that otherwise
+// completed ends as completed_with_issues instead of success. It never makes
+// a backup failed and never stops the native launch.
+type optionalScriptFailure struct{ err error }
+
 func (value followupFailure) Error() string       { return value.err.Error() }
 func (value followupFailure) Unwrap() error       { return value.err }
 func (value applicationWarning) Error() string    { return value.err.Error() }
@@ -166,13 +174,86 @@ func (value afterScriptFailure) Error() string    { return value.err.Error() }
 func (value afterScriptFailure) Unwrap() error    { return value.err }
 func (value afterScriptSuppressed) Error() string { return value.err.Error() }
 func (value afterScriptSuppressed) Unwrap() error { return value.err }
+func (value optionalScriptFailure) Error() string { return value.err.Error() }
+func (value optionalScriptFailure) Unwrap() error { return value.err }
 
 func taskCanceledStage(taskErr, stageErr error) bool {
 	return (errors.Is(taskErr, context.Canceled) || errors.Is(taskErr, context.DeadlineExceeded)) &&
 		(errors.Is(stageErr, context.Canceled) || errors.Is(stageErr, context.DeadlineExceeded))
 }
 
+// classifyBackupRunStatus applies the backup outcome precedence:
+//
+//  1. cancelled run, or a suppressed or cancelled after script: interrupted;
+//  2. native backup failed without saved-snapshot evidence, or a "must
+//     succeed" script failed: failed;
+//  3. saved snapshot with source-read failures, a retention or other
+//     follow-up failure after success, or a failed optional script:
+//     completed_with_issues;
+//  4. otherwise success.
+//
+// Optional script failures are taken out first and only ever lift a success
+// to completed_with_issues, so they cannot hide or outrank anything above.
 func classifyBackupRunStatus(runErr, taskErr error) string {
+	remaining, optionalFailed := withoutOptionalScriptFailures(runErr)
+	status := classifyBackupResult(remaining, taskErr)
+	if status == "success" && optionalFailed {
+		return "completed_with_issues"
+	}
+	return status
+}
+
+// withoutOptionalScriptFailures removes optionalScriptFailure values from the
+// joined run error and reports whether there were any. errors.Join trees are
+// walked; the original error is returned untouched when none is found.
+func withoutOptionalScriptFailures(err error) (error, bool) {
+	if err == nil {
+		return nil, false
+	}
+	joined, ok := err.(interface{ Unwrap() []error })
+	if !ok {
+		if wrapsOnlyOptionalScriptFailure(err) {
+			return nil, true
+		}
+		return err, false
+	}
+	var kept []error
+	found := false
+	for _, cause := range joined.Unwrap() {
+		rest, optional := withoutOptionalScriptFailures(cause)
+		found = found || optional
+		if rest != nil {
+			kept = append(kept, rest)
+		}
+	}
+	if !found {
+		return err, false
+	}
+	return errors.Join(kept...), true
+}
+
+// wrapsOnlyOptionalScriptFailure reports whether err is an
+// optionalScriptFailure, directly or behind single-cause wrappers such as
+// fmt.Errorf("...: %w", ...). It is errors.As with one deliberate limit: it
+// stops at a join. errors.As would look inside a join too, and dropping the
+// whole value then would also drop every other failure joined next to the
+// script, turning a failed backup into completed_with_issues. Joins are
+// handled by withoutOptionalScriptFailures, which removes only the script
+// failures and keeps the rest.
+func wrapsOnlyOptionalScriptFailure(err error) bool {
+	for err != nil {
+		if _, ok := err.(optionalScriptFailure); ok {
+			return true
+		}
+		if _, joined := err.(interface{ Unwrap() []error }); joined {
+			return false
+		}
+		err = errors.Unwrap(err)
+	}
+	return false
+}
+
+func classifyBackupResult(runErr, taskErr error) string {
 	if runErr == nil {
 		// A cancellation accepted after every eligible child returned did not
 		// interrupt or suppress work and cannot rewrite established success.
@@ -273,7 +354,7 @@ func runJobScriptStep(ctx context.Context, db *sql.DB, kind, path string, requir
 		result = "script was interrupted; output was discarded"
 	} else if err != nil {
 		status = "warning"
-		result = err.Error() + "; output was discarded; failure is result-neutral"
+		result = err.Error() + "; output was discarded; this script is optional"
 		if required {
 			status = "failed"
 			result = err.Error() + "; output was discarded; this script is required"
@@ -287,6 +368,12 @@ func runJobScriptStep(ctx context.Context, db *sql.DB, kind, path string, requir
 	}
 	if err != nil && required {
 		return fmt.Errorf("required %s failed", strings.ReplaceAll(kind, "_", " "))
+	}
+	if err != nil {
+		// An optional script failure does not stop the backup, but it is not
+		// ignored either: callers carry it to the final classification, which
+		// makes an otherwise completed backup completed_with_issues.
+		return optionalScriptFailure{fmt.Errorf("optional %s failed: %w", strings.ReplaceAll(kind, "_", " "), err)}
 	}
 	return nil
 }
@@ -1205,14 +1292,10 @@ func (c *Coordinator) run(task *targetTask) {
 	// No cancelable child may launch after the executor returns. Cleanup and
 	// final persistence below intentionally do not use the user-canceled context.
 	c.runtime.CloseCancel(task.operationID)
-	// reconnect_required is recorded only as this operation's terminal status;
-	// it is not a persisted vault-health flag.
-	reconnectBlocked := (vaultprofile.IsReconnectRequired(runErr) || engines.IsReconnectRequired(runErr))
-	if requestedStatus, _, _, _, _, known := engines.RequestedOperationOutcome(runErr); known &&
-		requestedStatus != engines.RequestedOperationNotStarted {
-		reconnectBlocked = false
-	}
-	reconnectBlocked = reconnectBlocked && !errors.Is(runErr, context.Canceled) && !errors.Is(runErr, context.DeadlineExceeded)
+	// A conclusive reconnect error found before native work started makes this
+	// backup reconnect_required. The vault's saved reconnect state is updated
+	// from that status below (vaultreconnect.RecordOperationResult).
+	reconnectBlocked := vaultreconnect.Conclusive(runErr)
 	status := "success"
 	if c.ctx.Err() != nil {
 		status = "interrupted"
@@ -1239,10 +1322,11 @@ func (c *Coordinator) run(task *targetTask) {
 			status = "interrupted"
 		} else if status == "success" {
 			status = "completed_with_issues"
-		} else if engines.IsBackupSourceReadFailure(runErr) {
+		} else if remaining, _ := withoutOptionalScriptFailures(runErr); engines.IsBackupSourceReadFailure(remaining) {
 			// A saved snapshot with source-read failures stays completed_with_issues
-			// only when that is the sole error. Cleanup failure is a separate
-			// orchestration failure, so reclassify with it included.
+			// only when that is the sole error (an optional script failure beside
+			// it does not count). Cleanup failure is a separate orchestration
+			// failure, so reclassify with it included.
 			status = classifyBackupRunStatus(errors.Join(runErr, closeErr), task.ctx.Err())
 		}
 		runErr = errors.Join(runErr, closeErr)
@@ -1250,6 +1334,19 @@ func (c *Coordinator) run(task *targetTask) {
 	}
 	if status == "failed" && reconnectBlocked {
 		status = "reconnect_required"
+		// Every run that finds the vault needs reconnecting says so in its own
+		// result and notification, in the same words as the vault card.
+		output = strings.TrimSpace(vaultreconnect.Message(task.db) + "\n" + output)
+	}
+	if status == "failed" && !pausedOccurrence {
+		// Only an Any Rclone Remote vault gets a line here: the result of
+		// checking its rclone settings once after the failure. A paused
+		// scheduled occurrence is left alone: for such a vault only a missing
+		// source pauses it, which says nothing about the vault, and pauses
+		// stay silent.
+		if note := vaultreconnect.CheckRcloneRemoteAfterFailure(task.db, task.target.RepositoryID, "backup"); note != "" {
+			output = strings.TrimSpace(output + "\n" + note)
+		}
 	}
 	finished := time.Now()
 	var dispatchNotification func()
@@ -1269,6 +1366,13 @@ func (c *Coordinator) run(task *targetTask) {
 		output = strings.TrimSpace(output + "\n" + warning)
 		log.Printf("backup terminal-state reconciliation required: %v", persistErr)
 		_ = database.LogError(task.db, "Backup terminal-state reconciliation required: "+persistErr.Error())
+	}
+	if terminalPersisted {
+		// Still under the vault lock (released by c.release below), so a
+		// reconnect cannot commit between this result and its bookkeeping.
+		// When this backup is what sets the state it sends no second
+		// notification; its own one above carries the same message.
+		vaultreconnect.RecordOperationResult(task.db, task.target.RepositoryID, "backup", status, runErr)
 	}
 	switch status {
 	case "success":
@@ -1355,7 +1459,7 @@ func prepareBackupNotification(task *targetTask, status string) func() {
 		return nil
 	}
 	success := status == "success"
-	native, webhook := settings.NotificationChannels(success)
+	native, webhook := settings.NotificationChannels(status)
 	title := "Backup: " + task.job.Name + " → " + task.target.RepositoryName
 	if !native && !webhook {
 		return nil
@@ -1380,6 +1484,9 @@ func prepareBackupNotification(task *targetTask, status string) func() {
 		task.targetFailureReason == database.AvailabilityReasonUnavailableTooLong) {
 		event.MessageKey, event.MessageValues = unavailableTooLongText(
 			task.sourceFailureReason != "", task.job.Name, task.target.RepositoryName)
+	}
+	if status == "reconnect_required" {
+		event.MessageKey = vaultreconnect.MessageKey
 	}
 	if !notifications.ShouldNotify(event) {
 		return nil
@@ -1765,7 +1872,15 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 
 	activeResticRetention := repo.Engine == engines.ResticID && job.Retention > 0
 	afterConfigured := job.AfterScriptPath != "" || job.AfterScriptMustSucceed
-	if err := runJobScriptStep(ctx, db, "before_script", job.BeforeScriptPath, job.BeforeScriptMustSucceed); err != nil {
+	// A failed optional before script does not stop the backup. It is kept in
+	// beforeScriptIssue and joined to the final result after the native
+	// backup, where it makes a completed backup completed_with_issues.
+	var beforeScriptIssue error
+	beforeErr := runJobScriptStep(ctx, db, "before_script", job.BeforeScriptPath, job.BeforeScriptMustSucceed)
+	if optional, ok := beforeErr.(optionalScriptFailure); ok {
+		beforeScriptIssue, beforeErr = optional, nil
+	}
+	if err := beforeErr; err != nil {
 		closeCancelGateFromContext(ctx)
 		reason := "before script prevented native backup launch"
 		if operationID := operationIDFromContext(ctx); operationID != "" {
@@ -2061,7 +2176,10 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 				"after script was not launched because the operation is shutting down", time.Now()))}
 		} else {
 			afterErr = runJobScriptStep(ctx, db, "after_script", job.AfterScriptPath, job.AfterScriptMustSucceed)
-			if afterErr != nil {
+			// A failed optional after script stays an optionalScriptFailure
+			// (completed_with_issues at most). Only a required failure or a
+			// cancellation becomes afterScriptFailure (failed or interrupted).
+			if _, optional := afterErr.(optionalScriptFailure); afterErr != nil && !optional {
 				afterErr = afterScriptFailure{afterErr}
 			}
 		}
@@ -2101,6 +2219,6 @@ func defaultExecutorContext(ctx context.Context, db *sql.DB, job models.BackupJo
 			resultErr = errors.Join(resultErr, followupFailure{retentionErr})
 		}
 	}
-	resultErr = errors.Join(resultErr, afterErr)
+	resultErr = errors.Join(resultErr, afterErr, beforeScriptIssue)
 	return backupOutput, resultErr
 }

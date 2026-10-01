@@ -34,7 +34,7 @@ func profileTimingLabel(args []string) string {
 	}
 
 	objectLabel := func(value string) string {
-		name := strings.TrimPrefix(value, "crypt:")
+		name := strings.TrimPrefix(value, sidecarRemote)
 		switch {
 		case name == canonicalProfileObject:
 			return "canonical"
@@ -49,7 +49,7 @@ func profileTimingLabel(args []string) string {
 
 	switch args[0] {
 	case "lsjson":
-		if len(args) > 1 && args[1] == "crypt:" {
+		if len(args) > 1 && args[1] == sidecarRemote {
 			return "profile rclone lsjson recovery directory"
 		}
 		return "profile rclone lsjson root"

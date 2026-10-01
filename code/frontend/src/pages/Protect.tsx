@@ -1,6 +1,6 @@
 import { formatDisplayDateTime, formatDisplayNumber, getEffectiveLocale, knownMessage, renderMessage, t } from "../i18n";
-import { useCallback, useEffect, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Link, useNavigate } from "react-router-dom";
 
 import { DirectoryField } from "../components/DirectoryPicker";
 import { BackupRunPicker } from "../components/BackupRunPicker";
@@ -9,6 +9,18 @@ import { RcloneAuthorization } from "../components/RcloneAuthorization";
 import { JobScriptFields } from "../components/JobScriptFields";
 import { UpdateJobSourceDialog } from "../components/UpdateJobSourceDialog";
 import { jobCurrentSource, jobSourceNeedsUpdate } from "../jobSourceDisplay";
+import {
+	activeJobDeletions,
+	activeVaultChanges,
+	followTrackedOperation,
+	JOB_DELETION_KIND,
+	newestVaultOperations,
+	onTrackedOperationFinished,
+	operationFailureReason,
+	removalStoppedByRecoveryProfile,
+	VAULT_PASSWORD_CHANGE_KIND,
+	VAULT_REMOVAL_KIND,
+} from "../services/trackedOperations";
 import { preventNumberInputWheel } from "../components/numberInput";
 import {
     ConfirmDialog,
@@ -40,9 +52,8 @@ import {
     getSettings,
     getJobStatus,
     getJobs,
-	getOperation,
+	getOperations,
 	getActiveOperations,
-		getRepository,
 	getRepositoryReconnectFields,
 	getVaultOwnership,
 	getRepositories,
@@ -65,9 +76,13 @@ import {
 		updateJob,
 		updateRepositorySchedules,
 	} from "../services/api";
-import { APIError } from "../services/api";
-import type { ExistingVaultStorageInput, JobInput, ManualTargetAdmissionResult, RcloneAuthStatus, RepositoryConnectionIntent, RepositoryCreationIntent, VaultOwnershipStatus, VaultPasswordChangeResult, VaultProfileSyncStatus, VaultProgressRecord } from "../services/api";
-import { backupTargetIsActive, manualRunNotice, nextSnapshotTooltip } from "../services/backupJobs";
+import { APIError, listRcloneRemotes } from "../services/api";
+import type { RcloneRemoteEntry } from "../services/api";
+import { ltrIsolate, parseRcloneRemoteVariables, serializeRcloneRemoteVariables } from "../services/rcloneRemote";
+import { limitedSpeedProviders, RCLONE_REMOTE_CONNECTOR, usesRcloneSignIn, usesSingleProfile, usesVaultFolderName } from "../services/storageConnectors";
+import type { ExistingVaultStorageInput, ForegroundOutcome, JobInput, ManualTargetAdmissionResult, RcloneAuthStatus, RepositoryConnectionIntent, RepositoryCreationIntent, TrackedOperationStart, VaultOwnershipStatus, VaultPasswordChangeResult, VaultProfileSyncStatus, VaultProgressRecord } from "../services/api";
+import { backupTargetIsActive, jobMutationStatusLabel, manualRunNotice, manualRunResultText, nextSnapshotTooltip } from "../services/backupJobs";
+import type { JobMutationResultStatus } from "../services/backupJobs";
 import { validVaultPassword } from "../services/vaultPassword";
 import type {
     BackupJob,
@@ -79,57 +94,63 @@ import type {
 	DormantRecoveryJob,
 	VaultSizeStatus,
 	ObjectLockSettings,
+	OperationEntry,
 } from "../types";
 
 import { formatNativeLogText } from "./nativeLogFormat";
 
-// Restic password changes use `key passwd`, which updates the selected key in
-// place without creating another key that retains the prior password. Keys
-// created independently by other software are outside this operation.
-const vaultPasswordChangeNotice = (result: VaultPasswordChangeResult) => [
-	result.message,
-	`Native ${result.native.engine} result: ${result.native.status || "unresolved"}${result.native.output ? ` — ${formatNativeLogText(result.native.engine, "password_change", result.native.output)}` : ""}`,
-].filter(Boolean).join(" ");
-
-const vaultPasswordChangeNoticeKind = (result: VaultPasswordChangeResult) =>
-	result.native.status === "succeeded" && !result.cleanupPending ? "ok" as const : "info" as const;
-
 const vaultPasswordChangeNeedsRecovery = (result: VaultPasswordChangeResult) =>
 	["preparing", "native_started", "publishing", "cleanup_pending"].includes(result.phase);
 
-const vaultPasswordChangeErrorNotice = (error: unknown) => {
-	const result = error instanceof APIError ? error.passwordChangeResult : undefined;
-	return [(error as Error).message, result?.resticKeyTruth].filter(Boolean).join(" ");
-};
+// A change stopped before commit refuses every operation on the vault until it
+// is retried; cleanup_pending has already committed the new password and does
+// not block anything.
+const vaultPasswordChangeBlocksVault = (result: VaultPasswordChangeResult | undefined) =>
+	Boolean(result && ["preparing", "native_started", "publishing"].includes(result.phase));
 
 type VaultSettingsPayload = Parameters<typeof updateRepositorySchedules>[0];
-type VaultSettingsResponse = Awaited<ReturnType<typeof updateRepositorySchedules>>;
 type VaultMutationBase = {
 	repositoryId: string;
 	repositoryName: string;
 	generation: number;
-	uncertainResolved?: boolean;
+	// The background operation doing the work, once the backend has queued it.
+	operationId?: string;
 };
 type VaultPasswordMutation = VaultMutationBase & {
 	kind: "password";
-	status: "running" | "checking" | "succeeded" | "recovery" | "error" | "uncertain";
+	status: "running" | "succeeded" | "recovery" | "error";
 	result?: VaultPasswordChangeResult;
+	// The operation's own final text and status, for the completion toast.
+	message?: string;
+	outcome?: OperationEntry["status"];
 	error?: string;
 };
 type VaultSettingsMutation = VaultMutationBase & {
 	kind: "settings";
 	status: "running" | "succeeded" | "error";
-	payload: Readonly<VaultSettingsPayload>;
-	response?: VaultSettingsResponse;
+	// Only a save started from this page carries its submitted values, which
+	// Retry save resubmits. A save found running after a reload, or started in
+	// another browser, has none.
+	payload?: Readonly<VaultSettingsPayload>;
 	error?: string;
 	retainedPasswordRecovery?: VaultPasswordMutation;
 };
 type VaultMutation = VaultSettingsMutation | VaultPasswordMutation;
 
+// A vault password change, settings save or removal runs as a background
+// operation on the server: the dialog closes at once, the vault card shows the
+// progress, and closing the browser does not stop the work. The card's state
+// lives here, outside the page, so leaving the Protect page inside the app and
+// coming back keeps it; and it is rebuilt from the backend's active operations
+// (adoptActiveVaultChanges), so a reload or another browser shows the same
+// progress. The page only subscribes.
 let vaultMutationGeneration = 0;
 let vaultMutationSnapshot: Record<string, VaultMutation> = {};
 const vaultMutationListeners = new Set<(snapshot: Record<string, VaultMutation>) => void>();
-const activeVaultMutationRequests = new Set<string>();
+// Vault change operations this browser has seen finish. An active-operations
+// read that was sent before one finished can arrive after it; this keeps it
+// from bringing the finished operation back as running.
+const finishedVaultOperations = new Set<string>();
 let vaultPasswordStatusObservationGeneration = 0;
 let vaultPasswordStatusLifecycle = 0;
 const vaultPasswordStatusObservationOwners: Record<string, number> = {};
@@ -165,8 +186,8 @@ const setVaultMutation = (mutation: VaultMutation) => publishVaultMutationSnapsh
 });
 
 const setAuthoritativeVaultPasswordMutation = (mutation: VaultPasswordMutation) => {
-	// A POST result, or its reconciliation, supersedes passive status reads that
-	// started before it settled. Active reconciliation is tracked separately.
+	// The operation's own result supersedes passive status reads that started
+	// before it settled.
 	invalidateVaultPasswordStatusObservation(mutation.repositoryId);
 	setVaultMutation(mutation);
 };
@@ -176,31 +197,6 @@ const setAuthoritativeVaultPasswordMutation = (mutation: VaultPasswordMutation) 
 const ownsVaultMutation = (repositoryId: string, generation: number) =>
 	vaultMutationSnapshot[repositoryId]?.generation === generation;
 
-const beforeVaultMutationUnload = (event: BeforeUnloadEvent) => {
-	// This browser-owned prompt only reduces accidental page/process loss. It
-	// cannot guarantee completion after the user confirms leaving, and internal
-	// React navigation does not fire beforeunload.
-	event.preventDefault();
-	event.returnValue = "";
-};
-
-// Every guarded request holds its own unique key: "<vault>:<generation>" for
-// settings and password changes, and "removal:<vault>:<sequence>" for vault
-// removal. The key only has to be unique per request, so one request's
-// release can never drop a guard that another request of the same vault
-// still holds.
-let vaultRemovalRequestSequence = 0;
-const holdVaultMutationUnloadGuard = (requestKey: string) => {
-	if (activeVaultMutationRequests.size === 0) window.addEventListener("beforeunload", beforeVaultMutationUnload);
-	activeVaultMutationRequests.add(requestKey);
-	return () => {
-		activeVaultMutationRequests.delete(requestKey);
-		// Each request removes only its own ownership. A second vault still in
-		// flight keeps the shared browser safeguard installed.
-		if (activeVaultMutationRequests.size === 0) window.removeEventListener("beforeunload", beforeVaultMutationUnload);
-	};
-};
-
 const subscribeVaultMutations = (listener: (snapshot: Record<string, VaultMutation>) => void) => {
 	vaultMutationListeners.add(listener);
 	listener(vaultMutationSnapshot);
@@ -208,30 +204,24 @@ const subscribeVaultMutations = (listener: (snapshot: Record<string, VaultMutati
 };
 
 type VaultRemovalPresentation = {
-	phase: "removing" | "updating_profile" | "profile_error" | "error";
+	phase: "removing" | "profile_error" | "error";
+	operationId?: string;
 	message?: string;
-	profileStillUpdating?: boolean;
+	// Remove anyway was chosen here, so its success is an information toast.
+	discardRecoveryProfile?: boolean;
 };
 
 // Vault removal state is module-owned for the same reason as the settings and
-// password mutations above: the request keeps running on the server when the
-// user navigates away inside the app, and the Protect page that comes back
-// has to show it. When this lived in component state, a remounted page lost
-// the "being removed" overlay, left the card unblocked so a second removal of
-// the same vault could start (and fail fast, showing "could not be removed"
-// while the first request's toast said it was removed), and the inventory
-// refresh ran on the unmounted page, so the removed vault's card stayed
-// visible. Keep the presentation, the in-flight map and the settle
-// notification here; the page only subscribes.
+// password changes above. When it lived in component state, a remounted page
+// lost the "being removed" overlay and left the card unblocked, and the
+// inventory refresh ran on the unmounted page, so the removed vault's card
+// stayed visible. Keep the presentation and the settle notification here; the
+// page only subscribes.
 let vaultRemovalSnapshot: Record<string, VaultRemovalPresentation> = {};
 const vaultRemovalListeners = new Set<(snapshot: Record<string, VaultRemovalPresentation>) => void>();
 // Mounted pages reload their inventory through this once a removal settles.
 // If no page is mounted, the next one loads the inventory when it mounts.
 const vaultRemovalSettledListeners = new Set<() => void>();
-// Vault id -> request sequence. Only the request that owns the entry may
-// publish results, which also keeps a request from a reset test run inert.
-const vaultRemovalsInFlight = new Map<string, number>();
-
 const publishVaultRemoval = (repositoryId: string, presentation: VaultRemovalPresentation | undefined) => {
 	const next = { ...vaultRemovalSnapshot };
 	if (presentation) next[repositoryId] = presentation;
@@ -251,91 +241,117 @@ const subscribeVaultRemovalSettled = (listener: () => void) => {
 	return () => { vaultRemovalSettledListeners.delete(listener); };
 };
 
-const vaultRemovalIsInFlight = (repositoryId: string) => vaultRemovalsInFlight.has(repositoryId);
+const vaultRemovalIsInFlight = (repositoryId: string) => vaultRemovalSnapshot[repositoryId]?.phase === "removing";
 
-// "Keep vault" only dismisses a settled error; a running request keeps its overlay.
+// Operation IDs of failed removals the user dismissed with "Keep vault" in this
+// browser. Only the newest few are kept: a dismissal matters only while its
+// failed removal is still the vault's newest operation, so old entries are
+// dead weight. Missing or blocked storage means the dismissal lasts only until
+// the page is opened again; unreadable contents are treated as empty and
+// replaced on the next dismissal.
+const DISMISSED_VAULT_REMOVALS_KEY = "replicaro.protect.dismissedVaultRemovals";
+const DISMISSED_VAULT_REMOVALS_LIMIT = 50;
+
+const readDismissedVaultRemovals = (): string[] => {
+	try {
+		const stored: unknown = JSON.parse(window.localStorage.getItem(DISMISSED_VAULT_REMOVALS_KEY) ?? "[]");
+		return Array.isArray(stored) ? stored.filter((id): id is string => typeof id === "string") : [];
+	} catch {
+		return [];
+	}
+};
+
+const rememberDismissedVaultRemoval = (operationId: string) => {
+	const dismissed = readDismissedVaultRemovals().filter((id) => id !== operationId);
+	dismissed.push(operationId);
+	writeStoredPreference(DISMISSED_VAULT_REMOVALS_KEY, JSON.stringify(dismissed.slice(-DISMISSED_VAULT_REMOVALS_LIMIT)));
+};
+
+// "Keep vault" only dismisses a settled error; a running removal keeps its
+// overlay. It hides the card here and remembers the failed operation in this
+// browser, so showStoppedVaultRemovals does not bring the card back after a
+// reload. Nothing is saved on the server: another browser still shows the card
+// until it is dismissed there too, or until any later work on the kept vault
+// ends it everywhere. A new failed removal has a new operation ID and shows.
 const dismissVaultRemoval = (repositoryId: string) => {
-	if (vaultRemovalsInFlight.has(repositoryId)) return;
+	const current = vaultRemovalSnapshot[repositoryId];
+	if (!current || current.phase === "removing") return;
+	if (current.operationId) rememberDismissedVaultRemoval(current.operationId);
 	publishVaultRemoval(repositoryId, undefined);
 };
 
 // A settled error only means something while the vault is still listed. Once
-// the authoritative inventory no longer has the vault (a lost response after a
-// committed delete, or a removal finished elsewhere), drop its entry, so a
-// later reconnect of the same vault UUID does not come back showing "could not
-// be removed" with a "Retry removal" nobody asked for. A running request keeps
-// its entry; it publishes its own outcome when it settles.
+// the authoritative inventory no longer has the vault (a removal finished
+// elsewhere), drop its entry, so a later reconnect of the same vault UUID does
+// not come back showing an error with a "Retry removal" nobody asked for. A
+// running removal keeps its entry; it publishes its own outcome when it ends.
 const forgetSettledVaultRemovalsNotIn = (repositories: readonly Pick<Repository, "id">[]) => {
 	const listed = new Set(repositories.map((repository) => repository.id));
 	for (const repositoryId of Object.keys(vaultRemovalSnapshot)) {
-		if (!listed.has(repositoryId) && !vaultRemovalsInFlight.has(repositoryId)) publishVaultRemoval(repositoryId, undefined);
+		if (!listed.has(repositoryId) && !vaultRemovalIsInFlight(repositoryId)) publishVaultRemoval(repositoryId, undefined);
 	}
 };
 
-const runVaultRemoval = async (
+type Toast = (kind: "ok" | "error" | "info", message: string) => void;
+
+// followVaultRemoval shows a queued or running removal on the vault card and
+// reports its result when the operation ends. A removal that failed because the
+// vault's recovery profile could not be updated offers Retry removal and
+// Remove anyway; any other failure offers Retry removal.
+const followVaultRemoval = (repositoryId: string, repositoryName: string, operationId: string, toast: Toast, discardRecoveryProfile?: boolean) => {
+	publishVaultRemoval(repositoryId, {
+		phase: "removing", operationId,
+		discardRecoveryProfile: discardRecoveryProfile ?? vaultRemovalSnapshot[repositoryId]?.discardRecoveryProfile,
+	});
+	followTrackedOperation(operationId, async (operation) => {
+		finishedVaultOperations.add(operation.id);
+		const owns = () => vaultRemovalSnapshot[repositoryId]?.operationId === operation.id;
+		if (!owns()) return;
+		const message = await operationFailureReason(operation);
+		if (!owns()) return;
+		const discarded = vaultRemovalSnapshot[repositoryId]?.discardRecoveryProfile;
+		if (operation.status === "success") {
+			publishVaultRemoval(repositoryId, undefined);
+			toast(discarded ? "info" : "ok", message);
+		} else if (operation.status === "completed_with_issues") {
+			// The vault is removed; only local cleanup is left. The backend error is
+			// English text inside a sentence that may be right-to-left, so it goes in
+			// a first-strong isolate (U+2068 ... U+2069) to keep its own direction and
+			// punctuation. Isolates are invisible in left-to-right languages.
+			publishVaultRemoval(repositoryId, undefined);
+			toast("error", t("ui.protect.vaultRemovedCleanupNeedsAttention", { name: repositoryName, error: `\u2068${message}\u2069` }));
+		} else {
+			publishVaultRemoval(repositoryId, {
+				phase: removalStoppedByRecoveryProfile(operation) ? "profile_error" : "error", operationId: operation.id, message,
+			});
+		}
+		// Every outcome reloads the authoritative inventory: a removed vault's
+		// card goes away, and a kept one shows its current state.
+		for (const listener of vaultRemovalSettledListeners) listener();
+	});
+};
+
+const runVaultRemoval = (
 	repository: Pick<Repository, "id" | "name">,
 	discardRecoveryProfile: boolean,
-	toast: (kind: "ok" | "error" | "info", message: string) => void,
+	toast: Toast,
 ) => {
-	if (vaultRemovalsInFlight.has(repository.id)) return;
-	const request = ++vaultRemovalRequestSequence;
-	vaultRemovalsInFlight.set(repository.id, request);
-	const owns = () => vaultRemovalsInFlight.get(repository.id) === request;
-	// Removal publishes the recovery profile and then deletes local state in
-	// one server request (two when it has to wait for a profile update, see
-	// below). Closing or reloading the tab in the middle can leave that work
-	// half done, so the browser's leave-page prompt is held until the last
-	// request settles. The guard is module-owned, so leaving the Protect page
-	// inside the app neither cancels the request nor drops the prompt.
-	const releaseUnloadGuard = holdVaultMutationUnloadGuard(`removal:${repository.id}:${request}`);
-	// The request remains foreground on the server so its profile publication,
-	// lock, and deletion safeguards are unchanged. Only the dialog gives way
-	// to card-local progress while other UI work can continue.
-	publishVaultRemoval(repository.id, { phase: "removing" });
-	try {
-		let result: Awaited<ReturnType<typeof deleteRepository>>;
-		try {
-			result = discardRecoveryProfile
-				? await deleteRepository(repository.id, true)
-				: await deleteRepository(repository.id);
-		} catch (error) {
-			if (!(error instanceof APIError && error.code === "vault_profile_update_pending")) throw error;
-			// Removing another vault that shares a job queues a recovery-profile
-			// update for this one, and removal must not skip it. The backend
-			// reports that case separately; the second request waits (up to two
-			// minutes) for the update and then retries the removal once with
-			// every safeguard rechecked. It is never retried again automatically.
-			if (owns()) publishVaultRemoval(repository.id, { phase: "updating_profile" });
-			result = await deleteRepository(repository.id, discardRecoveryProfile, true);
-		}
-		if (!owns()) return;
-		toast(result?.warning ? "info" : "ok", result?.warning ?? `Vault "${repository.name}" removed from Replicaro`);
-		publishVaultRemoval(repository.id, undefined);
-	} catch (error) {
-		if (!owns()) return;
-		if (error instanceof APIError && error.code === "vault_removal_cleanup_required") {
-			publishVaultRemoval(repository.id, undefined);
-			toast("error", `Vault "${repository.name}" was removed from Replicaro, but local cleanup needs attention: ${error.message}`);
-			return;
-		}
-		const phase = !discardRecoveryProfile && error instanceof APIError && error.code === "vault_profile_sync_required"
-			? "profile_error" : "error";
-		// The profile update outlasted the wait (or another change queued a new
-		// one during the retry). The vault is kept; the plain explanation
-		// replaces the technical message and "Retry removal" stays available.
-		const profileStillUpdating = error instanceof APIError && error.code === "vault_profile_update_still_pending";
-		publishVaultRemoval(repository.id, { phase, message: (error as Error).message, profileStillUpdating });
-	} finally {
-		releaseUnloadGuard();
-		if (owns()) {
-			vaultRemovalsInFlight.delete(repository.id);
-			// Every outcome reloads the authoritative inventory: success and
-			// cleanup_required remove the card, and a lost response may follow a
-			// committed delete, so an error overlay must not stay on a card that
-			// may already be gone.
-			for (const listener of vaultRemovalSettledListeners) listener();
-		}
-	}
+	if (vaultRemovalIsInFlight(repository.id)) return;
+	// The card shows the removal at once; the backend queues it and runs it in
+	// the background, waiting for anything else on the vault first.
+	publishVaultRemoval(repository.id, { phase: "removing", discardRecoveryProfile });
+	const request = discardRecoveryProfile ? deleteRepository(repository.id, true) : deleteRepository(repository.id);
+	void request.then(({ operationId }) => {
+		if (!vaultRemovalIsInFlight(repository.id)) return;
+		followVaultRemoval(repository.id, repository.name, operationId, toast, discardRecoveryProfile);
+	}).catch((error: Error) => {
+		if (!vaultRemovalIsInFlight(repository.id) || vaultRemovalSnapshot[repository.id]?.operationId) return;
+		publishVaultRemoval(repository.id, { phase: "error", message: error.message });
+		// Usually the request was refused and nothing was queued. If the answer
+		// was lost instead, the reload finds the queued removal in the active
+		// operations and follows it, or finds the vault already gone.
+		for (const listener of vaultRemovalSettledListeners) listener();
+	});
 };
 
 const clearVaultMutation = (repositoryId: string, generation?: number) => {
@@ -356,6 +372,33 @@ const freezeVaultSettingsPayload = (payload: VaultSettingsPayload): Readonly<Vau
 const isCleanupPendingRecovery = (mutation: VaultMutation | undefined): mutation is VaultPasswordMutation =>
 	mutation?.kind === "password" && mutation.status === "recovery" && mutation.result?.phase === "cleanup_pending";
 
+const retainedPasswordRecoveryOf = (current: VaultMutation | undefined) =>
+	isCleanupPendingRecovery(current) ? current : current?.kind === "settings" ? current.retainedPasswordRecovery : undefined;
+
+// followVaultSettingsSave shows a queued or running settings save on the
+// vault card and settles it when the operation ends.
+const followVaultSettingsSave = (repositoryId: string, repositoryName: string, generation: number, operationId: string) => {
+	const current = vaultMutationSnapshot[repositoryId];
+	const own = current?.kind === "settings" && current.generation === generation ? current : undefined;
+	setVaultMutation({
+		kind: "settings", status: "running", repositoryId, repositoryName, generation, operationId,
+		payload: own?.payload, retainedPasswordRecovery: own ? own.retainedPasswordRecovery : retainedPasswordRecoveryOf(current),
+	});
+	followTrackedOperation(operationId, async (operation) => {
+		finishedVaultOperations.add(operation.id);
+		const owned = () => {
+			const mutation = vaultMutationSnapshot[repositoryId];
+			return mutation?.kind === "settings" && mutation.operationId === operation.id ? mutation : undefined;
+		};
+		if (!owned()) return;
+		const saved = operation.status === "success" || operation.status === "completed_with_issues";
+		const error = saved ? undefined : await operationFailureReason(operation);
+		const mutation = owned();
+		if (!mutation) return;
+		setVaultMutation(saved ? { ...mutation, status: "succeeded" } : { ...mutation, status: "error", error });
+	});
+};
+
 const runVaultSettingsMutation = (
 	repositoryId: string,
 	repositoryName: string,
@@ -368,23 +411,17 @@ const runVaultSettingsMutation = (
 	} else if (current && !isCleanupPendingRecovery(current)) {
 		return false;
 	}
-	const retainedPasswordRecovery = isCleanupPendingRecovery(current)
-		? current
-		: current?.kind === "settings" ? current.retainedPasswordRecovery : undefined;
+	const retainedPasswordRecovery = retainedPasswordRecoveryOf(current);
 	invalidateVaultPasswordStatusObservation(repositoryId);
 	const generation = ++vaultMutationGeneration;
-	// Closing the dialog changes presentation only. The same synchronous request
-	// still owns root publication/local commit, or the profile-local commit plus
-	// its existing profile.replicaro queue response, before this overlay ends.
 	setVaultMutation({ kind: "settings", status: "running", repositoryId, repositoryName, generation, payload, retainedPasswordRecovery });
-	const releaseUnloadGuard = holdVaultMutationUnloadGuard(`${repositoryId}:${generation}`);
-	void updateRepositorySchedules(payload as VaultSettingsPayload).then((response) => {
+	void updateRepositorySchedules(payload as VaultSettingsPayload).then(({ operationId }) => {
 		if (!ownsVaultMutation(repositoryId, generation)) return;
-		setVaultMutation({ kind: "settings", status: "succeeded", repositoryId, repositoryName, generation, payload, response, retainedPasswordRecovery });
+		followVaultSettingsSave(repositoryId, repositoryName, generation, operationId);
 	}).catch((error: Error) => {
 		if (!ownsVaultMutation(repositoryId, generation)) return;
 		setVaultMutation({ kind: "settings", status: "error", repositoryId, repositoryName, generation, payload, error: error.message, retainedPasswordRecovery });
-	}).finally(releaseUnloadGuard);
+	});
 	return true;
 };
 
@@ -393,7 +430,7 @@ const startVaultSettingsMutation = (repositoryName: string, payload: VaultSettin
 
 const retryVaultSettingsMutation = (repositoryId: string) => {
 	const current = vaultMutationSnapshot[repositoryId];
-	if (!current || current.kind !== "settings" || current.status !== "error") return false;
+	if (!current || current.kind !== "settings" || current.status !== "error" || !current.payload) return false;
 	return runVaultSettingsMutation(repositoryId, current.repositoryName, current.payload, current.generation);
 };
 
@@ -410,14 +447,16 @@ const settleVaultSettingsPresentation = (repositoryId: string, generation: numbe
 	clearVaultMutation(repositoryId, generation);
 };
 
+// passwordMutationFromResult presents the vault's saved password change phase
+// record, which stays the recovery authority: an unfinished change offers
+// Continue password change (Retry).
 const passwordMutationFromResult = (
 	repositoryName: string,
 	generation: number,
 	result: VaultPasswordChangeResult,
 	error?: string,
-	uncertainResolved?: boolean,
 ): VaultPasswordMutation => {
-	const base = { kind: "password" as const, repositoryId: result.repositoryId, repositoryName, generation, result, uncertainResolved };
+	const base = { kind: "password" as const, repositoryId: result.repositoryId, repositoryName, generation, result };
 	if (vaultPasswordChangeNeedsRecovery(result)) return { ...base, status: "recovery", error };
 	// A completed orchestration means the new credential and sidecars were
 	// committed. A failed or interrupted native result is kept for information,
@@ -426,48 +465,82 @@ const passwordMutationFromResult = (
 	return { ...base, status: "error", error };
 };
 
+// followVaultPasswordChange shows a queued or running password change (or
+// retry) on the vault card. The card offers no Retry while it runs. When the
+// operation ends, the vault's phase record decides what the card shows: an
+// unfinished change stays as a recovery state with Retry; otherwise the
+// operation's own result is reported.
+const followVaultPasswordChange = (repositoryId: string, repositoryName: string, generation: number, operationId: string) => {
+	setAuthoritativeVaultPasswordMutation({ kind: "password", status: "running", repositoryId, repositoryName, generation, operationId });
+	followTrackedOperation(operationId, async (operation) => {
+		finishedVaultOperations.add(operation.id);
+		const owns = () => vaultMutationSnapshot[repositoryId]?.operationId === operation.id;
+		if (!owns()) return;
+		const message = await operationFailureReason(operation);
+		let phase: VaultPasswordChangeResult | undefined;
+		try {
+			phase = await getVaultPasswordChangeStatus(repositoryId);
+		} catch {
+			// No phase record (404) means nothing is left to recover.
+		}
+		if (!owns()) return;
+		const current = vaultMutationSnapshot[repositoryId];
+		const failed = operation.status !== "success" && operation.status !== "completed_with_issues";
+		if (phase?.repositoryId === repositoryId && vaultPasswordChangeNeedsRecovery(phase)) {
+			setAuthoritativeVaultPasswordMutation(passwordMutationFromResult(repositoryName, current.generation, phase, failed ? message : undefined));
+		} else if (!failed) {
+			setAuthoritativeVaultPasswordMutation({
+				kind: "password", status: "succeeded", repositoryId, repositoryName, generation: current.generation,
+				operationId: operation.id, message, outcome: operation.status,
+			});
+		} else {
+			setAuthoritativeVaultPasswordMutation({
+				kind: "password", status: "error", repositoryId, repositoryName, generation: current.generation,
+				operationId: operation.id, error: message,
+			});
+		}
+	});
+};
+
 const runVaultPasswordMutation = (
 	repositoryId: string,
 	repositoryName: string,
-	request: () => Promise<VaultPasswordChangeResult>,
+	request: () => Promise<TrackedOperationStart>,
 	replaceGeneration?: number,
 ) => {
 	const current = vaultMutationSnapshot[repositoryId];
 	if (current && current.generation !== replaceGeneration) return false;
 	const generation = ++vaultMutationGeneration;
 	setAuthoritativeVaultPasswordMutation({ kind: "password", status: "running", repositoryId, repositoryName, generation });
-	const releaseUnloadGuard = holdVaultMutationUnloadGuard(`${repositoryId}:${generation}`);
-	void request().then((result) => {
+	void request().then(({ operationId }) => {
 		if (!ownsVaultMutation(repositoryId, generation)) return;
-		if (result.repositoryId !== repositoryId) throw new Error("Password-change response did not match the selected vault.");
-		setAuthoritativeVaultPasswordMutation(passwordMutationFromResult(repositoryName, generation, result));
-	}).catch(async (error: unknown) => {
+		followVaultPasswordChange(repositoryId, repositoryName, generation, operationId);
+	}).catch(async (error: Error) => {
 		if (!ownsVaultMutation(repositoryId, generation)) return;
-		const structured = error instanceof APIError && error.passwordChangeResult?.repositoryId === repositoryId
-			? error.passwordChangeResult : undefined;
-		if (structured) {
-			setAuthoritativeVaultPasswordMutation(passwordMutationFromResult(repositoryName, generation, structured, vaultPasswordChangeErrorNotice(error)));
-			return;
-		}
-		// Any response without a structured password-change result can have lost
-		// its body after mutation, including an APIError produced from truncated
-		// JSON. Resolve it from durable status and never replay the candidate.
-		setAuthoritativeVaultPasswordMutation({ kind: "password", status: "checking", repositoryId, repositoryName, generation, error: (error as Error).message });
-		try {
-			const result = await getVaultPasswordChangeStatus(repositoryId);
-			// This read belongs to the exact mutation request, not to a Protect page
-			// observation. Route changes and overlapping passive reads cannot cancel it.
+		if (!(error instanceof APIError)) {
+			// No answer at all (the connection dropped, or the app went away while
+			// answering): the backend may still have queued the change, and it
+			// then runs whether or not this page hears about it. Look for it among
+			// the active operations before saying it did not finish, and follow
+			// it if it is there. A new change waits out a quiet period of at
+			// least half a minute, so it is still active when this runs; a quick
+			// Retry that already finished is not found here, and its result is
+			// still on the dashboard and in the vault's phase record.
+			try {
+				const queued = activeVaultChanges(await getActiveOperations()).get(repositoryId);
+				if (queued?.kind === VAULT_PASSWORD_CHANGE_KIND && ownsVaultMutation(repositoryId, generation)) {
+					followVaultPasswordChange(repositoryId, repositoryName, generation, queued.id);
+					return;
+				}
+			} catch {
+				// Still unreachable; report the original error.
+			}
 			if (!ownsVaultMutation(repositoryId, generation)) return;
-			if (result.repositoryId !== repositoryId) throw new Error("Password-change status did not match the selected vault.");
-			setAuthoritativeVaultPasswordMutation(passwordMutationFromResult(repositoryName, generation, result));
-		} catch {
-			if (!ownsVaultMutation(repositoryId, generation)) return;
-			setAuthoritativeVaultPasswordMutation({
-				kind: "password", status: "uncertain", repositoryId, repositoryName, generation,
-				error: (error as Error).message, uncertainResolved: true,
-			});
 		}
-	}).finally(releaseUnloadGuard);
+		// Refused at the request: nothing was queued. The phase record, if any,
+		// comes back on the next status read.
+		setAuthoritativeVaultPasswordMutation({ kind: "password", status: "error", repositoryId, repositoryName, generation, error: error.message });
+	});
 	return true;
 };
 
@@ -481,37 +554,83 @@ const continueVaultPasswordMutation = (repositoryId: string) => {
 };
 
 const recordObservedVaultPasswordMutation = (repositoryId: string, repositoryName: string, result: VaultPasswordChangeResult) => {
-	if (result.repositoryId !== repositoryId) return;
+	if (result.repositoryId !== repositoryId || !vaultPasswordChangeNeedsRecovery(result)) return;
 	const current = vaultMutationSnapshot[repositoryId];
-	// Status observations may replace inactive recovery/uncertainty, but never
-	// steal ownership from a synchronous request that is still unresolved.
-	if (current?.kind === "password" && (current.status === "running" || current.status === "checking")) return;
+	// A running change or its retry owns the card until its operation ends; the
+	// phase record it is working on is not a recovery state yet.
+	if (current?.kind === "password" && current.status === "running") return;
 	// A settings failure owns its immutable retry too. Its retained cleanup
 	// recovery remains visible until settings presentation settles.
 	if (current?.kind === "settings") return;
-	if (!vaultPasswordChangeNeedsRecovery(result) && result.phase !== "completed") return;
 	setVaultMutation(passwordMutationFromResult(repositoryName, ++vaultMutationGeneration, result));
 };
 
 const recordMissingVaultPasswordMutation = (repositoryId: string) => {
 	const current = vaultMutationSnapshot[repositoryId];
-	// Absence cannot resolve a live request whose response was lost: the durable
-	// record may have been absent before start or removed after cleanup.
-	if (current?.kind === "password" && current.status === "uncertain" && current.uncertainResolved) return;
-	if (!current || current.kind !== "password" || current.status === "running" || current.status === "checking") return;
+	// No phase record: a recovery state has nothing left to recover. Results of
+	// a finished operation stay until they are shown or dismissed.
+	if (current?.kind !== "password" || current.status !== "recovery") return;
 	clearVaultMutation(repositoryId, current.generation);
+};
+
+// adoptActiveVaultChanges puts every queued or running password change,
+// settings save or removal on its vault card, whichever page or browser
+// started it, and follows it to the end. This is what makes the card's
+// progress survive a reload: it comes from the backend's active operations,
+// not from this page's memory.
+const adoptActiveVaultChanges = (operations: OperationEntry[], repositoryName: (repositoryId: string) => string, toast: Toast) => {
+	for (const [repositoryId, operation] of activeVaultChanges(operations)) {
+		if (finishedVaultOperations.has(operation.id)) continue;
+		const name = repositoryName(repositoryId) || operation.title.slice(operation.title.indexOf(": ") + 2);
+		if (operation.kind === VAULT_REMOVAL_KIND) {
+			const removal = vaultRemovalSnapshot[repositoryId];
+			// This page's own request that has not had its answer yet adopts the
+			// operation itself.
+			if (removal?.operationId === operation.id || (removal?.phase === "removing" && !removal.operationId)) continue;
+			followVaultRemoval(repositoryId, name, operation.id, toast);
+			continue;
+		}
+		const current = vaultMutationSnapshot[repositoryId];
+		if (current?.operationId === operation.id || (current?.status === "running" && !current.operationId)) continue;
+		const generation = ++vaultMutationGeneration;
+		if (operation.kind === VAULT_PASSWORD_CHANGE_KIND) followVaultPasswordChange(repositoryId, name, generation, operation.id);
+		else followVaultSettingsSave(repositoryId, name, generation, operation.id);
+	}
+};
+
+// showStoppedVaultRemovals brings back the "Removal stopped" card of a vault
+// whose removal failed because its recovery profile could not be updated, so
+// Retry removal and Remove anyway are still offered after a reload or in
+// another browser. It is derived from that failed operation; the server keeps
+// nothing else for it. It is shown only while that removal is the vault's
+// newest operation of any kind and no vault change is active or starting for
+// the vault: a backup, restore, settings save or anything else that came later
+// means the user kept the vault and went on using it, and offering to remove
+// it again from an old failure would be wrong. A removal already dismissed with
+// "Keep vault" in this browser stays hidden.
+const showStoppedVaultRemovals = (operations: OperationEntry[], repositories: readonly Pick<Repository, "id">[]) => {
+	const listed = new Set(repositories.map((repository) => repository.id));
+	const activeChanges = activeVaultChanges(operations);
+	const dismissed = new Set(readDismissedVaultRemovals());
+	for (const [repositoryId, operation] of newestVaultOperations(operations)) {
+		if (!listed.has(repositoryId) || vaultRemovalSnapshot[repositoryId] || activeChanges.has(repositoryId) || dismissed.has(operation.id) ||
+			vaultMutationSnapshot[repositoryId]?.status === "running" || !removalStoppedByRecoveryProfile(operation)) continue;
+		publishVaultRemoval(repositoryId, { phase: "profile_error", operationId: operation.id });
+		void operationFailureReason(operation).then((message) => {
+			const current = vaultRemovalSnapshot[repositoryId];
+			if (current?.phase === "profile_error" && current.operationId === operation.id) publishVaultRemoval(repositoryId, { ...current, message });
+		});
+	}
 };
 
 // Test isolation needs an explicit reset because this presentation state is
 // intentionally module-owned so an internal route unmount cannot cancel work.
 // eslint-disable-next-line react-refresh/only-export-components
 export const resetVaultMutationPresentationForTests = () => {
-	activeVaultMutationRequests.clear();
-	window.removeEventListener("beforeunload", beforeVaultMutationUnload);
 	vaultPasswordStatusLifecycle++;
 	for (const repositoryId of Object.keys(vaultPasswordStatusObservationOwners)) delete vaultPasswordStatusObservationOwners[repositoryId];
 	publishVaultMutationSnapshot({});
-	vaultRemovalsInFlight.clear();
+	finishedVaultOperations.clear();
 	vaultRemovalSnapshot = {};
 	for (const listener of vaultRemovalListeners) listener(vaultRemovalSnapshot);
 };
@@ -523,11 +642,13 @@ type RunSubmissionOwner = {
 	phase: "run";
 };
 
-type VaultOwnershipPresentation = "checking" | "owner" | "nonowner" | "unverified";
+// transfer_unfinished: this computer's takeover stopped partway and can be
+// finished here. transfer_elsewhere: another computer's takeover is
+// unfinished; only that computer can finish it.
+type VaultOwnershipPresentation = "checking" | "owner" | "nonowner" | "unverified" | "transfer_unfinished" | "transfer_elsewhere";
 type VaultWorkState = "checking" | "idle" | "running" | "unavailable";
 type ActiveBackupTarget = { jobId: string; repositoryId: string; operationId: string; status: string };
 type ObservedBackupOperation = { jobId: string; repositoryId: string };
-type ObservedOperationReadOwner = { generation: number; repositoryId: string; repositoryEpoch: number };
 
 function VaultActivityLog({ records }: { records: VaultProgressRecord[] }) {
 	const container = useRef<HTMLElement | null>(null);
@@ -558,6 +679,23 @@ function VaultActivityLog({ records }: { records: VaultProgressRecord[] }) {
 	</aside>;
 }
 
+// Vault creation, connection and ownership takeover run inside their request,
+// so closing the window stops them partway. The browser's leave-page prompt
+// (held by services/api.ts) catches a reload or tab close; this says it up
+// front while the request runs. The shorter foreground saves get only the
+// prompt.
+function KeepWindowOpenNotice() {
+	return <p className="vault-keep-open" role="status">{t("ui.protect.keepWindowOpen")}</p>;
+}
+
+// A foreground action whose change committed but left a cleanup step
+// unfinished. The result is shown as completed with issues, with the
+// backend's issue text, instead of as plain success.
+function completedWithIssuesMessage(result: ForegroundOutcome | undefined) {
+	if (result?.status !== "completed_with_issues") return undefined;
+	return `${t("ui.jobStatus.completedWithIssues")}: ${(result.issues ?? []).join(" ")}`;
+}
+
 function VaultOverlayIdentity({ name }: { name: string }) {
 	return <div className="vault-overlay-identity"><span className="vault-glyph" aria-hidden="true"><Icon name="shield" size={18} /></span><strong>{name}</strong></div>;
 }
@@ -567,20 +705,50 @@ const vaultMutationBlocksCard = (mutation: VaultMutation) =>
 	mutation.status !== "recovery" ||
 	mutation.result?.phase !== "cleanup_pending";
 
+// A password change result is only shown while it needs recovery (see
+// vaultPasswordChangeNeedsRecovery), so these are the phases that can appear
+// here. Any other phase is shown with its underscores turned into spaces.
+function vaultPasswordPhaseLabel(phase: string) {
+	switch (phase) {
+		case "preparing": return t("ui.protect.passwordPhase.preparing");
+		case "native_started": return t("ui.protect.passwordPhase.nativeStarted");
+		case "publishing": return t("ui.protect.passwordPhase.publishing");
+		case "cleanup_pending": return t("ui.protect.passwordPhase.cleanupPending");
+		default: return phase.replaceAll("_", " ");
+	}
+}
+
+// The engine's result (not_started, succeeded, failed, interrupted) and the
+// protected recovery metadata status (pending, succeeded, not_changed) of a
+// password change. A status this version doesn't know is shown as sent.
+function vaultPasswordStatusLabel(status: string) {
+	switch (status) {
+		case "pending": return t("ui.protect.pending");
+		case "succeeded": return t("ui.operation.step.status.succeeded");
+		case "failed": return t("ui.operation.failed");
+		case "not_started": return t("ui.protect.passwordStatus.notStarted");
+		case "interrupted": return t("ui.protect.passwordStatus.interrupted");
+		case "not_changed": return t("ui.protect.passwordStatus.notChanged");
+		default: return status;
+	}
+}
+
 function VaultPasswordResult({ result }: { result: VaultPasswordChangeResult }) {
 	return <div className="vault-password-result">
-		<span><b>{t("ui.pages.protect.phase")}</b> {result.phase.replaceAll("_", " ")}</span>
-		<span><b>{t("ui.protect.nativeResultLabel", { engine: result.native.engine })}</b> {result.native.status || t("ui.protect.unresolved")}{result.native.output ? ` — ${formatNativeLogText(result.native.engine, "password_change", result.native.output)}` : ""}</span>
-		<span><b>{t("ui.pages.protect.protected.recovery.metadata")}</b> {result.sidecarStatus}</span>
+		<span><b>{t("ui.pages.protect.phase")}</b> {vaultPasswordPhaseLabel(result.phase)}</span>
+		<span><b>{t("ui.protect.nativeResultLabel", { engine: result.native.engine })}</b> {result.native.status ? vaultPasswordStatusLabel(result.native.status) : t("ui.protect.unresolved")}{result.native.output ? ` — ${formatNativeLogText(result.native.engine, "password_change", result.native.output)}` : ""}</span>
+		<span><b>{t("ui.pages.protect.protected.recovery.metadata")}</b> {vaultPasswordStatusLabel(result.sidecarStatus)}</span>
 		<span><b>{t("ui.pages.protect.local.cleanup")}</b> {result.cleanupPending ? t("ui.protect.pending") : t("ui.protect.notPending")}</span>
-		<span>{result.message}</span>
-		{result.resticKeyTruth && <span>{result.resticKeyTruth}</span>}
+		{/* The backend message and Restic key note are shown as written. dir="auto" gives
+		    each the direction of its own text, so a right-to-left page keeps the full stop at the end. */}
+		<span dir="auto">{result.message}</span>
+		{result.resticKeyTruth && <span dir="auto">{result.resticKeyTruth}</span>}
 		{result.native.mutationDisposition === "rejected_before_mutation" && !result.resticKeyTruth && <span>{t("ui.pages.protect.the.selected.password.was.not.changed")}</span>}
 	</div>;
 }
 
 function VaultMutationOverlay({ mutation, onReopenSettings }: { mutation: VaultMutation; onReopenSettings: (repositoryId: string, generation: number) => void }) {
-	const active = mutation.status === "running" || mutation.status === "checking";
+	const active = mutation.status === "running";
 	const result = mutation.kind === "password" ? mutation.result : undefined;
 	const retainedPasswordRecovery = mutation.kind === "settings" ? mutation.retainedPasswordRecovery : undefined;
 	const cleanupNotice = mutation.kind === "password" && mutation.status === "recovery" && result?.phase === "cleanup_pending";
@@ -591,17 +759,18 @@ function VaultMutationOverlay({ mutation, onReopenSettings }: { mutation: VaultM
 				: mutation.status === "succeeded" ? t("ui.pages.protect.vault.settings.saved")
 					: t("ui.pages.protect.vault.settings.could.not.be.saved")
 			: mutation.status === "running" ? t("ui.pages.protect.changing.vault.password")
-				: mutation.status === "checking" ? t("ui.pages.protect.checking.password.change.status")
-					: mutation.status === "recovery" ? t("ui.pages.protect.password.change.needs.attention")
-						: mutation.status === "uncertain" ? t("ui.pages.protect.password.change.outcome.is.uncertain")
-							: mutation.status === "succeeded" ? t("ui.pages.protect.vault.password.change.completed")
-								: t("ui.pages.protect.vault.password.change.did.not.finish")}</strong>
-		{active && <><span>{t("ui.pages.protect.you.can.continue.using.replicaro.while.this.finishes")}</span><span className="spinner" aria-hidden="true" /></>}
-		{mutation.error && <span className={mutation.status === "uncertain" ? "vault-mutation-uncertain" : "vault-mutation-error"}>{mutation.error}</span>}
+				: mutation.status === "recovery" ? t("ui.pages.protect.password.change.needs.attention")
+					: mutation.status === "succeeded" ? t("ui.pages.protect.vault.password.change.completed")
+						: t("ui.pages.protect.vault.password.change.did.not.finish")}</strong>
+		{/* The work runs on the server whether or not this page stays open, so
+		    there is no "keep the window open" text here. */}
+		{active && <span className="spinner" aria-hidden="true" />}
+		{mutation.kind === "password" && mutation.status === "recovery" && vaultPasswordChangeBlocksVault(result) && <span className="vault-mutation-error">{t("ui.protect.vaultPasswordChangeBlocking")}</span>}
+		{mutation.error && <span className="vault-mutation-error">{mutation.error}</span>}
 		{result && <VaultPasswordResult result={result} />}
 		{!active && <div className="vault-mutation-actions">
-			{(mutation.status === "error" || mutation.status === "uncertain") && <button className="btn sm" onClick={() => mutation.kind === "settings" ? settleVaultSettingsPresentation(mutation.repositoryId, mutation.generation) : clearVaultMutation(mutation.repositoryId, mutation.generation)}>{t("ui.pages.protect.dismiss")}</button>}
-			{mutation.kind === "settings" && mutation.status === "error" && <button className="btn sm" onClick={() => retryVaultSettingsMutation(mutation.repositoryId)}>{t("ui.pages.protect.retry.save")}</button>}
+			{mutation.status === "error" && <button className="btn sm" onClick={() => mutation.kind === "settings" ? settleVaultSettingsPresentation(mutation.repositoryId, mutation.generation) : clearVaultMutation(mutation.repositoryId, mutation.generation)}>{t("ui.pages.protect.dismiss")}</button>}
+			{mutation.kind === "settings" && mutation.status === "error" && mutation.payload && <button className="btn sm" onClick={() => retryVaultSettingsMutation(mutation.repositoryId)}>{t("ui.pages.protect.retry.save")}</button>}
 			{mutation.kind === "settings" && mutation.status === "error" && <button className="btn sm" onClick={() => onReopenSettings(mutation.repositoryId, mutation.generation)}>{t("ui.pages.protect.reopen.settings")}</button>}
 			{mutation.kind === "password" && mutation.status === "recovery" && <button className="btn sm" onClick={() => continueVaultPasswordMutation(mutation.repositoryId)}>{t("ui.pages.protect.continue.password.change")}</button>}
 		</div>}
@@ -627,19 +796,6 @@ const VAULT_PAGE_SIZE_STORAGE_KEY = "replicaro.protect.vaults.pageSize";
 const JOB_SORT_STORAGE_KEY = "replicaro.protect.jobs.sort";
 const VAULT_SORT_STORAGE_KEY = "replicaro.protect.vaults.sort";
 const MAX_VAULT_NAME_CODE_POINTS = 50;
-
-function manualRunResultText(result: ManualTargetAdmissionResult) {
-	switch (result.status) {
-		case "admitted":
-			return result.operationId ? `Admitted · operation ${result.operationId}` : "Admitted";
-		case "storage_unavailable":
-			return `Storage unavailable${result.reasonCode ? ` · ${result.reasonCode}` : ""}`;
-		case "policy_not_ready":
-			return `Policy not ready${result.reasonCode ? ` · ${result.reasonCode}` : ""}`;
-		case "busy":
-			return "Busy";
-	}
-}
 
 function truncateCodePoints(value: string, maximum: number) {
 	return Array.from(value).slice(0, maximum).join("");
@@ -691,7 +847,6 @@ function availableImportedVaultName(baseName: string, vaultID: string, repositor
 	return candidate;
 }
 const MAX_CUSTOM_SCHEDULE_MINUTES = 153_722_867;
-const EXAMPLE_PREFIX = "example: ";
 const integrityCheckHelp = () => t("ui.protect.help.integrityCheckHelp");
 const coldStorageIntegrityHelp = () => t("ui.protect.help.coldStorageIntegrityHelp");
 const connectAccessReminder = () => t("ui.protect.disableOtherSoftwareReminder");
@@ -768,14 +923,8 @@ function normalizedRcloneFolderName(value: string) {
 	return value.trim().normalize("NFC");
 }
 
-function usesRcloneNativeLogin(provider: string) {
-	// For these account-backed rclone connectors the backend allows only one
-	// profile. Connect must reuse or transfer that attachment rather than offer
-	// Join or another profile, which would imply coordination we don't support.
-	return provider === "dropbox" || provider === "google_drive" || provider === "onedrive";
-}
-
-const vaultStorageOrder = ["fs", "s3", "azblob", "gcs", "sftp", "dropbox", "google_drive", "onedrive"];
+// Any Rclone Remote is for advanced users, so it comes last.
+const vaultStorageOrder = ["fs", "s3", "azblob", "gcs", "sftp", "webdav", "dropbox", "google_drive", "onedrive", RCLONE_REMOTE_CONNECTOR];
 const hiddenVaultOptionKeys = new Set([
 	"sse_customer_key",
 	"ssh_private_key",
@@ -824,9 +973,38 @@ function unicodeCodePointCount(value: string) {
 	return Array.from(value).length;
 }
 
+// Every caller passes the bare example value (a path, URL, flag, or pattern),
+// so the translated "example:" wording is added exactly once. The value itself
+// stays untranslated. It is wrapped in a left-to-right isolate (U+2066 ...
+// U+2069) because a placeholder has no markup to carry dir="ltr": without it a
+// right-to-left language moves the leading "/" of "/srv/backups/vault" or the
+// "--" of "--verbose" to the other end and shows "*.tmp" as "tmp.*".
 function examplePlaceholder(value?: string) {
-	if (!value || value.startsWith(EXAMPLE_PREFIX)) return value;
-	return `${EXAMPLE_PREFIX}${value}`;
+	return value ? t("ui.protect.examplePlaceholder", { value: `\u2066${value}\u2069` }) : value;
+}
+
+// A destination's last run status in the job card tooltip. The words match the
+// Overview timeline, where an interrupted run is also shown as stopped. A
+// status this version doesn't know is shown as the backend sent it.
+function targetStatusLabel(status: string) {
+	switch (status) {
+		case "": return t("ui.destinationStatus.notRun");
+		case "queued": return t("ui.operation.queued");
+		case "running": return t("ui.operation.running");
+		case "success": return t("ui.operation.success");
+		case "failed": return t("ui.operation.failed");
+		case "partial": return t("ui.operation.partial");
+		case "interrupted": return t("ui.operation.stopped");
+		case "completed_with_issues": return t("ui.operation.completedWithIssues");
+		case "reconnect_required": return t("ui.operation.reconnectRequired");
+		default: return status;
+	}
+}
+
+// The backend reports a failed Vault Size refresh as a stable code rather than
+// text. Anything else it sends is shown as it arrives.
+function vaultSizeFailureText(failure: string) {
+	return failure === "vault_size_refresh_failed" ? t("ui.protect.vaultSizeRefreshFailed") : failure;
 }
 
 type JobSort = "newest" | "oldest" | "name-asc" | "name-desc";
@@ -1037,13 +1215,15 @@ interface JobForm {
 	afterScriptMustSucceed: boolean;
 }
 
-type JobMutationResultStatus = "created" | "updated" | "unchanged" | "warning" | "failed";
-
 interface JobMutationResult {
 	jobId?: string;
 	name: string;
 	source?: string;
 	status: JobMutationResultStatus;
+	// A backend warning or error, or a translated notice such as the one shown
+	// when a failed edit can't be retried while its job is running. A plain
+	// success leaves this empty, because the translated status above already
+	// says what happened.
 	message: string;
 	payload?: JobInput;
 	enabled?: boolean;
@@ -1290,8 +1470,15 @@ function connectorOptionsWithoutUnchangedDefaults(integration: StorageIntegratio
 	return Object.fromEntries(Object.entries(options).filter(([key, value]) => defaults.get(key) !== value));
 }
 
+// An rclone config password typed before the answer was changed to No is not
+// sent; it only belongs to an encrypted rclone.conf.
+function withheldRcloneConfigPassword(form: VaultForm, key: string) {
+	return form.connector === RCLONE_REMOTE_CONNECTOR && key === "config_password" && form.options.config_encrypted !== "true";
+}
+
 function connectorOptionsForSubmission(form: VaultForm, integration: StorageIntegration | undefined) {
-	const presentedKeys = new Set(visibleVaultOptions(integration?.options ?? [], form.connector).map((option) => option.key));
+	const presentedKeys = new Set(visibleVaultOptions(integration?.options ?? [], form.connector).map((option) => option.key)
+		.filter((key) => !withheldRcloneConfigPassword(form, key)));
 	// Options removed from the UI must not silently reach a backend adapter or
 	// native engine, including stale values restored from a pending intent.
 	return Object.fromEntries(Object.entries(form.options)
@@ -1324,12 +1511,57 @@ function orderedConnectorOptions(integration: StorageIntegration | undefined, co
 }
 
 function missingRequiredConnectorOptions(integration: StorageIntegration | undefined, options: Record<string, string>) {
-	return (integration?.options ?? []).filter((option) => option.required && !String(options[option.key] ?? "").trim());
+	return (integration?.options ?? []).filter((option) => option.required
+		? !String(options[option.key] ?? "").trim()
+		// The rclone config password is needed only for an encrypted rclone.conf.
+		: integration?.id === RCLONE_REMOTE_CONNECTOR && option.key === "config_password" &&
+			options.config_encrypted === "true" && !options.config_password);
 }
 
-function repositoryConnectorLabel(repository: Pick<Repository, "connector" | "connectorLabel" | "location" | "isNetwork" | "coldStorage">) {
+// The path in remote the way the backend saves it: trimmed, and without a
+// trailing "/" unless the path is just "/".
+function normalizedRcloneRemotePath(value = "") {
+	return trimGoSpace(value) === "/" ? "/" : trimGoSpace(value).replace(/\/$/, "");
+}
+
+// The remote and the full path of an Any Rclone Remote vault, the way rclone
+// writes it: <remote>:<path in remote>/Replicaro/<vault name>.
+function rcloneRemoteVaultAddress(remote: string, path: string, location: string) {
+	return trimGoSpace(remote) ? `${trimGoSpace(remote)}:${normalizedRcloneRemotePath(path).replace(/\/$/, "")}/${location}` : "";
+}
+
+function savedRcloneRemoteVaultAddress(repository: Pick<Repository, "connector" | "coldStorage" | "location" | "rcloneRemote">) {
+	const settings = repository.rcloneRemote;
+	return repository.connector === RCLONE_REMOTE_CONNECTOR && !repository.coldStorage && settings
+		? rcloneRemoteVaultAddress(settings.remote, settings.path, repository.location) : "";
+}
+
+// The chip label as shown. An Any Rclone Remote address goes in a
+// left-to-right <bdi>, so it keeps its order in a right-to-left language and
+// copies without any added characters.
+function repositoryConnectorLabelContent(repository: Pick<Repository, "connector" | "connectorLabel" | "location" | "isNetwork" | "coldStorage" | "rcloneRemote">) {
+	const address = savedRcloneRemoteVaultAddress(repository);
+	if (!address) return repositoryConnectorLabel(repository);
+	return <>{knownMessage(`ui.integration.${RCLONE_REMOTE_CONNECTOR}.label`, "Any Rclone Remote")}: <bdi dir="ltr" className="rclone-remote-address">{address}</bdi></>;
+}
+
+function repositoryConnectorLabel(repository: Pick<Repository, "connector" | "connectorLabel" | "location" | "isNetwork" | "coldStorage" | "rcloneRemote">) {
 	if (repository.coldStorage) return t("ui.protect.coldStorageConnectorLabel");
+	if (repository.connector === RCLONE_REMOTE_CONNECTOR) {
+		// Like "s3: <endpoint>": the storage type, then where the vault is.
+		const storageType = knownMessage(`ui.integration.${RCLONE_REMOTE_CONNECTOR}.label`, "Any Rclone Remote");
+		const address = savedRcloneRemoteVaultAddress(repository);
+		return address ? `${storageType}: ${address}` : storageType;
+	}
     if (repository.connector === "s3") return repository.connectorLabel || "s3";
+	if (repository.connector === "webdav") {
+		// The backend sends "webdav: <host>", like S3, with ":<port>" added for a
+		// non-default port; the path is on the location line below. The card
+		// data has no connector options, so this fallback only knows the host,
+		// written without IPv6 brackets as the backend does when it shows no port.
+		const address = canonicalWebDAVAddress(repository.location);
+		return repository.connectorLabel || (address ? `webdav: ${address.host.replace(/^\[(.*)\]$/, "$1")}` : "webdav");
+	}
     if (repository.connector !== "fs") return repository.connector;
     const location = repository.location.trim().replace(/\//g, "\\");
 	return repository.isNetwork || location.startsWith("\\\\") ? t("ui.protect.networkConnectorLabel") : t("ui.protect.localConnectorLabel");
@@ -1356,6 +1588,10 @@ function repositoryLocationLabel(repository: Pick<Repository, "connector" | "con
     const location = ["fs", "s3"].includes(repository.connector) ? repository.location : repository.location.trim();
 	const withLeadingSlash = (value: string) => value.startsWith("/") || value.startsWith("~/") ? value : `/${value}`;
     if (repository.connector === "fs") return withLeadingSlash(filesystemVaultFolder(location));
+	// A WebDAV Location is already the full server URL the user entered (in its
+	// saved spelling), so show it as is. The generic handling below would
+	// prefix it with "/".
+	if (repository.connector === "webdav") return location;
     try {
         const parsed = repository.connector === "s3" ? s3LocationURL(location) : new URL(location);
         const path = remotePathLabel(parsed.pathname);
@@ -1404,12 +1640,6 @@ const emptyVault = (integration?: StorageIntegration, engine: VaultForm["engine"
 	objectLock: emptyObjectLock(),
 });
 
-const limitedSpeedProviders: Record<string, string> = {
-	dropbox: "Dropbox",
-	google_drive: "Google Drive",
-	onedrive: "OneDrive",
-};
-
 // Keep old/imported high-speed values usable while making provider changes
 // synchronous with form state so a save cannot race a later correction.
 function compatibleConcurrencyMode(connector: string, mode: VaultForm["concurrencyMode"]): VaultForm["concurrencyMode"] {
@@ -1439,6 +1669,9 @@ function IntegrationField({
     const label = knownMessage(`ui.integration.${connector}.option.${option.key}.label`, option.label);
     const help = option.help && (connector === "s3" && option.key === "storage_class"
         ? t("ui.integration.s3.option.storage_class.help", { glacier: "GLACIER", deepArchive: "DEEP_ARCHIVE" })
+        // Catalogs can't contain URL text, so the schemes are placeholders.
+        : connector === "webdav" && option.key === "port"
+        ? renderMessage("ui.integration.webdav.option.port.help", ltrValues({ https: "https://", http: "http://" }))
         : knownMessage(`ui.integration.${connector}.option.${option.key}.help`, option.help));
     if (option.kind === "boolean") {
         return (
@@ -1452,9 +1685,11 @@ function IntegrationField({
             </div>
         );
     }
+    // Fields are required unless their label says "(optional)", so a required
+    // option gets no marker.
     return (
 		<label className="field">
-			<span>{label}{option.required && option.key !== "access_key" && option.key !== "secret_access_key" ? " *" : ""}</span>
+			<span>{label}</span>
 			{option.kind === "textarea" ? (
 				<textarea rows={3} value={value} disabled={disabled} placeholder={examplePlaceholder(option.placeholder)} onChange={(event) => onChange(event.target.value)} />
 			) : (
@@ -1518,9 +1753,135 @@ function sftpHost(value: string) {
     return host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
 }
 
+// WebDAV addresses are stored as "<scheme>://<host><path>" with a non-default
+// port in the "port" option. The backend (vaultidentity.NormalizeWebDAVAddress)
+// saves one canonical spelling, and the helpers below follow its string rules
+// so a typed address can be compared with a saved one. They deliberately
+// avoid the browser URL parser: it turns IDN hosts into punycode and
+// percent-encodes spaces and non-ASCII path characters, so a saved
+// "https://bücher.example/Backups/my vault" would never equal what the user
+// typed. This is a best-effort match, not a guarantee: the browser and Go can
+// ship different Unicode tables, so a rare host or path may compare
+// differently here. That only decides whether an unfinished connection is
+// offered; the backend validates and canonicalizes every address it receives.
+const webdavSchemes: Record<string, "https" | "http"> = {
+	https: "https", http: "http",
+	webdavs: "https", davs: "https",
+	webdav: "http", dav: "http",
+};
+
+// Go's unicode.IsSpace set. JavaScript's trim() and \s differ from it (they
+// include U+FEFF and leave out U+0085), and the backend trims with Go's set.
+const goSpace = "\\t\\n\\v\\f\\r \\u0085\\u00a0\\u1680\\u2000-\\u200a\\u2028\\u2029\\u202f\\u205f\\u3000";
+const goLeadingSpace = new RegExp(`^[${goSpace}]+`);
+const goTrailingSpace = new RegExp(`[${goSpace}]+$`);
+
+function trimGoSpace(value: string) {
+	return value.replace(goLeadingSpace, "").replace(goTrailingSpace, "");
+}
+
+// Go's strings.ToLower maps one code point at a time. toLowerCase() on the
+// whole string applies context rules (a final capital sigma becomes "ς") and
+// turns "İ" into two code points, so lowercase each code point on its own.
+function goLowerCase(value: string) {
+	return Array.from(value, (character) => character === "\u0130" ? "i" : character.toLowerCase()).join("");
+}
+
+// The Server URL field holds only the scheme and host. A trailing slash is
+// harmless there, so drop it before the Path is appended.
+function webdavServerURL(value: string) {
+	return trimGoSpace(value).replace(/\/+$/, "");
+}
+
+// The Server URL field takes only a known scheme and the host; the port and
+// the folder have their own fields. A path typed here would otherwise be glued
+// in front of the Path field and quietly name a different folder, so the form
+// stops on a missing scheme, a path, or a port and points the user to the
+// right fields. The backend still validates the whole URL.
+//
+// Returns "misplaced" for a value that needs the message, "incomplete" for one
+// the user may still be typing (an empty field, the start of a known scheme,
+// a scheme with no host, or an IPv6 address whose "]" hasn't been typed yet),
+// and "ok" otherwise. Only "ok" is used to build a Location.
+function webdavServerURLCheck(value: string): "ok" | "incomplete" | "misplaced" {
+	const trimmed = trimGoSpace(value);
+	const lower = trimmed.toLowerCase();
+	if (!trimmed || Object.keys(webdavSchemes).some((scheme) => `${scheme}://`.startsWith(lower))) return "incomplete";
+	if (!webdavScheme(trimmed)) return "misplaced";
+	const host = webdavServerURL(trimmed.slice(trimmed.indexOf("://") + 3));
+	if (!host) return "incomplete";
+	if (host.includes("/")) return "misplaced";
+	// An IPv6 address keeps its colons inside the brackets, so only what comes
+	// after the closing bracket can hold a port.
+	if (host.startsWith("[") && !host.includes("]")) return "incomplete";
+	const outsideBrackets = host.startsWith("[") ? host.slice(host.indexOf("]") + 1) : host;
+	// A port adds exactly one colon. More than one means an IPv6 address
+	// without brackets, which the backend explains more precisely.
+	return outsideBrackets.split(":").length === 2 ? "misplaced" : "ok";
+}
+
+// Returns "https", "http", or "" for an unknown or missing scheme. The dav
+// aliases are sent as typed; the backend stores the plain scheme.
+function webdavScheme(value: string) {
+	const trimmed = trimGoSpace(value);
+	const separator = trimmed.indexOf("://");
+	const scheme = separator < 0 ? "" : trimmed.slice(0, separator).toLowerCase();
+	// An own-property check, so "constructor://" or "__proto__://" can't pick
+	// up a value from Object.prototype.
+	return Object.hasOwn(webdavSchemes, scheme) ? webdavSchemes[scheme] : "";
+}
+
+function webdavUsesPlainHTTP(value: string) {
+	return webdavScheme(value) === "http";
+}
+
+// Splits a stored or composed Location back into the Server URL and Path
+// fields. The path is returned exactly as written.
+function splitWebDAVLocation(location: string) {
+	const trimmed = trimGoSpace(location);
+	const separator = trimmed.indexOf("://");
+	if (separator < 0) return null;
+	const slash = trimmed.indexOf("/", separator + 3);
+	return slash < 0 ? { serverURL: trimmed, path: "" } : { serverURL: trimmed.slice(0, slash), path: trimmed.slice(slash) };
+}
+
+// The canonical form the backend would store, with the effective port filled
+// in: alias schemes mapped, scheme and host lowercased, and the trailing slash
+// (with any whitespace it was hiding) dropped from the path until neither is
+// left. Everything else in the path, including case, spaces, and Unicode form,
+// is kept, because it names a real folder on the server.
+function canonicalWebDAVAddress(location: string, port = "") {
+	const split = splitWebDAVLocation(location);
+	const scheme = split ? webdavScheme(split.serverURL) : "";
+	if (!split || !scheme || !split.path) return null;
+	const host = goLowerCase(trimGoSpace(split.serverURL.slice(split.serverURL.indexOf("://") + 3)));
+	if (!host) return null;
+	let path = split.path;
+	while (path !== "/") {
+		const trimmed = path.replace(/\/$/, "").replace(goTrailingSpace, "");
+		if (trimmed === path) break;
+		path = trimmed;
+	}
+	const rawPort = trimGoSpace(port);
+	// strconv.Atoi accepts a leading sign and leading zeros.
+	if (rawPort && !/^[+-]?\d+$/.test(rawPort)) return null;
+	const portNumber = rawPort ? Number(rawPort) : scheme === "https" ? 443 : 80;
+	if (!Number.isInteger(portNumber) || portNumber < 1 || portNumber > 65535) return null;
+	return { scheme, host, path, port: String(portNumber) };
+}
+
+// URLs and paths keep their own left-to-right order inside a translated
+// sentence. Without an isolate, a right-to-left language moves the slashes and
+// colon of "https://" or "/dav/Backups/vault" to the wrong side of the text
+// around them.
+function ltrValues(values: Record<string, string>) {
+	return Object.fromEntries(Object.entries(values).map(([name, value]) =>
+		[name, <bdi key={name} dir="ltr">{value}</bdi>]));
+}
+
 function vaultLocation(form: VaultForm, useVaultNameForRclone = false) {
     if (form.pendingLocation) return form.pendingLocation;
-	if (usesRcloneNativeLogin(form.connector)) {
+	if (usesVaultFolderName(form.connector)) {
 		const normalized = normalizedRcloneFolderName(useVaultNameForRclone ? form.name : form.location);
 		return normalized && unicodeCodePointCount(normalized) <= 50 ? normalized : "";
 	}
@@ -1539,6 +1900,16 @@ function vaultLocation(form: VaultForm, useVaultNameForRclone = false) {
 			const absolutePath = (form.options.path_mode || "home") === "absolute";
 			if ((absolutePath && (!rawPath.startsWith("/") || rawPath.startsWith("//"))) || (!absolutePath && rawPath.startsWith("/"))) return "";
             return host && prefix ? `sftp://${host}${prefix}` : "";
+        }
+        case "webdav": {
+            // The Location is the Server URL followed by the Path, as typed apart
+            // from edge whitespace and the Server URL's trailing slash. The backend
+            // validates and canonicalizes it (scheme aliases, host case, default
+            // port), so this only has to put the two fields together safely.
+            const serverURL = webdavServerURL(form.host);
+            const path = trimGoSpace(form.prefix);
+            if (webdavServerURLCheck(form.host) !== "ok" || !path.startsWith("/")) return "";
+            return `${serverURL}${path}`;
         }
         case "azblob": {
             const container = form.container.trim();
@@ -1645,8 +2016,26 @@ function connectionIntentMatchesDestination(intent: RepositoryConnectionIntent, 
 		const enteredEndpoint = normalizedRemoteEndpoint(form.options.endpoint ?? "", false);
 		if (!sameOption("root") || savedEndpoint === null || savedEndpoint !== enteredEndpoint) return false;
 	}
+	if (form.connector === "webdav") {
+		// The saved attempt holds the backend's canonical Location and port, while
+		// the form may still hold an alias scheme, an uppercase host, or an empty
+		// default port. Compare both in the backend's canonical form. The scheme
+		// stays part of the match: a retry reuses the saved address, so an https
+		// entry must not resume an attempt saved for http on the same port.
+		const saved = canonicalWebDAVAddress(intent.location, savedOptions.port);
+		const current = canonicalWebDAVAddress(entered, form.options.port);
+		if (!saved || !current) return false;
+		return saved.scheme === current.scheme && saved.host === current.host &&
+			saved.port === current.port && saved.path === current.path;
+	}
+	if (form.connector === RCLONE_REMOTE_CONNECTOR) {
+		// The same vault folder name can sit on another remote or under another
+		// path in remote, so those have to match too. The backend saves the path
+		// without its trailing "/".
+		if (trimGoSpace(savedOptions.remote ?? "") !== trimGoSpace(form.options.remote ?? "") || normalizedRcloneRemotePath(savedOptions.path) !== normalizedRcloneRemotePath(form.options.path)) return false;
+	}
 	if (intent.location === entered) return true;
-	if (usesRcloneNativeLogin(form.connector)) return intent.location === `Replicaro/${entered}`;
+	if (usesVaultFolderName(form.connector)) return intent.location === `Replicaro/${entered}`;
 	if (form.connector !== "sftp") return intent.location === entered;
 	try {
 		// SFTP's visible form keeps username and port in connector options,
@@ -1661,13 +2050,19 @@ function connectionIntentMatchesDestination(intent: RepositoryConnectionIntent, 
 function restoreVaultDestinationFields(form: VaultForm) {
     if (!form.location) return form;
 	if (form.connector === "fs") return { ...form, pendingLocation: form.location };
-	if (usesRcloneNativeLogin(form.connector)) {
+	if (usesVaultFolderName(form.connector)) {
 		const canonical = form.location.trim();
 		const prefix = "Replicaro/";
 		if (!canonical.startsWith(prefix)) return form;
 		const folder = canonical.slice(prefix.length);
 		if (!folder || folder.includes("/") || folder.includes("\\")) return form;
 		return { ...form, location: folder, pendingLocation: canonical };
+	}
+	if (form.connector === "webdav") {
+		// Split by hand rather than with URL, which would rewrite an IDN host
+		// and encode the path. The port already lives in the options.
+		const split = splitWebDAVLocation(form.location);
+		return split ? { ...form, host: split.serverURL, prefix: split.path, pendingLocation: form.location } : form;
 	}
     try {
         const parsed = form.connector === "s3" ? s3LocationURL(form.location) : new URL(form.location.trim());
@@ -1701,8 +2096,13 @@ function restoreVaultDestinationFields(form: VaultForm) {
 }
 
 function creationOptionIsCustom(connector: string, key: string) {
+	// Any Rclone Remote lays out all of its settings itself (RcloneRemoteFields).
+	if (connector === RCLONE_REMOTE_CONNECTOR) return true;
 	if (key === "root") return true;
 	if (connector === "s3" && key === "endpoint") return true;
+	// WebDAV's Port sits between its Server URL and Path inputs. The WebDAV
+	// username and WebDAV account password render as ordinary catalog options.
+	if (connector === "webdav") return key === "port";
 	return connector === "sftp" && ["path_mode", "port", "username", "identity"].includes(key);
 }
 
@@ -1728,6 +2128,7 @@ function vaultEngineHelp(connector: string, coldStorage: boolean) {
 	if (connector === "dropbox") return t("ui.protect.dropboxEngineHelp");
 	if (connector === "google_drive") return t("ui.protect.googleDriveEngineHelp");
 	if (connector === "onedrive") return t("ui.protect.oneDriveEngineHelp");
+	if (connector === RCLONE_REMOTE_CONNECTOR) return t("ui.protect.rcloneRemoteEngineHelp");
 	return t("ui.protect.immutableEngineHelp");
 }
 
@@ -1746,10 +2147,14 @@ function RemoteVaultFields({
 	form,
 	integration,
 	onChange,
+	vaultFolderField = true,
 }: {
     form: VaultForm;
     integration: StorageIntegration;
     onChange: (next: VaultForm) => void;
+	// Create uses the vault name as the vault's folder name, so only Connect
+	// asks for the folder name itself.
+	vaultFolderField?: boolean;
 }) {
     const option = (key: string) => integration.options.find((candidate) => candidate.key === key);
     const updateOption = (key: string, value: string) => onChange(updateConnectorOption(form, key, value, Boolean(option("region"))));
@@ -1758,9 +2163,16 @@ function RemoteVaultFields({
 		return selected ? <IntegrationField key={key} connector={integration.id} option={selected} value={displayValue ?? form.options[key] ?? ""} disabled={Boolean(form.pendingLocation) && !selected.credential} onChange={(value) => updateOption(key, value)} /> : null;
     };
 
-	if (usesRcloneNativeLogin(integration.id)) {
-		return <label className="field"><span>{t("ui.protect.vaultFolderOnProvider", { provider: knownMessage(`ui.integration.${integration.id}.label`, integration.label) })}</span><input aria-label={t("ui.protect.vaultFolderOnProvider", { provider: knownMessage(`ui.integration.${integration.id}.label`, integration.label) })} value={form.location} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, location: event.target.value })} /><small>{t("ui.protect.vaultFolderExactHelp", { provider: knownMessage(`ui.integration.${integration.id}.label`, integration.label) })}</small></label>;
-	}
+	// Any Rclone Remote has its own sentences: its storage type name doesn't
+	// fit where these sentences put a provider's name in every language.
+	const provider = knownMessage(`ui.integration.${integration.id}.label`, integration.label);
+	const rcloneRemote = integration.id === RCLONE_REMOTE_CONNECTOR;
+	const vaultFolderLabel = rcloneRemote ? t("ui.protect.rcloneRemoteVaultFolder") : t("ui.protect.vaultFolderOnProvider", { provider });
+	const vaultFolder = vaultFolderField && <label className="field"><span>{vaultFolderLabel}</span><input aria-label={vaultFolderLabel} value={form.location} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, location: event.target.value })} /><small>{rcloneRemote ? t("ui.protect.rcloneRemoteVaultFolderHelp") : t("ui.protect.vaultFolderExactHelp", { provider })}</small></label>;
+	// The vault folder name comes after the remote settings, because it names
+	// a folder under the chosen path in remote.
+	if (rcloneRemote) return <><RcloneRemoteFields form={form} integration={integration} onChange={onChange} />{vaultFolder}</>;
+	if (usesVaultFolderName(integration.id)) return vaultFolder || null;
 
     switch (integration.id) {
         case "s3":
@@ -1795,13 +2207,195 @@ function RemoteVaultFields({
                 {renderOption("port", pendingURL?.port || undefined)}
                 {renderOption("username", pendingURL?.username || undefined)}
 				{supportsPathMode && <label className="field"><span>{t("ui.pages.protect.vault.location.on.server")}</span><select value={pathMode} disabled={Boolean(form.pendingLocation)} onChange={(event) => updateOption("path_mode", event.target.value)}><option value="home">{t("ui.pages.protect.sftp.home.directory.recommended")}</option><option value="absolute">{t("ui.pages.protect.server.filesystem.root")}</option></select></label>}
-				<label className="field"><span>{absolutePath ? t("ui.pages.protect.vault.path.relative.to.server.filesystem.root") : t("ui.pages.protect.vault.path.relative.to.sftp.home")}</span><input aria-label={absolutePath ? t("ui.protect.vaultPathServerRoot") : t("ui.protect.vaultPathSftpHome")} value={form.prefix} placeholder={absolutePath ? "example: /srv/backups/vault" : "example: backups/vault"} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /><small>{absolutePath ? t("ui.pages.protect.start.with.one.the.path.begins.at.the.server") : t("ui.pages.protect.do.not.start.with.the.path.begins.in.the")}</small></label>
+				<label className="field"><span>{absolutePath ? t("ui.pages.protect.vault.path.relative.to.server.filesystem.root") : t("ui.pages.protect.vault.path.relative.to.sftp.home")}</span><input aria-label={absolutePath ? t("ui.protect.vaultPathServerRoot") : t("ui.protect.vaultPathSftpHome")} value={form.prefix} placeholder={examplePlaceholder(absolutePath ? "/srv/backups/vault" : "backups/vault")} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /><small>{absolutePath ? t("ui.pages.protect.start.with.one.the.path.begins.at.the.server") : t("ui.pages.protect.do.not.start.with.the.path.begins.in.the")}</small></label>
                 {renderOption("identity")}
+            </>;
+        }
+        case "webdav": {
+            // Server URL, Port, and Path are separate inputs, like SFTP's host and
+            // path, and vaultLocation joins them. WebDAV has no home directory, so
+            // unlike SFTP there is no home/root choice: every path starts at the
+            // server root, and the examples show where common servers put a
+            // user's files. Neither engine creates a missing folder here. Both
+            // inputs are laid out left to right even in a right-to-left page;
+            // otherwise the Path's leading "/" is drawn at the far end.
+            const serverURLMisplaced = webdavServerURLCheck(form.host) === "misplaced";
+            return <>
+                <div className="webdav-server-url">
+                    <label className="field"><span>{t("ui.protect.webdavServerURL")}</span><input aria-label={t("ui.protect.webdavServerURL")} dir="ltr" value={form.host} placeholder={examplePlaceholder("https://cloud.example.com")} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, host: event.target.value })} /><small>{renderMessage("ui.protect.webdavServerURLHelp", ltrValues({ https: "https://", http: "http://", example: "https://cloud.example.com" }))}</small>{serverURLMisplaced && <small className="inline-error" role="alert">{renderMessage("ui.protect.webdavServerURLHasPath", ltrValues({ https: "https://", http: "http://", example: "https://cloud.example.com" }))}</small>}</label>
+                    {/* Plain HTTP is allowed for trusted networks, but the WebDAV
+                        credentials then cross the network in the clear, so say so
+                        whenever the scheme resolves to http (webdav:// and dav://
+                        included). The status region stays mounted and only its
+                        text comes and goes: several screen readers don't announce
+                        a live region that is inserted together with its text. It
+                        shares a wrapper with the Server URL so that, while empty,
+                        it adds no gap to the form. */}
+                    <div className="webdav-plain-http-status" role="status">{webdavUsesPlainHTTP(form.host) && <div className="recovery-warning webdav-plain-http-warning"><p>{renderMessage("ui.protect.webdavPlainHTTPWarning", ltrValues({ https: "https://" }))}</p></div>}</div>
+                </div>
+                {renderOption("port")}
+                <label className="field"><span>{t("ui.protect.webdavPath")}</span><input aria-label={t("ui.protect.webdavPath")} dir="ltr" value={form.prefix} placeholder={examplePlaceholder("/dav/Backups/vault")} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /><small>{t("ui.protect.webdavPathHelp")}</small><small className="webdav-path-examples">{renderMessage("ui.protect.webdavPathExamples", ltrValues({ nextcloud: "/remote.php/dav/files/<username>/Backups/vault", owncloud: "/remote.php/webdav/Backups/vault", share: "/dav/Backups/vault" }))}</small></label>
             </>;
         }
         default:
             return null;
     }
+}
+
+// Shown at the top of the create and connect screens whenever Any Rclone
+// Remote is the selected storage type.
+function RcloneRemoteWarning() {
+	return <div className="recovery-warning recovery-fallback-message rclone-remote-warning">
+		<p>{t("ui.protect.rcloneRemoteWarningAdvanced")}</p>
+		<p>{t("ui.protect.rcloneRemoteWarningSupport")}</p>
+		<p>{t("ui.protect.rcloneRemoteWarningCredentials")}</p>
+	</div>;
+}
+
+// Listing the remotes runs rclone against the user's rclone.conf and writes a
+// short-lived check file next to it, so the list is read only once the typing
+// has paused.
+const RCLONE_REMOTE_LIST_DELAY_MS = 800;
+
+type RcloneRemoteList =
+	| { request: string; status: "loading" }
+	| { request: string; status: "loaded"; remotes: RcloneRemoteEntry[] }
+	| { request: string; status: "failed"; error: string };
+
+// The Any Rclone Remote settings, in this order: the rclone config file, the
+// environment variables, whether rclone.conf is encrypted (and then the rclone
+// config password), the remote picked from the file, and the path in remote.
+// No sign-in is involved; everything rclone needs is in the user's file or in
+// these variables.
+function RcloneRemoteFields({
+	form,
+	integration,
+	onChange,
+}: {
+	form: VaultForm;
+	integration: StorageIntegration;
+	onChange: (next: VaultForm) => void;
+}) {
+	const label = (key: string) => knownMessage(`ui.integration.${RCLONE_REMOTE_CONNECTOR}.option.${key}.label`,
+		integration.options.find((option) => option.key === key)?.label ?? key);
+	const options = form.options;
+	const update = (key: string, value: string) => onChange(updateConnectorOption(form, key, value));
+	// A pending creation or connection keeps its saved remote settings; only
+	// the rclone config password and the environment variables are entered
+	// again, as for other storage types' credentials.
+	const locked = Boolean(form.pendingLocation);
+	const encrypted = options.config_encrypted === "true";
+	const variables = parseRcloneRemoteVariables(options.environment);
+	const updateVariables = (rows: typeof variables) => update("environment", serializeRcloneRemoteVariables(rows));
+	const remote = options.remote ?? "";
+
+	// Only the settings that decide which remotes rclone sees go into the
+	// list request.
+	const listOptions: Record<string, string> = {
+		config_file: options.config_file ?? "",
+		config_encrypted: encrypted ? "true" : "false",
+		...(encrypted ? { config_password: options.config_password ?? "" } : {}),
+		environment: options.environment ?? "",
+	};
+	const listReady = !locked && Boolean(listOptions.config_file.trim()) && (!encrypted || Boolean(listOptions.config_password));
+	const [refreshCount, setRefreshCount] = useState(0);
+	const listRequest = listReady ? JSON.stringify([listOptions, refreshCount]) : "";
+	const [list, setList] = useState<RcloneRemoteList | null>(null);
+	const immediateRefresh = useRef(false);
+	useEffect(() => {
+		if (!listRequest) return;
+		const controller = new AbortController();
+		const [requestOptions] = JSON.parse(listRequest) as [Record<string, string>, number];
+		const delay = immediateRefresh.current ? 0 : RCLONE_REMOTE_LIST_DELAY_MS;
+		immediateRefresh.current = false;
+		const timer = window.setTimeout(() => {
+			setList({ request: listRequest, status: "loading" });
+			listRcloneRemotes(requestOptions, controller.signal)
+				.then(({ remotes }) => { if (!controller.signal.aborted) setList({ request: listRequest, status: "loaded", remotes: remotes ?? [] }); })
+				.catch((error: Error) => {
+					if (!controller.signal.aborted && error.name !== "AbortError") setList({ request: listRequest, status: "failed", error: error.message });
+				});
+		}, delay);
+		return () => {
+			window.clearTimeout(timer);
+			controller.abort();
+		};
+	}, [listRequest]);
+	// A result for settings that have since changed is not shown.
+	const current = list && list.request === listRequest ? list : null;
+	const remotes = current?.status === "loaded" ? current.remotes : [];
+	const listedNames = remotes.map((entry) => entry.name);
+	const placeholder = !listReady ? t("ui.protect.rcloneRemoteListWaiting")
+		: !current || current.status === "loading" ? t("ui.protect.rcloneRemoteListLoading")
+		: current.status === "loaded" && remotes.length === 0 ? t("ui.protect.rcloneRemoteListEmpty")
+		: t("ui.protect.rcloneRemoteChooseRemote");
+	const pathExampleRemote = remote || "remote";
+
+	return <>
+		<label className="field">
+			<span>{label("config_file")}</span>
+			<input aria-label={label("config_file")} dir="ltr" value={options.config_file ?? ""} disabled={locked} spellCheck={false} onChange={(event) => update("config_file", event.target.value)} />
+			<small>{t("ui.integration.rclone_remote.option.config_file.help")}</small>
+		</label>
+		<div className="field rclone-remote-variables" role="group" aria-label={label("environment")}>
+			<span>{label("environment")}</span>
+			{/* Every row has the same visible labels, so each control's
+			    accessible name adds the row number to tell the rows apart. */}
+			{variables.map((variable, index) => (
+				<div className="rclone-remote-variable" key={index}>
+					<label className="field">
+						<span>{t("ui.protect.rcloneRemoteVariableName")}</span>
+						<input aria-label={t("ui.protect.rcloneRemoteVariableNameRow", { number: index + 1 })} dir="ltr" value={variable.name} spellCheck={false} autoComplete="off" onChange={(event) => updateVariables(variables.map((row, rowIndex) => rowIndex === index ? { ...row, name: event.target.value } : row))} />
+					</label>
+					<label className="field">
+						<span>{t("ui.protect.rcloneRemoteVariableValue")}</span>
+						{/* Values are often keys or tokens, so they are masked like any
+						    other secret setting. */}
+						<input aria-label={t("ui.protect.rcloneRemoteVariableValueRow", { number: index + 1 })} type="password" dir="ltr" value={variable.value} autoComplete="new-password" onChange={(event) => updateVariables(variables.map((row, rowIndex) => rowIndex === index ? { ...row, value: event.target.value } : row))} />
+					</label>
+					<button type="button" className="btn sm" aria-label={t("ui.protect.rcloneRemoteRemoveVariableRow", { number: index + 1 })} onClick={() => updateVariables(variables.filter((_, rowIndex) => rowIndex !== index))}>{t("ui.protect.rcloneRemoteRemoveVariable")}</button>
+				</div>
+			))}
+			<button type="button" className="btn sm rclone-remote-add-variable" onClick={() => updateVariables([...variables, { name: "", value: "" }])}><Icon name="plus" size={14} />{t("ui.protect.rcloneRemoteAddVariable")}</button>
+			<small>{renderMessage("ui.integration.rclone_remote.option.environment.help", ltrValues({ example: "AWS_ACCESS_KEY_ID", envAuth: "env_auth" }))}</small>
+		</div>
+		<label className="field">
+			<span>{label("config_encrypted")}</span>
+			<select aria-label={label("config_encrypted")} value={encrypted ? "true" : "false"} disabled={locked} onChange={(event) => update("config_encrypted", event.target.value)}>
+				<option value="true">{t("ui.protect.answerYes")}</option>
+				<option value="false">{t("ui.protect.answerNo")}</option>
+			</select>
+		</label>
+		{encrypted && <label className="field">
+			<span>{label("config_password")}</span>
+			<input aria-label={label("config_password")} type="password" value={options.config_password ?? ""} autoComplete="off" onChange={(event) => update("config_password", event.target.value)} />
+		</label>}
+		<div className="field rclone-remote-picker">
+			<label className="field">
+				<span>{label("remote")}</span>
+				{/* The select follows the page direction, so the translated
+				    placeholder sentences read correctly. An option can only hold
+				    text, so each remote name is isolated left to right instead. */}
+				<select aria-label={label("remote")} value={remote} disabled={locked || current?.status !== "loaded"} onChange={(event) => update("remote", event.target.value)}>
+					<option value="">{placeholder}</option>
+					{/* A saved remote stays selectable while the list loads, and
+					    after it, even when rclone no longer lists it. */}
+					{remote && !listedNames.includes(remote) && <option value={remote}>{ltrIsolate(remote)}</option>}
+					{remotes.map((entry) => <option key={entry.name} value={entry.name}>{ltrIsolate(entry.type ? `${entry.name} (${entry.type})` : entry.name)}</option>)}
+				</select>
+			</label>
+			{current?.status === "failed" && <small className="inline-error rclone-remote-list-error" role="alert">{current.error}</small>}
+			{listReady && current && current.status !== "loading" && <button type="button" className="btn sm" onClick={() => { immediateRefresh.current = true; setRefreshCount((count) => count + 1); }}>{t("ui.protect.rcloneRemoteListRefresh")}</button>}
+		</div>
+		<label className="field">
+			<span>{label("path")}</span>
+			<input aria-label={label("path")} dir="ltr" value={options.path ?? ""} disabled={locked} spellCheck={false} onChange={(event) => update("path", event.target.value)} />
+			<small>{renderMessage("ui.integration.rclone_remote.option.path.help", ltrValues({
+				bucketExample: `${pathExampleRemote}:<bucket>/`,
+				pathExample: `${pathExampleRemote}:<path>/`,
+			}))}</small>
+		</label>
+	</>;
 }
 
 function VaultCareFields({
@@ -1862,7 +2456,9 @@ function JobSpeedField({
 				<option value="maximum" disabled={Boolean(provider)}>{t("ui.pages.protect.maximum")}</option>
 			</select>
 			<small>{t("ui.pages.protect.controls.how.quickly.replicaro.finishes.backup.restore.integrity.check")}</small>
-			{provider && <small>{t("ui.protect.providerSpeedLimitHelp", { provider })}</small>}
+			{provider && <small>{connector === RCLONE_REMOTE_CONNECTOR
+				? t("ui.protect.rcloneRemoteSpeedLimitHelp")
+				: t("ui.protect.providerSpeedLimitHelp", { provider })}</small>}
 		</label>
 	);
 }
@@ -2026,7 +2622,15 @@ function displayPath(value: string) {
 
 export default function Protect() {
     const toast = useToast();
-    const [jobs, setJobs] = useState<BackupJob[] | null>(null);
+	const navigate = useNavigate();
+    const [savedJobs, setJobs] = useState<BackupJob[] | null>(null);
+	// Jobs whose deletion is queued or running are hidden everywhere on this
+	// page. The set is rebuilt from the backend's active operations, so a
+	// reload or another browser hides the same jobs; a job whose deletion this
+	// page just requested is added at once and dropped again if the request is
+	// refused.
+	const [deletingJobIDs, setDeletingJobIDs] = useState<Set<string>>(() => new Set());
+	const jobs = useMemo(() => savedJobs === null ? null : savedJobs.filter((job) => !deletingJobIDs.has(job.id)), [savedJobs, deletingJobIDs]);
     const [repos, setRepos] = useState<Repository[] | null>(null);
 	const [vaultMutations, setVaultMutations] = useState<Record<string, VaultMutation>>(vaultMutationSnapshot);
 	const [vaultStats, setVaultStats] = useState<Record<string, VaultSizeStatus>>({});
@@ -2053,7 +2657,6 @@ export default function Protect() {
     const [jobSaving, setJobSaving] = useState(false);
     const [jobDelete, setJobDelete] = useState<BackupJob | null>(null);
 	const [sourceUpdateJob, setSourceUpdateJob] = useState<BackupJob | null>(null);
-    const [jobDeleting, setJobDeleting] = useState(false);
 	const [jobToggleBusy, setJobToggleBusy] = useState("");
 	const [selectedJobIDs, setSelectedJobIDs] = useState<string[]>([]);
 	const [bulkEditOpen, setBulkEditOpen] = useState(false);
@@ -2094,6 +2697,9 @@ export default function Protect() {
 	const [connectOwnerChoiceMade, setConnectOwnerChoiceMade] = useState(false);
 	const [connectUpdateConfirmedDigest, setConnectUpdateConfirmedDigest] = useState("");
 	const [connectReviewedLocation, setConnectReviewedLocation] = useState("");
+	// For Any Rclone Remote, <remote>:<path in remote>/Replicaro/<vault name> as
+	// checked, because the location alone doesn't show a changed remote or path.
+	const [connectReviewedRcloneAddress, setConnectReviewedRcloneAddress] = useState("");
 	const [connectDetectedEngine, setConnectDetectedEngine] = useState<"restic" | "kopia" | "">("");
 	const [connectNameConflictNotice, setConnectNameConflictNotice] = useState("");
 	const [connectRcloneNameConflict, setConnectRcloneNameConflict] = useState(false);
@@ -2133,12 +2739,13 @@ export default function Protect() {
 	const [autoUnlock, setAutoUnlock] = useState(true);
 	const [objectLock, setObjectLock] = useState<ObjectLockSettings>(emptyObjectLock());
     const [toolBusy, setToolBusy] = useState("");
-	const [toolOutput, setToolOutput] = useState("");
-    const [showRawToolLog, setShowRawToolLog] = useState(false);
-	const toolRequestController = useRef<AbortController | null>(null);
 	const [vaultDelete, setVaultDelete] = useState<Repository | null>(null);
 	const [vaultRemoval, setVaultRemoval] = useState<Record<string, VaultRemovalPresentation>>(vaultRemovalSnapshot);
 	const [closePrompt, setClosePrompt] = useState<"job" | "vault" | null>(null);
+	// The vault tool ("check" or "maintenance") waiting on the unsaved-changes
+	// prompt, if the prompt was opened by Run check now / Run reclamation now
+	// rather than by closing the dialog.
+	const pendingVaultTool = useRef<"check" | "maintenance" | null>(null);
 	const jobModalSession = useRef(0);
 	const jobSubmissionGeneration = useRef(0);
 	const jobSubmissionOwner = useRef<{ session: number; generation: number } | null>(null);
@@ -2164,20 +2771,13 @@ export default function Protect() {
 	const vaultSettingsOwner = useRef("");
 	const vaultOwnershipRequest = useRef(0);
 	const protectPageActive = useRef(false);
-	// Reconnect presentation is derived only from operations observed in this
-	// frontend session; it never probes or recreates persistent vault health.
+	// Backups this page started keep their job shown as running until the
+	// status poll lists them. The vault card's Reconnect state is not derived
+	// here: it is the vault's saved reconnectRequired flag from the server.
 	const observedBackupOperations = useRef<Record<string, ObservedBackupOperation>>({});
-	const observedOperationSession = useRef(1);
-	const observedOperationReadGeneration = useRef(0);
-	const observedOperationReadOwners = useRef<Record<string, ObservedOperationReadOwner>>({});
-	const observedRepositoryEpochs = useRef<Record<string, number>>({});
-	const [reconnectRequiredVaults, setReconnectRequiredVaults] = useState<Record<string, boolean>>({});
 	const runReviewSession = useRef(0);
 	const runSubmissionGeneration = useRef(0);
 	const runSubmissionOwner = useRef<RunSubmissionOwner | null>(null);
-	const jobDeleteSession = useRef(0);
-	const jobDeleteGeneration = useRef(0);
-	const jobDeleteOwner = useRef<{ session: number; generation: number } | null>(null);
 	const refreshGenerations = useRef({ jobs: 0, repositories: 0, profileSync: 0, running: 0, creations: 0 });
 	const runningState = useRef<Record<string, boolean>>({});
 	const handledVaultMutationCompletions = useRef(new Set<string>());
@@ -2202,61 +2802,20 @@ export default function Protect() {
 
 	useEffect(() => {
 		// Status reads are presentation observations, unlike the module-owned
-		// synchronous mutations. Crossing a page lifetime invalidates only those
-		// reads so an old Protect instance cannot resurrect stale recovery state.
+		// vault change presentations that follow their background operations.
+		// Crossing a page lifetime invalidates only those reads so an old
+		// Protect instance cannot resurrect stale recovery state.
 		vaultPasswordStatusLifecycle++;
 		return () => { vaultPasswordStatusLifecycle++; };
 	}, []);
 
-	const clearReconnectObservation = useCallback((repositoryId: string) => {
-		if (!repositoryId) return;
-		observedRepositoryEpochs.current[repositoryId] = (observedRepositoryEpochs.current[repositoryId] ?? 0) + 1;
-		for (const [operationId, observed] of Object.entries(observedBackupOperations.current)) {
-			if (observed.repositoryId !== repositoryId) continue;
-			delete observedBackupOperations.current[operationId];
-		}
-		for (const [operationId, owner] of Object.entries(observedOperationReadOwners.current)) {
-			if (owner.repositoryId !== repositoryId) continue;
-			delete observedOperationReadOwners.current[operationId];
-		}
-		setReconnectRequiredVaults((current) => {
-			const updated = { ...current };
-			delete updated[repositoryId];
-			return updated;
-		});
-	}, []);
-
 	const commitActiveTargets = useCallback((activeTargets: ActiveBackupTarget[]) => {
 		const activeOperationIDs = new Set(activeTargets.map((target) => target.operationId).filter(Boolean));
-		for (const [operationId, observed] of Object.entries(observedBackupOperations.current)) {
-			if (activeOperationIDs.has(operationId)) continue;
-			delete observedBackupOperations.current[operationId];
-			const session = observedOperationSession.current;
-			const generation = ++observedOperationReadGeneration.current;
-			const repositoryEpoch = observedRepositoryEpochs.current[observed.repositoryId] ?? 0;
-			observedOperationReadOwners.current[operationId] = {
-				generation, repositoryId: observed.repositoryId, repositoryEpoch,
-			};
-			void getOperation(operationId).then((operations) => {
-				const owner = observedOperationReadOwners.current[operationId];
-				if (observedOperationSession.current !== session ||
-					owner?.generation !== generation || owner.repositoryId !== observed.repositoryId ||
-					owner.repositoryEpoch !== repositoryEpoch ||
-					(observedRepositoryEpochs.current[observed.repositoryId] ?? 0) !== repositoryEpoch) return;
-				delete observedOperationReadOwners.current[operationId];
-				const operation = operations.length === 1 ? operations[0] : undefined;
-				if (!operation || operation.kind !== "backup" || operation.id !== operationId || operation.jobId !== observed.jobId ||
-					operation.repositoryId !== observed.repositoryId || operation.status !== "reconnect_required") return;
-				setReconnectRequiredVaults((current) => ({ ...current, [observed.repositoryId]: true }));
-			}).catch(() => {
-				if (observedOperationReadOwners.current[operationId]?.generation === generation) {
-					delete observedOperationReadOwners.current[operationId];
-				}
-			});
+		for (const operationId of Object.keys(observedBackupOperations.current)) {
+			if (!activeOperationIDs.has(operationId)) delete observedBackupOperations.current[operationId];
 		}
 		for (const target of activeTargets) {
 			if (!target.operationId) continue;
-			delete observedOperationReadOwners.current[target.operationId];
 			observedBackupOperations.current[target.operationId] = {
 				jobId: target.jobId, repositoryId: target.repositoryId,
 			};
@@ -2297,6 +2856,7 @@ export default function Protect() {
 		setConnectOwnerChoiceMade(false);
 		setConnectUpdateConfirmedDigest("");
 		setConnectReviewedLocation("");
+		setConnectReviewedRcloneAddress("");
 	}, []);
 
 	useEffect(() => () => {
@@ -2323,16 +2883,10 @@ export default function Protect() {
 		connectSubmissionGeneration.current++;
 		connectPreviewController.current?.abort();
 		connectPreviewController.current = null;
-		observedOperationSession.current++;
 		observedBackupOperations.current = {};
-		observedOperationReadOwners.current = {};
-		observedRepositoryEpochs.current = {};
 		runReviewSession.current++;
 		runSubmissionGeneration.current++;
 		runSubmissionOwner.current = null;
-		jobDeleteSession.current++;
-		jobDeleteGeneration.current++;
-		jobDeleteOwner.current = null;
 	}, []);
 
 	useEffect(() => {
@@ -2419,15 +2973,99 @@ export default function Protect() {
 	// A removal started on an earlier mount of this page settles here too.
 	useEffect(() => subscribeVaultRemovalSettled(load), [load]);
 
+	// Retry returns as soon as the update is queued. The card keeps showing the
+	// pending update from the sync status list until the queue finishes it, so
+	// this toast must not claim the profile was synchronized.
 	const retryProfile = async (repositoryId: string) => {
 		try {
-			const result = await retryVaultProfileSync(repositoryId);
-			toast(result.profilePending ? "info" : "ok", result.warning ?? "Vault recovery profile synchronized");
+			await retryVaultProfileSync(repositoryId);
+			toast("info", t("ui.protect.profileUpdateQueued"));
 			load();
 		} catch (error) {
 			toast("error", (error as Error).message);
 		}
 	};
+
+	// Jobs this page asked to delete, from the click until the deletion's
+	// operation finishes. They stay hidden whatever an active-operations refresh
+	// says in between: a refresh that was sent before the backend queued the
+	// deletion can land after the 202, and would otherwise show the job again
+	// until the next refresh. The entry is dropped when the followed operation
+	// finishes (in followJobDeletion), not when the 202 arrives, for that reason.
+	const pendingJobDeletions = useRef(new Set<string>());
+
+	// followJobDeletion reports a queued job deletion once it finishes. It is
+	// deduplicated by operation, so a job found deleting on a reload is
+	// announced once.
+	const followJobDeletion = useCallback((operationId: string, jobName: string) => {
+		followTrackedOperation(operationId, async (operation) => {
+			// Before anything awaits: the finished listeners run right after this
+			// and recompute the hidden jobs from the active operations.
+			pendingJobDeletions.current.delete(operation.jobId);
+			if (operation.status === "success" || operation.status === "completed_with_issues") {
+				toast("ok", t("ui.protect.jobDeleted", { name: jobName }));
+			} else {
+				toast("error", await operationFailureReason(operation));
+			}
+		});
+	}, [toast]);
+
+	// The latest vault list, for naming a vault change found running on the
+	// backend.
+	const reposForNames = useRef<Repository[] | null>(null);
+	useEffect(() => { reposForNames.current = repos; }, [repos]);
+
+	// refreshActiveOperations reads the backend's active operations and derives
+	// from them what this page shows for work that runs in the background: the
+	// jobs hidden while their deletion is active, and the vault cards showing a
+	// password change, settings save or removal in progress.
+	const refreshActiveOperations = useCallback(async () => {
+		try {
+			const operations = await getActiveOperations();
+			const active = activeJobDeletions(operations);
+			setDeletingJobIDs(new Set([...active.keys(), ...pendingJobDeletions.current]));
+			for (const operation of operations) {
+				if (operation.kind === JOB_DELETION_KIND && active.get(operation.jobId) === operation.id) {
+					followJobDeletion(operation.id, operation.title.replace(/^Delete job: /, ""));
+				}
+			}
+			adoptActiveVaultChanges(operations, (repositoryId) =>
+				reposForNames.current?.find((repository) => repository.id === repositoryId)?.name ?? "", toast);
+		} catch {
+			// Keep what is shown now; the next refresh or finished operation corrects it.
+		}
+	}, [followJobDeletion, toast]);
+
+	useEffect(() => {
+		void refreshActiveOperations();
+		return onTrackedOperationFinished((operation) => {
+			if (operation.kind !== JOB_DELETION_KIND) return;
+			// Drop a deleted job at once so it does not flash back between the
+			// active-operation refresh and the job list reload.
+			if (operation.status === "success" || operation.status === "completed_with_issues") {
+				setJobs((current) => current?.filter((job) => job.id !== operation.jobId) ?? current);
+			}
+			void refreshActiveOperations();
+			load();
+		});
+	}, [load, refreshActiveOperations]);
+
+	// Every inventory load also picks up vault changes started elsewhere (another
+	// browser, or this one before a reload).
+	useEffect(() => {
+		if (repos) void refreshActiveOperations();
+	}, [repos, refreshActiveOperations]);
+
+	// Once per page, bring back the "Removal stopped" card of a vault whose
+	// newest removal could not update its recovery profile.
+	const stoppedRemovalsShown = useRef(false);
+	useEffect(() => {
+		if (!repos || stoppedRemovalsShown.current) return;
+		stoppedRemovalsShown.current = true;
+		void getOperations().then((operations) => {
+			if (protectPageActive.current) showStoppedVaultRemovals(operations, reposForNames.current ?? repos);
+		}).catch(() => undefined);
+	}, [repos]);
 
     useEffect(() => {
         load();
@@ -2539,11 +3177,16 @@ export default function Protect() {
 	const createOrderedOptions = orderedConnectorOptions(integration, vaultForm.connector).filter((option) =>
 		!vaultForm.coldStorage || vaultForm.connector !== "s3" || option.key !== "storage_class");
 	const createMissingRequiredOptions = missingRequiredConnectorOptions(integration, vaultForm.options);
-	const createUsesRcloneLogin = usesRcloneNativeLogin(vaultForm.connector);
+	const createUsesRcloneSignIn = usesRcloneSignIn(vaultForm.connector);
+	// Restic through rclone into Replicaro/<vault name>: Restic is the only engine.
+	const createUsesVaultFolder = usesVaultFolderName(vaultForm.connector);
+	const createUsesRcloneRemote = vaultForm.connector === RCLONE_REMOTE_CONNECTOR && !vaultForm.coldStorage;
 	const createObjectLockAvailable = !vaultForm.coldStorage && ["s3", "azblob", "gcs"].includes(vaultForm.connector) &&
 		engineCatalog.some((descriptor) => descriptor.id === "kopia" && descriptor.installed &&
 			descriptor.providers.some((provider) => provider.id === vaultForm.connector && provider.supported));
-	const connectUsesRcloneLogin = usesRcloneNativeLogin(connectForm.connector);
+	const connectUsesRcloneSignIn = usesRcloneSignIn(connectForm.connector);
+	// The vault name is the vault's folder name, so it can't be changed here.
+	const connectUsesVaultFolder = usesVaultFolderName(connectForm.connector);
 	const createIntegrationDescription = integration
 		? providerPresentationDescription(
 			engineCatalog, integration.id, integration.description, vaultForm.engine,
@@ -2832,7 +3475,7 @@ export default function Protect() {
 							name: payload.name,
 							source: payload.source,
 							status: result?.warning ? "warning" : "created",
-							message: result?.warning ?? "Created",
+							message: result?.warning ?? "",
 						});
 					} catch (error) {
 						results.push({ name: payload.name, source: payload.source, status: "failed", message: (error as Error).message, payload });
@@ -2880,7 +3523,7 @@ export default function Protect() {
 						name: item.name,
 						source: item.source,
 						status: result?.warning ? "warning" : "created",
-						message: result?.warning ?? "Created",
+						message: result?.warning ?? "",
 					};
 				} catch (error) {
 					if (!ownsRetry()) break;
@@ -3061,7 +3704,7 @@ export default function Protect() {
 						jobId: job.id,
 						name: job.name,
 						status: result?.warning ? "warning" : "updated",
-						message: result?.warning ?? "Updated",
+						message: result?.warning ?? "",
 					});
 				} catch (error) {
 					results.push({ jobId: job.id, name: job.name, status: "failed", message: (error as Error).message, payload });
@@ -3099,7 +3742,7 @@ export default function Protect() {
 						jobId: job.id,
 						name: job.name,
 						status: result?.warning ? "warning" : result.changed ? "updated" : "unchanged",
-						message: result?.warning ?? (result.changed ? "Updated" : "Unchanged"),
+						message: result?.warning ?? "",
 						enabled,
 					});
 				} catch (error) {
@@ -3148,12 +3791,12 @@ export default function Protect() {
 						const result = await updateJob(item.payload);
 						if (result?.job) applySavedJob(result.job);
 						if (!ownsRetry()) break;
-						next[index] = { jobId: item.jobId, name: item.name, status: result?.warning ? "warning" : "updated", message: result?.warning ?? "Updated" };
+						next[index] = { jobId: item.jobId, name: item.name, status: result?.warning ? "warning" : "updated", message: result?.warning ?? "" };
 					} else {
 						const enabled = bulkResults.action === "enable";
 						const result = await setJobEnabled(item.jobId, enabled);
 						if (!ownsRetry()) break;
-						next[index] = { jobId: item.jobId, name: item.name, status: result?.warning ? "warning" : result.changed ? "updated" : "unchanged", message: result?.warning ?? (result.changed ? "Updated" : "Unchanged"), enabled };
+						next[index] = { jobId: item.jobId, name: item.name, status: result?.warning ? "warning" : result.changed ? "updated" : "unchanged", message: result?.warning ?? "", enabled };
 					}
 				} catch (error) {
 					if (!ownsRetry()) break;
@@ -3238,7 +3881,7 @@ export default function Protect() {
 			// single-vault job run straight from its card) get the full notice.
 			const notice = manualRunNotice(jobName, job.targets, result.results);
 			if (notice.admittedCount > 0 || !showsRunResults) toast(notice.kind, notice.message);
-			else toast("info", `No backup started for "${jobName}". Review the admission result.`);
+			else toast("info", t("ui.backup.runResult.noneStartedSeeResults", { jobName }));
             load();
 			if (ownsSubmission() && !reviewingMultipleTargets) setRunJobID("");
         } catch (error) {
@@ -3273,45 +3916,51 @@ export default function Protect() {
         }
     };
 
-    const openJobDelete = (job: BackupJob) => {
-		if (jobDeleteOwner.current) return;
-		jobDeleteSession.current++;
-		jobDeleteOwner.current = null;
-		setJobDeleting(false);
-		setJobDelete(job);
-	};
+    const openJobDelete = (job: BackupJob) => setJobDelete(job);
 
 	const dismissJobDelete = () => {
-		if (jobDeleteOwner.current?.session === jobDeleteSession.current) return false;
-		jobDeleteSession.current++;
-		jobDeleteOwner.current = null;
-		setJobDeleting(false);
 		setJobDelete(null);
 		return true;
 	};
 
+	// The deletion runs in the background once the backend has queued it: the
+	// dialog closes at once, the job is hidden, and the result arrives as a
+	// toast when the operation finishes (see followJobDeletion).
     const removeJob = async () => {
         if (!jobDelete) return;
-		if (jobDeleteOwner.current) return;
 		const jobId = jobDelete.id;
 		const jobName = jobDelete.name;
-		const owner = { session: jobDeleteSession.current, generation: ++jobDeleteGeneration.current };
-		jobDeleteOwner.current = owner;
-		const ownsSubmission = () => jobDeleteSession.current === owner.session &&
-			jobDeleteGeneration.current === owner.generation && jobDeleteOwner.current === owner;
-        setJobDeleting(true);
+		setJobDelete(null);
+		pendingJobDeletions.current.add(jobId);
+		setDeletingJobIDs((current) => new Set(current).add(jobId));
+		// Hiding the job shrinks the list the same way a reload after deletion
+		// did: drop it from the selection, and clear the selection once one job
+		// or none is left (selection is only offered for two or more).
+		const remaining = (savedJobs ?? []).filter((job) => job.id !== jobId && !deletingJobIDs.has(job.id));
+		setSelectedJobIDs((current) => remaining.length <= 1
+			? current.length === 0 ? current : []
+			: current.includes(jobId) ? current.filter((id) => id !== jobId) : current);
+		toast("info", t("ui.protect.jobBeingSentForDeletion", { name: jobName }));
         try {
-			const result = await deleteJob(jobId);
-			toast(result?.warning ? "info" : "ok", result?.warning ?? t("ui.protect.jobDeleted", { name: jobName }));
-            load();
-			if (ownsSubmission()) setJobDelete(null);
+			const { operationId } = await deleteJob(jobId);
+			// The job stays in pendingJobDeletions until this operation finishes.
+			followJobDeletion(operationId, jobName);
         } catch (error) {
-			if (ownsSubmission()) toast("error", (error as Error).message);
-        } finally {
-			if (ownsSubmission()) {
-				jobDeleteOwner.current = null;
-				setJobDeleting(false);
+			pendingJobDeletions.current.delete(jobId);
+			toast("error", (error as Error).message);
+			// A 409 job_being_deleted here means a deletion of this job is already
+			// queued or running (from another tab or a stale page). The job must
+			// stay hidden and that deletion's result still has to be reported, so
+			// read the active deletions again rather than showing the job.
+			if (error instanceof APIError && error.status === 409 && error.code === "job_being_deleted") {
+				void refreshActiveOperations();
+				return;
 			}
+			setDeletingJobIDs((current) => {
+				const next = new Set(current);
+				next.delete(jobId);
+				return next;
+			});
         }
     };
 
@@ -3396,8 +4045,9 @@ export default function Protect() {
 		try {
 			setVaultProgress([]);
 			const result = await createRepository(payload, (record) => { if (ownsSubmission()) appendVaultProgress(record); });
-			const success = result.created ? `Encrypted vault "${payload.name}" created` : `Vault "${payload.name}" added`;
-			toast(result.warning ? "info" : "ok", result.warning ?? success);
+			const success = result.created ? t("ui.protect.vaultCreatedNamed", { name: payload.name }) : t("ui.protect.vaultAddedNamed", { name: payload.name });
+			const issues = completedWithIssuesMessage(result);
+			toast(issues ? "info" : "ok", issues ?? success);
             load();
 			if (ownsSubmission()) {
 				if (createRcloneAuth?.sessionId) void closeRcloneAuthorization(createRcloneAuth.sessionId);
@@ -3437,7 +4087,7 @@ export default function Protect() {
 					setShowVaultCreate(false);
 					setRetryCreationIntentId("");
 				}
-				if (retryCreationIntentId && createUsesRcloneLogin && message.includes("reauthorization")) {
+				if (retryCreationIntentId && createUsesRcloneSignIn && message.includes("reauthorization")) {
 					setShowCreateRcloneAuthorization(true);
 				}
 				setVaultCreateError(message);
@@ -3477,7 +4127,7 @@ export default function Protect() {
 		const enteredOptions = connectorOptionsWithoutUnchangedDefaults(connectIntegration, connectorOptionsForSubmission(submittedForm, connectIntegration));
 		// Cloud Connect takes native identity from its fresh rclone session.
 		// Submit only the ordinary visible rclone wrapper options with it.
-		const options = connectUsesRcloneLogin
+		const options = connectUsesRcloneSignIn
 			? Object.fromEntries(Object.entries(enteredOptions).filter(([key]) => key.startsWith("rclone_")))
 			: enteredOptions;
 		const storage: ExistingVaultStorageInput = {
@@ -3553,7 +4203,10 @@ export default function Protect() {
 				objectLock: preview.mode === "profile" ? preview.objectLock ?? emptyObjectLock() : current.objectLock,
 			}));
 			connectReviewedStorage.current = storage;
-			setConnectReviewedLocation(preview.existingVault?.candidateLocation ?? storage.location);
+			const reviewedLocation = preview.existingVault?.candidateLocation ?? storage.location;
+			setConnectReviewedLocation(reviewedLocation);
+			setConnectReviewedRcloneAddress(storage.connector === RCLONE_REMOTE_CONNECTOR
+				? rcloneRemoteVaultAddress(storage.options?.remote ?? "", storage.options?.path ?? "", reviewedLocation) : "");
 			if (!refiningProfile) connectPreviewBaseFields.current = reviewedBaseFields;
 			setConnectPreview(preview);
 			if (preview.existingVault) {
@@ -3585,7 +4238,7 @@ export default function Protect() {
 				: undefined;
 			const localAttachmentBecameAuthoritative = Boolean(selectedChoice?.localAttachment);
 			const decisionChoice = chooseJoin && !localAttachmentBecameAuthoritative ? undefined : selectedChoice;
-			const profileChoiceIsAutomatic = preview.mode === "fallback" || Boolean(decisionChoice?.localAttachment) || usesRcloneNativeLogin(storage.connector);
+			const profileChoiceIsAutomatic = preview.mode === "fallback" || Boolean(decisionChoice?.localAttachment) || usesSingleProfile(storage.connector);
 			const profileChoiceWasMade = profileChoiceIsAutomatic || Boolean(selectedProfileUUID) || chooseJoin;
 			setConnectProfileUUID(profileChoiceWasMade ? decisionChoice?.profile_uuid ?? "" : "");
 			setConnectProfileAction(profileChoiceWasMade && decisionChoice ? (decisionChoice.localAttachment ? "reconnect" : "takeover") : "join");
@@ -3593,7 +4246,12 @@ export default function Protect() {
 			setConnectOwnerAction("keep");
 			setConnectOwnerChoiceMade(preview.mode === "fallback" || Boolean(decisionChoice?.vaultOwner));
 			setConnectPendingProfileChoice(null);
-			const rcloneName = usesRcloneNativeLogin(storage.connector)
+			// Folder-named vaults can't take another name, so a name that is
+			// already registered blocks the connection.
+			const rcloneVaultNameConflict = (connector: string, name: string) => connector === RCLONE_REMOTE_CONNECTOR
+				? t("ui.protect.existingRcloneRemoteVaultNameConflict", { name })
+				: t("ui.protect.existingRcloneVaultNameConflict", { name, provider: connectIntegration?.label ?? t("ui.protect.cloudProvider") });
+			const rcloneName = usesVaultFolderName(storage.connector)
 				? normalizedRcloneFolderName(submittedForm.location)
 				: "";
 			if (preview.profile && decisionChoice && profileChoiceWasMade) {
@@ -3603,7 +4261,7 @@ export default function Protect() {
 				const availableName = rcloneName || availableImportedVaultName(importedName, preview.profile.vault_uuid, repos);
 				setConnectRcloneNameConflict(hasRcloneConflict);
 				setConnectNameConflictNotice(hasRcloneConflict
-					? t("ui.protect.existingRcloneVaultNameConflict", { name: rcloneName, provider: connectIntegration?.label ?? t("ui.protect.cloudProvider") })
+					? rcloneVaultNameConflict(storage.connector, rcloneName)
 					: availableName === importedName ? "" :
 						t("ui.protect.importedVaultNameChanged", { before: importedName, after: availableName }));
 				setConnectForm((current) => ({ ...current, name: availableName, description: preview.profile!.vaultPreferences.description, checkSchedule: current.coldStorage ? "manual" : preview.rootIntegritySchedule ?? "manual", maintenanceSchedule: preview.rootMaintenanceSchedule ?? "manual", concurrencyMode: preview.profile!.vaultPreferences.concurrencyMode }));
@@ -3620,7 +4278,7 @@ export default function Protect() {
 				const hasRcloneConflict = (repos ?? []).some((repository) => repository.name.trim().toLowerCase() === rcloneName.toLowerCase());
 				setConnectRcloneNameConflict(hasRcloneConflict);
 				setConnectNameConflictNotice(hasRcloneConflict
-					? t("ui.protect.existingRcloneVaultNameConflict", { name: rcloneName, provider: connectIntegration?.label ?? t("ui.protect.cloudProvider") })
+					? rcloneVaultNameConflict(storage.connector, rcloneName)
 					: "");
 				setConnectForm((current) => ({ ...current, name: rcloneName }));
 			}
@@ -3644,7 +4302,10 @@ export default function Protect() {
 				if (initial) setConnectForm((current) => ({ ...current, ...initial }));
 			}
 			setConnectPendingProfileChoice(null);
-			toast("error", (error as Error).message);
+			toast("error", error instanceof APIError && error.code === "kopia_rclone_provider_unsupported"
+				? submittedForm.connector === RCLONE_REMOTE_CONNECTOR ? t("ui.protect.kopiaRcloneRemoteUnsupported")
+					: t("ui.protect.kopiaRcloneProviderUnsupported", { provider: knownMessage(`ui.integration.${submittedForm.connector}.label`, connectIntegration?.label ?? submittedForm.connector) })
+				: (error as Error).message);
 			return false;
 		} finally {
 			if (ownsRequest()) {
@@ -3674,7 +4335,7 @@ export default function Protect() {
 			// Native rclone identity and credentials come from the reviewed intent
 			// and saved config (or the new auth session), not form option defaults.
 			options: Object.fromEntries((connectIntegration?.options ?? [])
-				.filter((option) => (option.credential || option.secret) && !connectUsesRcloneLogin)
+				.filter((option) => (option.credential || option.secret) && !connectUsesRcloneSignIn && !withheldRcloneConfigPassword(connectForm, option.key))
 				.map((option) => [option.key, connectForm.options[option.key] ?? ""])),
 			rcloneAuthSessionId: connectRcloneAuth?.sessionId,
 			intentId: selectedIntentId,
@@ -3688,8 +4349,8 @@ export default function Protect() {
 		try {
 			setVaultProgress([]);
 			const result = await retryExistingVaultConnection(payload, (record) => { if (ownsSubmission()) appendVaultProgress(record); });
-			clearReconnectObservation(result.id);
-			toast(result.profilePending ? "info" : "ok", result.warning ?? (result.name ? `Vault "${result.name}" connected.` : "Vault connected."));
+			const issues = completedWithIssuesMessage(result);
+			toast(issues || result.profilePending ? "info" : "ok", issues ?? result.warning ?? (result.name ? t("ui.protect.vaultConnectedNamed", { name: result.name }) : t("ui.protect.vaultConnected")));
 			load();
 			if (ownsSubmission()) {
 				setConnectSaving(false);
@@ -3710,12 +4371,12 @@ export default function Protect() {
 					setShowVaultConnect(false);
 					load();
 				}
-				const savedConfigRetryFailed = connectUsesRcloneLogin && !payload.rcloneAuthSessionId &&
+				const savedConfigRetryFailed = connectUsesRcloneSignIn && !payload.rcloneAuthSessionId &&
 					error instanceof APIError && error.status === 400;
 				const savedConfigMissing = savedConfigRetryFailed &&
 					error.message === "the pending vault requires native rclone reauthorization before retry";
 				const nativeAdmissionFailed = savedConfigRetryFailed &&
-					error.message === "the detected restic vault rejected the password or could not be validated";
+					error.message === "the detected restic vault rejected the vault encryption password or could not be validated";
 				// A locally safe config can still fail native admission because of
 				// expired authorization, a wrong vault password, or a network failure.
 				// Offer a deliberate login fallback without claiming which occurred.
@@ -3798,8 +4459,8 @@ export default function Protect() {
 		try {
 			setVaultProgress([]);
 			const result = await connectExistingVault(payload, (record) => { if (ownsSubmission()) appendVaultProgress(record); });
-			clearReconnectObservation(result.id);
-			toast(result.profilePending ? "info" : "ok", result.warning ?? `Vault "${result.name ?? vaultName}" connected.`);
+			const issues = completedWithIssuesMessage(result);
+			toast(issues || result.profilePending ? "info" : "ok", issues ?? result.warning ?? t("ui.protect.vaultConnectedNamed", { name: result.name ?? vaultName }));
 			load();
 			if (ownsSubmission()) {
 				setConnectSaving(false);
@@ -3827,7 +4488,6 @@ export default function Protect() {
 	};
 
 	const clearVaultSettingsTransient = () => {
-		toolRequestController.current = null;
 		setDormantJobs([]);
 		setDormantBusy("");
 		setVaultOwnership(null);
@@ -3835,7 +4495,6 @@ export default function Protect() {
 		setVaultOwnershipBusy(false);
 		setVaultPasswordForm({ password: "", confirmation: "" });
 		setToolBusy("");
-		setToolOutput("");
 	};
 
 	const vaultSettingsSessionIsCurrent = (session: number, repositoryId: string) =>
@@ -3876,16 +4535,17 @@ export default function Protect() {
 				if (!vaultSettingsSessionIsCurrent(session, repo.id) || vaultOwnershipRequest.current !== request) return;
 				applyAuthoritativeVaultCare(repo.id, status);
 				setVaultOwnership(status);
-				setVaultOwnershipPresentation(status.isOwner ? "owner" : "nonowner");
+				setVaultOwnershipPresentation(status.ownerTransfer === "unfinished" ? "transfer_unfinished" : status.isOwner ? "owner" : "nonowner");
 			})
-			.catch(() => {
+			.catch((error: unknown) => {
 				if (!vaultSettingsSessionIsCurrent(session, repo.id) || vaultOwnershipRequest.current !== request) return;
 				setVaultOwnership(null);
-				setVaultOwnershipPresentation("unverified");
+				setVaultOwnershipPresentation(error instanceof APIError && error.code === "owner_transfer_elsewhere" ? "transfer_elsewhere" : "unverified");
 			});
 	};
 
 	const dismissVaultSettings = () => {
+		pendingVaultTool.current = null;
 		vaultOwnershipRequest.current++;
 		vaultSettingsSession.current++;
 		vaultSettingsOwner.current = "";
@@ -3982,7 +4642,7 @@ export default function Protect() {
 			// Only values represented by ordinary Connect existing vault inputs are
 			// prefilled. pendingLocation and hidden options would change what Check
 			// submits even when the user sees the same form values.
-			const options = usesRcloneNativeLogin(fields.connector)
+			const options = usesRcloneSignIn(fields.connector)
 				? {}
 				: connectorOptionsForSubmission(restored, integration);
 			delete options.root;
@@ -4008,6 +4668,10 @@ export default function Protect() {
 					if (savedURL.port && integration.options.some((option) => option.key === "port")) options.port = savedURL.port;
 				} catch { /* Check validates the visible SFTP fields. */ }
 			}
+			// WebDAV needs nothing here: the backend never keeps a port or user
+			// name in a WebDAV Location, so the saved options already hold the
+			// port, WebDAV username, and WebDAV account password, and
+			// restoreVaultDestinationFields has split the Server URL from the Path.
 			setConnectForm({ ...restored, pendingLocation: "", options });
 			if (vaultSettingsOwner.current === repositoryID) dismissVaultSettings();
 			setShowVaultConnect(true);
@@ -4034,8 +4698,12 @@ export default function Protect() {
 		void openSavedVaultReconnect(repository);
 	};
 
+	// Also Finish takeover: an unfinished takeover is finished by sending the
+	// same request again, with the owner the status reported, and the backend
+	// resumes it from its saved phase.
 	const takeOverVaultOwnership = async () => {
-		if (!vaultSettings || !vaultOwnership || vaultOwnership.isOwner || vaultOwnershipBusy) return;
+		if (!vaultSettings || !vaultOwnership || vaultOwnershipBusy) return;
+		if (vaultOwnership.isOwner && vaultOwnership.ownerTransfer !== "unfinished") return;
 		// The takeover button follows the full ownership explanation and is the
 		// confirmation boundary. Do not add a second browser
 		// prompt; server-side ownership and stale-review checks remain authoritative.
@@ -4048,8 +4716,8 @@ export default function Protect() {
 			if (!vaultSettingsSessionIsCurrent(session, repositoryId)) return;
 			if (next.isOwner) applyAuthoritativeVaultCare(repositoryId, next);
 			setVaultOwnership(next);
-			setVaultOwnershipPresentation(next.isOwner ? "owner" : "nonowner");
-			toast("ok", "Vault ownership transferred to this computer");
+			setVaultOwnershipPresentation(next.ownerTransfer === "unfinished" ? "transfer_unfinished" : next.isOwner ? "owner" : "nonowner");
+			toast("ok", t("ui.protect.vaultOwnershipTransferred"));
 		} catch (error) {
 			if (vaultSettingsSessionIsCurrent(session, repositoryId)) toast("error", (error as Error).message);
 		} finally {
@@ -4060,8 +4728,9 @@ export default function Protect() {
 	const beginVaultPasswordChange = (repository: Repository, submitted: { password: string; confirmation: string }) => {
 		if (vaultMutationSnapshot[repository.id]) return;
 		setVaultPasswordForm({ password: "", confirmation: "" });
-		// Dialog dismissal is presentation-only: this starts the existing
-		// synchronous endpoint and leaves its native/recovery semantics untouched.
+		// The dialog closes at once; the change runs as a background operation
+		// and the vault card follows it. Its native and recovery semantics are
+		// the phase record's, unchanged.
 		dismissVaultSettings();
 		startVaultPasswordMutation(repository.id, repository.name, submitted.password, submitted.confirmation);
 	};
@@ -4092,7 +4761,28 @@ export default function Protect() {
 		dismissVaultSettings();
     };
 
+	const cancelClosePrompt = () => {
+		pendingVaultTool.current = null;
+		setClosePrompt(null);
+	};
+
 	const discardChanges = () => {
+		const tool = closePrompt === "vault" ? pendingVaultTool.current : null;
+		if (tool && vaultSettings && vaultInitialSchedules) {
+			// "Run check now" or "Run reclamation now" asked first: drop the edits
+			// and run the tool it was waiting for. The dialog closes once the
+			// operation is queued; if the request is refused it stays open with the
+			// saved values the tool actually ran against.
+			pendingVaultTool.current = null;
+			setCheckSchedule(vaultInitialSchedules.checkSchedule);
+			setMaintenanceSchedule(vaultInitialSchedules.maintenanceSchedule);
+			setConcurrencyMode(compatibleConcurrencyMode(vaultSettings.connector, vaultInitialSchedules.concurrencyMode));
+			setAutoUnlock(vaultInitialSchedules.autoUnlock);
+			setObjectLock(vaultInitialSchedules.objectLock);
+			setClosePrompt(null);
+			void queueVaultTool(tool);
+			return;
+		}
 		if (closePrompt === "job") {
 			dismissJob();
 		} else if (closePrompt === "vault") {
@@ -4101,20 +4791,30 @@ export default function Protect() {
 		setClosePrompt(null);
 	};
 
+	// Save after "Run check now" / "Run reclamation now" saves and closes the
+	// dialog, exactly like closing it, and does not run the tool. The settings
+	// save and a queued check or reclamation would compete for the vault lock,
+	// and a reclamation that won would run on the old settings (object lock,
+	// auto unlock). The tool can be run again once the save has finished; a
+	// toast says so, because otherwise nothing shows that the tool did not run.
 	const saveChangesBeforeClose = () => {
+		const tool = closePrompt === "vault" ? pendingVaultTool.current : null;
+		pendingVaultTool.current = null;
 		setClosePrompt(null);
 		if (closePrompt === "job") {
 			void saveJob();
 		} else if (closePrompt === "vault") {
-			void saveCare();
+			if (saveCare() && tool) toast("info", t("ui.protect.settingsSavedRunAgain"));
 		}
 	};
 
+	// Returns whether the save was started; it is refused while other vault
+	// work is running or the object lock settings are invalid.
 	const saveCare = () => {
-        if (!vaultSettings || vaultWorkState !== "idle") return;
+        if (!vaultSettings || vaultWorkState !== "idle") return false;
 		const repositoryId = vaultSettings.id;
 		const repositoryName = vaultSettings.name;
-		if (!validObjectLockSettings(objectLock, maintenanceSchedule, true, vaultSettings.objectLock)) return;
+		if (!validObjectLockSettings(objectLock, maintenanceSchedule, true, vaultSettings.objectLock)) return false;
 		const payload: VaultSettingsPayload = {
 				repositoryId,
                 checkSchedule,
@@ -4125,11 +4825,11 @@ export default function Protect() {
 				...(vaultOwnershipPresentation !== "owner" ? { profilePreferencesOnly: true } : {}),
 		};
 		const currentMutation = vaultMutationSnapshot[repositoryId];
-		if (currentMutation && !isCleanupPendingRecovery(currentMutation)) return;
+		if (currentMutation && !isCleanupPendingRecovery(currentMutation)) return false;
 		// Freeze all submitted values before closing so later form/session changes
-		// cannot alter this request or its run-local retry.
+		// cannot alter this save or its Retry save.
 		dismissVaultSettings();
-		startVaultSettingsMutation(repositoryName, payload);
+		return startVaultSettingsMutation(repositoryName, payload);
     };
 
 	const chooseSaveVaultSettings = () => {
@@ -4160,16 +4860,18 @@ export default function Protect() {
 			if (mutation.status === "succeeded" && !handledVaultMutationCompletions.current.has(completionKey)) {
 				handledVaultMutationCompletions.current.add(completionKey);
 				if (mutation.kind === "settings") {
-					toast(mutation.response?.warning ? "info" : "ok", mutation.response?.warning ?? `Vault "${mutation.repositoryName}" settings saved`);
-				} else if (mutation.result) {
-					toast(vaultPasswordChangeNoticeKind(mutation.result), vaultPasswordChangeNotice(mutation.result));
+					toast("ok", t("ui.protect.vaultSettingsSavedNamed", { name: mutation.repositoryName }));
+				} else {
+					// A change that took effect while the engine reported a failure is
+					// completed with issues; its own text says so.
+					toast(mutation.outcome === "success" ? "ok" : "info", mutation.message ?? t("ui.pages.protect.vault.password.change.completed"));
 				}
 				if (mutation.kind === "settings") settleVaultSettingsPresentation(mutation.repositoryId, mutation.generation);
 				else clearVaultMutation(mutation.repositoryId, mutation.generation);
 				load();
 				continue;
 			}
-			if ((mutation.uncertainResolved || (mutation.kind === "settings" && mutation.status === "error")) && !handledVaultMutationReloads.current.has(completionKey)) {
+			if (mutation.status === "error" && !handledVaultMutationReloads.current.has(completionKey)) {
 				handledVaultMutationReloads.current.add(completionKey);
 				load();
 			}
@@ -4185,52 +4887,41 @@ export default function Protect() {
 		// eslint-disable-next-line react-hooks/exhaustive-deps
 	}, [load, toast, vaultMutations, vaultSettings]);
 
-    const runTool = async (kind: "check" | "maintenance") => {
-        if (!vaultSettings) return;
+	// A manual check or maintenance runs in the background. The request only
+	// queues it; the settings dialog closes and the dashboard opens its live
+	// log, where it can be followed and cancelled (including a cold storage
+	// reclamation that waits for provider retrieval).
+	//
+	// Queuing the tool closes the settings dialog, which would silently drop
+	// unsaved edits, so with edits pending it asks first with the same
+	// save/discard prompt as closing the dialog. Nothing is sent until the user
+	// picks Discard (see discardChanges).
+    const runTool = (kind: "check" | "maintenance") => {
+        if (!vaultSettings || toolBusy) return;
+		if (vaultCareHasUnsavedChanges()) {
+			pendingVaultTool.current = kind;
+			setClosePrompt("vault");
+			return;
+		}
+		void queueVaultTool(kind);
+	};
+
+    const queueVaultTool = async (kind: "check" | "maintenance") => {
+        if (!vaultSettings || toolBusy) return;
 		const repositoryId = vaultSettings.id;
 		const session = vaultSettingsSession.current;
-		const controller = kind === "maintenance" && vaultSettings.coldStorage ? new AbortController() : null;
-		toolRequestController.current = controller;
         setToolBusy(kind);
-        setToolOutput("");
         try {
-			const result = kind === "check"
-				? await checkRepository(repositoryId)
-				: controller
-					? await runMaintenance(repositoryId, controller.signal)
-					: await runMaintenance(repositoryId);
+			const { operationId } = kind === "check" ? await checkRepository(repositoryId) : await runMaintenance(repositoryId);
 			if (!vaultSettingsSessionIsCurrent(session, repositoryId)) return;
-            setToolOutput(result.output || "Completed with no output.");
-            toast("ok", kind === "check" ? "Integrity check passed" : "Maintenance completed");
-			try {
-				const refreshed = await getRepository(repositoryId);
-				if (!vaultSettingsSessionIsCurrent(session, repositoryId)) return;
-				setVaultSettings(refreshed);
-				setRepos((current) => current?.some((repo) => repo.id === repositoryId)
-					? current.map((repo) => repo.id === repositoryId ? refreshed : repo)
-					: current);
-			} catch (error) {
-				if (vaultSettingsSessionIsCurrent(session, repositoryId)) {
-					toast("error", `Care completed, but vault status could not be refreshed: ${(error as Error).message}`);
-				}
-			}
+			dismissVaultSettings();
+			navigate(`/?operation=${encodeURIComponent(operationId)}`);
         } catch (error) {
-			if (!vaultSettingsSessionIsCurrent(session, repositoryId)) return;
-			if ((error as Error).name === "AbortError") {
-				const message = "Cold storage reclamation was interrupted locally. Provider restore requests may continue.";
-				setToolOutput(message);
-				toast("info", message);
-			} else {
-				setToolOutput((error as Error).message);
-				toast("error", (error as Error).message);
-			}
+			if (vaultSettingsSessionIsCurrent(session, repositoryId)) toast("error", (error as Error).message);
         } finally {
-			if (toolRequestController.current === controller) toolRequestController.current = null;
 			if (vaultSettingsSessionIsCurrent(session, repositoryId)) setToolBusy("");
         }
     };
-
-	const cancelColdMaintenance = () => toolRequestController.current?.abort();
 
     const openVaultDelete = (repository: Repository) => {
 		if (vaultRemovalIsInFlight(repository.id)) return;
@@ -4245,7 +4936,7 @@ export default function Protect() {
 	const removeVault = (repository: Repository, discardRecoveryProfile = false) => {
 		if (vaultRemovalIsInFlight(repository.id)) return;
 		setVaultDelete(null);
-		void runVaultRemoval(repository, discardRecoveryProfile, toast);
+		runVaultRemoval(repository, discardRecoveryProfile, toast);
 	};
 
 	const refreshConnectionIntents = () => void getRepositoryConnectionIntents().then(setConnectionIntents).catch((error: Error) => toast("error", error.message));
@@ -4286,7 +4977,7 @@ export default function Protect() {
 		setCreationRemovalBusy(intent.id);
 		try {
 			const result = await deleteRepositoryCreationIntent(intent.id);
-			toast(result?.warning ? "info" : "ok", result?.warning ?? (intent.phase === "prepared" ? "Pending creation cancelled." : "Pending creation forgotten. Remote repository content was not deleted."));
+			toast(result?.warning ? "info" : "ok", result?.warning ?? (intent.phase === "prepared" ? t("ui.protect.pendingCreationCancelled") : t("ui.protect.pendingCreationForgotten")));
 			refreshCreationIntents();
 		} catch (error) {
 			toast("error", (error as Error).message);
@@ -4314,7 +5005,7 @@ export default function Protect() {
 			// even if native validation fails and the preview never appears.
 			const editableForm = { ...connectForm, pendingLocation: "" };
 			setConnectForm(editableForm);
-			if (connectUsesRcloneLogin) setConnectRcloneAuthorizationAction("check");
+			if (connectUsesRcloneSignIn) setConnectRcloneAuthorizationAction("check");
 			else await checkExistingVault("", false, editableForm);
 		} catch (error) {
 			if (connectPreviewSession.current === session) toast("error", (error as Error).message);
@@ -4454,7 +5145,7 @@ export default function Protect() {
     const selectedRunJob = (jobs ?? []).find((job) => job.id === runJobID) ?? null;
 	const selectedConnectProfile = connectPreview?.profiles?.find((profile) => profile.profile_uuid === connectProfileUUID);
 	const currentConnectOwner = connectPreview?.profiles?.find((profile) => profile.profile_uuid === connectPreview.vault_owner_profile_uuid);
-	const connectProfileSelectionVisible = connectPreview?.mode === "profile" && !connectPreview.existingVault && !usesRcloneNativeLogin(connectForm.connector) &&
+	const connectProfileSelectionVisible = connectPreview?.mode === "profile" && !connectPreview.existingVault && !usesSingleProfile(connectForm.connector) &&
 		!(connectPreview.profiles ?? []).some((profile) => profile.localAttachment);
 	const connectProfileReady = !connectPreview || Boolean(connectPreview.existingVault) || connectPreview.mode === "fallback" || connectProfileChoiceMade;
 	const connectOwnerReady = !connectPreview || Boolean(connectPreview.existingVault) || connectPreview.mode === "fallback" || !connectProfileChoiceMade || connectOwnerChoiceMade;
@@ -4471,9 +5162,17 @@ export default function Protect() {
 	const connectMaintenanceLockedHelp = connectPreview?.existingVault
 		? t("ui.protect.existingVaultMaintenanceLockedHelp")
 		: t("ui.protect.newVaultMaintenanceLockedHelp");
+	// An Any Rclone Remote vault compares its whole address, so a changed remote
+	// or path in remote shows up even when the folder name stays the same.
+	const existingVaultRecord = connectPreview?.existingVault && connectReviewedRcloneAddress
+		? (repos ?? []).find((repo) => repo.id === connectPreview.existingVault?.id) : undefined;
+	const existingVaultSavedRcloneAddress = existingVaultRecord ? savedRcloneRemoteVaultAddress(existingVaultRecord) : "";
+	const [existingVaultLocationBefore, existingVaultLocationAfter] = existingVaultSavedRcloneAddress
+		? [ltrIsolate(existingVaultSavedRcloneAddress), ltrIsolate(connectReviewedRcloneAddress)]
+		: [connectPreview?.existingVault?.location ?? "", connectReviewedLocation];
 	const existingVaultUpdateChanges = connectPreview?.existingVault ? [
-		...[connectPreview.existingVault.location !== connectReviewedLocation
-			? t("ui.protect.locationChangeReview", { before: connectPreview.existingVault.location, after: connectReviewedLocation }) : t("ui.protect.locationUnchangedReview")],
+		...[existingVaultLocationBefore !== existingVaultLocationAfter
+			? t("ui.protect.locationChangeReview", { before: existingVaultLocationBefore, after: existingVaultLocationAfter }) : t("ui.protect.locationUnchangedReview")],
 		...(connectPreview.existingVault.name !== connectForm.name.trim() ? [t("ui.protect.nameChangeReview", { before: connectPreview.existingVault.name, after: connectForm.name.trim() })] : []),
 		...(connectPreview.existingVault.description !== connectForm.description.trim() ?
 			[t("ui.protect.descriptionChangeReview", { before: connectPreview.existingVault.description || t("ui.protect.emptyReview"), after: connectForm.description.trim() || t("ui.protect.emptyReview") })] : []),
@@ -4503,7 +5202,8 @@ export default function Protect() {
 		connectionIntentMatchesDestination(intent, connectForm, enteredConnectLocation)) : undefined;
 	// A cloud folder name alone cannot identify the native account. Keep the
 	// ordinary authorization Check reachable beside any saved-account retry.
-	const canCheckAnotherRcloneAccount = connectUsesRcloneLogin;
+	const canCheckAnotherRcloneAccount = connectUsesRcloneSignIn;
+	const createVaultNameField = <label className="field"><span>{t("ui.pages.protect.vault.name")}</span><input aria-label={t("ui.pages.protect.vault.name")} disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.name} placeholder={t("ui.pages.protect.example.work.archive")} onChange={(event) => setVaultForm({ ...vaultForm, name: event.target.value })} /><small>{t("ui.protect.vaultNameLengthHelp", { count: MAX_VAULT_NAME_CODE_POINTS })}</small></label>;
     return (
         <div className="page protect-page">
             <header className="page-header simple">
@@ -4516,7 +5216,10 @@ export default function Protect() {
 	                    <h2>{t("ui.pages.protect.backup.jobs")}</h2>
 	                    <div className="job-heading-actions">
 						{(jobs?.length ?? 0) > 1 && selectedJobs.length > 0 && <span className="selection-count">{t("ui.protect.selectedCount", { count: selectedJobs.length })}</span>}
-						<button className="btn primary" disabled={!repos?.length} onClick={() => openJob()}>
+						{/* Like + Vault below, this is the primary action only while its list
+						    is empty; once a job exists it steps back to a plain button. It
+						    stays disabled until there is a vault to back up to. */}
+						<button className={`btn${jobs !== null && jobs.length === 0 ? " primary" : ""}`} disabled={!repos?.length} onClick={() => openJob()}>
 							<Icon name="plus" size={14} /> {t("ui.protect.backupJob")}
 						</button>
 					</div>
@@ -4571,7 +5274,7 @@ export default function Protect() {
                                             ? t("ui.destinationStatus.successfulCount", { successful: successfulTargets.length, total: job.targets.length })
                                             : t("ui.destinationStatus.notRun");
                         const targetDetails = job.targets.map((target) =>
-                            `${target.repositoryName}: ${target.lastStatus === "completed_with_issues" ? "completed with issues" : target.lastStatus === "reconnect_required" ? "reconnect required" : target.lastStatus || "not run"}`
+                            `${target.repositoryName}: ${targetStatusLabel(target.lastStatus)}`
                         ).join(" · ");
                         const pendingCatchUpTargets = job.targets.filter((target) => target.pendingCatchUp);
                         return (
@@ -4696,7 +5399,7 @@ export default function Protect() {
 						const pendingProfile = profileSync[repo.id];
 						const statsActive = stats.running || stats.pending;
 						const statsStatus = stats.paused ? t("ui.protect.statsRefreshPaused") : t("ui.protect.statsRefreshing");
-						const reconnectRequired = Boolean(reconnectRequiredVaults[repo.id]);
+						const reconnectRequired = Boolean(repo.reconnectRequired);
                         return (
 							<article key={repo.id} className="vault-row" data-vault-id={repo.id}>
 									{/* Covered controls must leave keyboard navigation while removal owns this card. */}
@@ -4705,23 +5408,29 @@ export default function Protect() {
 										  <span className="vault-glyph"><Icon name="shield" size={18} /></span>
 									  <span className="vault-chips">
 										<span className="connector-chip">{repo.engine}</span>
-										<span className="connector-chip">{repositoryConnectorLabel(repo)}</span>
+										{/* A long remote label (such as an S3 endpoint) stays on one line
+										    beside the engine chip; the tooltip always shows it in full,
+										    as the location line below does. */}
+										<Tooltip content={repositoryConnectorLabelContent(repo)}>
+											<span className="connector-chip connector-label-chip" aria-label={repositoryConnectorLabel(repo)}><span className="connector-label-text">{repositoryConnectorLabelContent(repo)}</span></span>
+										</Tooltip>
 									  </span>
 										</div>
 										<strong>{repo.name}</strong>
 										<Tooltip content={repo.location}>
 											<span className="vault-location"><span className="vault-location-text">{repositoryLocationLabel(repo)}</span></span>
 										</Tooltip>
+									{repo.connector === "webdav" && webdavUsesPlainHTTP(repo.location) && <p className="recovery-warning webdav-plain-http-warning">{t("ui.protect.webdavPlainHTTPCardWarning")}</p>}
 									{pendingProfile?.lastError && (
 									<span className="recovery-warning profile-sync-warning">{t("ui.protect.profileUpdatePending", { error: pendingProfile.lastError })} {pendingProfile.nextAttemptAt ? t("ui.protect.retryAfter", { time: timeAgo(pendingProfile.nextAttemptAt) }) : ""} <button className="btn sm" disabled={cardBlocked} onClick={() => void retryProfile(repo.id)}>{t("ui.pages.protect.retry.now")}</button></span>
 									)}
-									{reconnectRequired && <span className="recovery-warning">{t("ui.pages.protect.reconnect.is.required.before.this.vault.can.run.backups")}</span>}
+									{reconnectRequired && <span className="recovery-warning">{t("notifications.message.vaultReconnectRequired")}</span>}
                                 </div>
 								<div className={`vault-stat vault-size-stat${statsActive ? " is-refreshing" : ""}`} inert={cardBlocked || undefined}>
 									<div className="vault-size-summary">{sizePresentation ? <Tooltip content={sizePresentation.tooltip}><span className="vault-size-value" aria-label={sizePresentation.display}><strong>{sizePresentation.display}</strong></span></Tooltip> : <strong>{t("ui.pages.protect.not.measured.yet")}</strong>}<span>{t("ui.pages.protect.vault.size")}</span></div>
 									<div className="vault-size-meta"><small>{t("ui.protect.sizeStatsUpdated", { time: stats.vaultSizeMeasuredAt ? timeAgo(stats.vaultSizeMeasuredAt) : t("ui.protect.notMeasuredYet") })}</small><Tooltip content={t("ui.pages.protect.replicaro.periodically.refreshes.vault.size.stats.you.can.force.a.refr")}><button className="vault-stats-refresh" aria-label={t("ui.pages.protect.refresh.stats.now")} disabled={cardBlocked} onClick={() => refreshVaultSize(repo.id)}>{t("ui.pages.protect.refresh.stats.now")}</button></Tooltip></div>
 									{statsActive && <span className="vault-stats-refreshing">{!stats.paused && <span className="spinner" />}<span><strong>{statsStatus}</strong><span>{t("ui.pages.protect.you.can.safely.close.this.page.if.you.need.to.refreshing.will.resume.i")}</span></span></span>}
-									{stats.failure && <small className="recovery-warning">{stats.failure}</small>}
+									{stats.failure && <small className="recovery-warning">{vaultSizeFailureText(stats.failure)}</small>}
 								</div>
 								<div className="row-actions vault-actions" inert={cardBlocked || undefined}>
 									{reconnectRequired && <button className="btn sm danger" disabled={cardBlocked} onClick={() => void openSavedVaultReconnect(repo)}>{t("ui.pages.protect.reconnect")}</button>}
@@ -4735,11 +5444,11 @@ export default function Protect() {
                                 </div>
 								{removal && <div className="vault-removal-overlay" role="status" aria-live="polite">
 									<VaultOverlayIdentity name={repo.name} />
-									{removal.phase === "removing" || removal.phase === "updating_profile" ? <><strong className="vault-overlay-status">{t("ui.pages.protect.vault.is.being.removed")}</strong>{removal.phase === "updating_profile" && <span>{t("ui.pages.protect.vaultRemoval.updatingInformation")}</span>}<span>{t("ui.pages.protect.you.can.continue.using.replicaro.while.this.finishes")}</span><span className="spinner" aria-hidden="true" /></> : <>
-										<strong>{removal.phase === "profile_error" ? t("ui.pages.protect.the.recovery.profile.could.not.be.updated") : t("ui.pages.protect.the.vault.could.not.be.removed")}</strong>
-										<span>{removal.profileStillUpdating ? t("ui.pages.protect.vaultRemoval.stillUpdating") : removal.message}</span>
+									{removal.phase === "removing" ? <><strong className="vault-overlay-status">{t("ui.pages.protect.vault.is.being.removed")}</strong><span className="spinner" aria-hidden="true" /></> : <>
+										<strong>{removal.phase === "profile_error" ? t("ui.protect.vaultRemovalProfileStopped") : t("ui.pages.protect.the.vault.could.not.be.removed")}</strong>
+										{removal.message && <span>{removal.message}</span>}
 										{removal.phase === "profile_error" && <span>{t("ui.pages.protect.removing.it.anyway.leaves.the.remote.recovery.profile.unchanged.the.va")}</span>}
-										<div className="vault-removal-actions"><button className="btn sm" onClick={() => dismissVaultRemoval(repo.id)}>{t("ui.pages.protect.keep.vault")}</button><button className="btn sm danger-outline" onClick={() => removeVault(repo, removal.phase === "profile_error")}>{removal.phase === "profile_error" ? t("ui.pages.protect.remove.anyway") : t("ui.pages.protect.retry.removal")}</button></div>
+										<div className="vault-removal-actions"><button className="btn sm" onClick={() => dismissVaultRemoval(repo.id)}>{t("ui.pages.protect.keep.vault")}</button><button className="btn sm danger-outline" onClick={() => removeVault(repo)}>{t("ui.pages.protect.retry.removal")}</button>{removal.phase === "profile_error" && <button className="btn sm danger-outline" onClick={() => removeVault(repo, true)}>{t("ui.pages.protect.remove.anyway")}</button>}</div>
 									</>}
 								</div>}
 								{mutation && !removal && <VaultMutationOverlay mutation={mutation} onReopenSettings={(repositoryId, generation) => { void reopenVaultSettings(repositoryId, generation); }} />}
@@ -4808,7 +5517,7 @@ export default function Protect() {
 									<label className="field"><span>{t("ui.pages.protect.keep.n.latest.monthly.snapshots")}</span><input aria-label={t("ui.pages.protect.keep.n.latest.monthly.snapshots")} type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionMonthly} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionMonthly: event.target.value })} /></label>
 									<label className="field"><span>{t("ui.pages.protect.keep.n.latest.yearly.snapshots")}</span><input aria-label={t("ui.pages.protect.keep.n.latest.yearly.snapshots")} type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionYearly} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionYearly: event.target.value })} /></label>
 								</div>
-	                                <label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" rows={3} value={jobForm.excludes} placeholder={"example: *.tmp\nexample: node_modules"} onChange={(event) => setJobForm({ ...jobForm, excludes: event.target.value })} /><small>{t("ui.pages.protect.one.pattern.per.line.for.files.folders.this.job.should.skip")}</small></label>
+	                                <label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" rows={3} value={jobForm.excludes} placeholder={`${examplePlaceholder("*.tmp")}\n${examplePlaceholder("node_modules")}`} onChange={(event) => setJobForm({ ...jobForm, excludes: event.target.value })} /><small>{t("ui.pages.protect.one.pattern.per.line.for.files.folders.this.job.should.skip")}</small></label>
 								<label className="field"><span>{t("ui.pages.protect.tag.optional")}</span><input value={jobForm.tag} onChange={(event) => setJobForm({ ...jobForm, tag: event.target.value })} /><small>{t("ui.pages.protect.optional.label.applied.to.snapshots.created.by.this.job")}</small></label>
                                 <div className="engine-settings">
 									<div className="engine-settings-heading"><strong>{t("ui.pages.protect.engine.specific.settings.optional")}</strong><small>{t("ui.pages.protect.these.settings.apply.only.to.the.selected.vault.engines")}</small></div>
@@ -4816,7 +5525,7 @@ export default function Protect() {
                                     {selectedEngines.map((engine) => (
                                         <section className="engine-settings-group" key={engine}>
                                             <h3>{engine[0].toUpperCase() + engine.slice(1)}</h3>
-											<label className="field"><span>{t("ui.pages.protect.advanced.cli.options")}</span><textarea className="mono" rows={3} value={jobForm.engineOptions[engine] ?? ""} placeholder={engine === "kopia" ? "example: --fail-fast" : "example: --verbose"} onChange={(event) => setJobForm({ ...jobForm, engineOptions: { ...jobForm.engineOptions, [engine]: event.target.value } })} /><small>{t("ui.pages.protect.one.option.per.line.each.line.is.tokenized.as.cli.options.so.a.flag.an")}</small></label>
+											<label className="field"><span>{t("ui.pages.protect.advanced.cli.options")}</span><textarea className="mono" rows={3} value={jobForm.engineOptions[engine] ?? ""} placeholder={examplePlaceholder(engine === "kopia" ? "--fail-fast" : "--verbose")} onChange={(event) => setJobForm({ ...jobForm, engineOptions: { ...jobForm.engineOptions, [engine]: event.target.value } })} /><small>{t("ui.pages.protect.one.option.per.line.each.line.is.tokenized.as.cli.options.so.a.flag.an")}</small></label>
                                         </section>
                                     ))}
 								</div>
@@ -4834,9 +5543,9 @@ export default function Protect() {
 				<p className="muted modal-intro">{t("ui.pages.protect.each.source.got.its.own.job.these.are.independent.jobs.that.you.can.ed")}</p>
 				<div className="mutation-results">{jobCreationResults.map((item, index) => <div className={`mutation-result ${item.status}`} key={`${item.name}:${index}`}>
 					<strong>{item.name}</strong>
-					<span>{item.status[0].toUpperCase() + item.status.slice(1)}</span>
+					<span>{jobMutationStatusLabel(item.status)}</span>
 					{item.source && <small className="mono mutation-result-source">{t("ui.protect.sourcePath", { path: item.source })}</small>}
-					<small>{item.message}</small>
+					{item.message && <small>{item.message}</small>}
 				</div>)}</div>
 				<div className="modal-footer">
 					{jobCreationResults.some((item) => item.status === "failed") && <button className="btn" disabled={jobCreationRetrying} onClick={() => void retryFailedJobCreations()}>{jobCreationRetrying && <span className="spinner" />}{t("ui.pages.protect.retry.failed.jobs")}</button>}
@@ -4858,7 +5567,7 @@ export default function Protect() {
 						</section>
 						<section className="bulk-setting">
 							<label className="check"><input type="checkbox" checked={bulkForm.changeExcludes} onChange={(event) => setBulkForm({ ...bulkForm, changeExcludes: event.target.checked })} />{t("ui.pages.protect.change.exclude.patterns")}</label>
-							{bulkForm.changeExcludes && <div className="bulk-setting-fields"><label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" rows={3} value={bulkForm.excludes} placeholder={"example: *.tmp\nexample: node_modules"} onChange={(event) => setBulkForm({ ...bulkForm, excludes: event.target.value })} /><small>{t("ui.pages.protect.one.pattern.per.line.for.files.folders.these.jobs.should.skip")}</small></label></div>}
+							{bulkForm.changeExcludes && <div className="bulk-setting-fields"><label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" rows={3} value={bulkForm.excludes} placeholder={`${examplePlaceholder("*.tmp")}\n${examplePlaceholder("node_modules")}`} onChange={(event) => setBulkForm({ ...bulkForm, excludes: event.target.value })} /><small>{t("ui.pages.protect.one.pattern.per.line.for.files.folders.these.jobs.should.skip")}</small></label></div>}
 						</section>
 						<section className="bulk-setting">
 							<label className="check"><input type="checkbox" checked={bulkForm.changeTag} onChange={(event) => setBulkForm({ ...bulkForm, changeTag: event.target.checked })} />{t("ui.pages.protect.change.tag")}</label>
@@ -4870,7 +5579,7 @@ export default function Protect() {
 						</section>
 						<section className="bulk-setting">
 							<label className="check"><input type="checkbox" checked={bulkForm.replaceDestinations} onChange={(event) => setBulkForm({ ...bulkForm, replaceDestinations: event.target.checked, repositoryIds: event.target.checked ? bulkForm.repositoryIds : [], engineOptions: event.target.checked ? bulkForm.engineOptions : {} })} />{t("ui.pages.protect.replace.destination.vaults")}</label>
-							{bulkForm.replaceDestinations && <div className="bulk-setting-fields"><div className="field"><span>{t("ui.pages.protect.destination.vaults")}</span><DestinationVaultPicker repositories={repos ?? []} selectedIds={bulkForm.repositoryIds} onChange={(repositoryIds) => setBulkForm({ ...bulkForm, repositoryIds })} /><small>{t("ui.pages.protect.selected.vaults.will.replace.the.complete.destination.list.for.every.s")}</small></div><div className="engine-settings"><div className="engine-settings-heading"><strong>{t("ui.pages.protect.engine.specific.settings.optional")}</strong><small>{t("ui.pages.protect.these.options.replace.the.active.engine.options.for.every.selected.job")}</small></div>{bulkSelectedEngines.map((engine) => <section className="engine-settings-group" key={engine}><h3>{engine[0].toUpperCase() + engine.slice(1)}</h3><label className="field"><span>{t("ui.pages.protect.advanced.cli.options")}</span><textarea className="mono" rows={3} value={bulkForm.engineOptions[engine] ?? ""} placeholder={engine === "kopia" ? "example: --fail-fast" : "example: --verbose"} onChange={(event) => setBulkForm({ ...bulkForm, engineOptions: { ...bulkForm.engineOptions, [engine]: event.target.value } })} /><small>{t("ui.pages.protect.one.option.per.line.each.line.is.tokenized.as.cli.options.so.a.flag.an")}</small></label></section>)}</div></div>}
+							{bulkForm.replaceDestinations && <div className="bulk-setting-fields"><div className="field"><span>{t("ui.pages.protect.destination.vaults")}</span><DestinationVaultPicker repositories={repos ?? []} selectedIds={bulkForm.repositoryIds} onChange={(repositoryIds) => setBulkForm({ ...bulkForm, repositoryIds })} /><small>{t("ui.pages.protect.selected.vaults.will.replace.the.complete.destination.list.for.every.s")}</small></div><div className="engine-settings"><div className="engine-settings-heading"><strong>{t("ui.pages.protect.engine.specific.settings.optional")}</strong><small>{t("ui.pages.protect.these.options.replace.the.active.engine.options.for.every.selected.job")}</small></div>{bulkSelectedEngines.map((engine) => <section className="engine-settings-group" key={engine}><h3>{engine[0].toUpperCase() + engine.slice(1)}</h3><label className="field"><span>{t("ui.pages.protect.advanced.cli.options")}</span><textarea className="mono" rows={3} value={bulkForm.engineOptions[engine] ?? ""} placeholder={examplePlaceholder(engine === "kopia" ? "--fail-fast" : "--verbose")} onChange={(event) => setBulkForm({ ...bulkForm, engineOptions: { ...bulkForm.engineOptions, [engine]: event.target.value } })} /><small>{t("ui.pages.protect.one.option.per.line.each.line.is.tokenized.as.cli.options.so.a.flag.an")}</small></label></section>)}</div></div>}
 						</section>
 					</div>
 					<div className="modal-footer"><button className="btn" onClick={dismissBulkEdit}>{t("ui.pages.protect.cancel")}</button><button className="btn primary" onClick={reviewBulkEdit}>{t("ui.pages.protect.review.changes")}</button></div>
@@ -4903,8 +5612,8 @@ export default function Protect() {
 				<p className="muted modal-intro">{t("ui.pages.protect.every.selected.job.is.listed.separately")}</p>
 				<div className="mutation-results">{bulkResults.items.map((item) => <div className={`mutation-result ${item.status}`} key={item.jobId ?? item.name}>
 					<strong>{item.name}</strong>
-					<span>{item.status[0].toUpperCase() + item.status.slice(1)}</span>
-					<small>{item.message}</small>
+					<span>{jobMutationStatusLabel(item.status)}</span>
+					{item.message && <small>{item.message}</small>}
 				</div>)}</div>
 				<div className="modal-footer">
 					{bulkResults.items.some((item) => item.status === "failed") && <button className="btn" disabled={bulkRetrying} onClick={() => void retryFailedBulkJobs()}>{bulkRetrying && <span className="spinner" />}{t("ui.pages.protect.retry.failed.jobs")}</button>}
@@ -4922,7 +5631,7 @@ export default function Protect() {
 						load();
 					}}
 				/>}
-				{jobDelete && <ConfirmDialog title={t("ui.protect.deleteNamedJobQuestion", { name: jobDelete.name })} message={t("ui.pages.protect.its.run.history.is.kept.but.no.further.backups.will.run.existing.backu")} confirmLabel={t("ui.pages.protect.delete.job")} busy={jobDeleting} onConfirm={() => void removeJob()} onCancel={dismissJobDelete} />}
+				{jobDelete && <ConfirmDialog title={t("ui.protect.deleteNamedJobQuestion", { name: jobDelete.name })} message={t("ui.pages.protect.its.run.history.is.kept.but.no.further.backups.will.run.existing.backu")} confirmLabel={t("ui.pages.protect.delete.job")} onConfirm={() => void removeJob()} onCancel={dismissJobDelete} />}
             {selectedRunJob && (
                 <Modal title={t("ui.protect.runNamedJob", { name: selectedRunJob.name })} onClose={dismissRunReview}>
 					{runResults ? <article aria-label={t("ui.pages.protect.manual.backup.admission.results")}>
@@ -4953,6 +5662,7 @@ export default function Protect() {
 			{showVaultConnect && !connectRcloneAuthorizationAction && (
 				<Modal title={t("ui.pages.protect.connect.existing.vault")} wide onClose={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>
 					<fieldset className="modal-form modal-workflow-fields" disabled={connectSaving}>
+						{connectForm.connector === RCLONE_REMOTE_CONNECTOR && !connectForm.coldStorage && <RcloneRemoteWarning />}
 						{/* Discovery inputs are intentionally unmounted after a successful
 						    preview so credentials and already-reviewed destination details do
 						    not compete with the attachment decisions. Check another vault
@@ -4960,9 +5670,9 @@ export default function Protect() {
 						{!connectPreview && <>
 							<p className="section-copy">{t("ui.protect.enterExistingDetailsHelp")}</p>
 						<label className="field"><span>{t("ui.pages.protect.storage.type")}</span><select value={connectForm.coldStorage ? "cold_s3" : connectForm.connector} disabled={Boolean(connectPreview || retryConnectionIntentId)} onChange={(event) => { if (connectRcloneAuth?.sessionId) void closeRcloneAuthorization(connectRcloneAuth.sessionId); setConnectRcloneAuth(null); const coldStorage = event.target.value === "cold_s3"; const connector = coldStorage ? "s3" : event.target.value; const selected = connectionIntegrations.find((item) => item.id === connector); invalidateConnectPreview(); setConnectForm((current) => ({ ...current, engine: coldStorage ? "restic" : current.engine, connector, coldStorage, archiveWriteClass: "GLACIER", checkSchedule: coldStorage ? "manual" : current.checkSchedule, location: "", pendingLocation: "", options: integrationDefaults(selected), objectLock: emptyObjectLock() })); }}>{connectionIntegrations.flatMap((item) => [<option key={item.id} value={item.id}>{knownMessage(`ui.integration.${item.id}.label`, item.label)}</option>, ...(item.id === "s3" ? [<option key="cold_s3" value="cold_s3">{t("ui.pages.protect.cold.storage.must.be.s3.compatible")}</option>] : [])])}</select>{connectIntegration && <small>{connectForm.coldStorage ? t("ui.protect.coldS3CompatibilityHelp", { glacier: "GLACIER", deepArchive: "DEEP_ARCHIVE" }) : connectIntegrationDescription}</small>}</label>
-						{(!connectPreview || !connectUsesRcloneLogin) && (connectIntegration?.localBrowser ? <label className="field"><span>{t("ui.pages.protect.location")}</span><DirectoryField value={connectForm.location} disabled={Boolean(retryConnectionIntentId)} placeholder={examplePlaceholder(connectIntegration.placeholder)} onChange={(location) => { invalidateConnectPreview(); setConnectForm((current) => ({ ...current, location, pendingLocation: "" })); }} /></label> : connectIntegration ? <RemoteVaultFields form={connectForm} integration={connectIntegration} onChange={(next) => { if (!retryConnectionIntentId) invalidateConnectPreview(); setConnectForm(next); }} /> : null)}
-						{!connectUsesRcloneLogin && connectOrderedOptions.filter((option) => !option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={connectForm.connector} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}
-							{(!connectPreview || !connectUsesRcloneLogin) && <label className="field"><span>{t("ui.pages.protect.vault.encryption.password")}</span><input type="password" value={connectForm.password} onChange={(event) => { if (!retryConnectionIntentId) invalidateConnectPreview(); setConnectForm((current) => ({ ...current, password: event.target.value })); }} /><small>{t("ui.pages.protect.the.password.is.used.to.decrypt.and.validate.the.vault.the.password.is")}</small></label>}
+						{(!connectPreview || !connectUsesRcloneSignIn) && (connectIntegration?.localBrowser ? <label className="field"><span>{t("ui.pages.protect.location")}</span><DirectoryField value={connectForm.location} disabled={Boolean(retryConnectionIntentId)} placeholder={examplePlaceholder(connectIntegration.placeholder)} onChange={(location) => { invalidateConnectPreview(); setConnectForm((current) => ({ ...current, location, pendingLocation: "" })); }} /></label> : connectIntegration ? <RemoteVaultFields form={connectForm} integration={connectIntegration} onChange={(next) => { if (!retryConnectionIntentId) invalidateConnectPreview(); setConnectForm(next); }} /> : null)}
+						{!connectUsesRcloneSignIn && connectOrderedOptions.filter((option) => !option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={connectForm.connector} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}
+							{(!connectPreview || !connectUsesRcloneSignIn) && <label className="field"><span>{t("ui.pages.protect.vault.encryption.password")}</span><input type="password" value={connectForm.password} onChange={(event) => { if (!retryConnectionIntentId) invalidateConnectPreview(); setConnectForm((current) => ({ ...current, password: event.target.value })); }} /><small>{t("ui.pages.protect.the.password.is.used.to.decrypt.and.validate.the.vault.the.password.is")}</small></label>}
 						{matchingConnectionIntent && <section className="recovery-warning recovery-fallback-message" role="status">
 							<p><strong>{retryConnectionError ? t("ui.protect.previousConnectionIncomplete") : matchingConnectionIntent.state === "prepared" ? t("ui.protect.earlierConnectionSaved") : t("ui.protect.unfinishedConnectionFound")}</strong></p>
 							<p>{retryConnectionError ? t("ui.protect.savedAttemptAvailable") : matchingConnectionIntent.state === "prepared" ? t("ui.protect.prePublicationAttemptHelp") : t("ui.protect.profileUpdatedAttemptHelp")}</p>
@@ -4970,10 +5680,10 @@ export default function Protect() {
 							<div className="vault-removal-actions">{!retryConnectionIntentId && <button className="btn primary" disabled={connectChecking || connectSaving} onClick={() => selectConnectionIntent(matchingConnectionIntent)}>{t("ui.pages.protect.continue.previous.connection")}</button>}{matchingConnectionIntent.state === "prepared" && <button className="btn" disabled={connectChecking || connectSaving || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => void startNewConnectionCheck(matchingConnectionIntent)}>{t("ui.pages.protect.start.a.new.check")}</button>}</div>
 						</section>}
 						{connectForm.coldStorage && <div className="recovery-warning">{coldStorageProviderGuidance().map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>}
-						{!connectUsesRcloneLogin && connectOrderedOptions.some((option) => option.advanced) && <button className="btn advanced-toggle" onClick={() => setConnectAdvanced((value) => !value)}><Icon name="settings" size={14} />{connectAdvanced ? t("ui.pages.protect.hide.advanced.settings") : t("ui.pages.protect.advanced.settings")}</button>}
-						{!connectUsesRcloneLogin && connectAdvanced && <div className="advanced-panel">{connectOrderedOptions.filter((option) => option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={connectForm.connector} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}</div>}
-						<div className="modal-footer"><button className="btn" disabled={connectSaving} onClick={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>{t("ui.pages.protect.cancel")}</button>
-										{matchingConnectionIntent && retryConnectionIntentId ? <button className="btn primary" disabled={connectChecking || connectSaving || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => void retryPendingConnection()}>{connectSaving && <span className="spinner" />}{retryConnectionError ? t("ui.protect.retryConnection") : t("ui.protect.continuePreviousConnection")}</button> : (!matchingConnectionIntent || canCheckAnotherRcloneAccount) && <button className="btn primary" disabled={connectChecking || !vaultLocation(connectForm) || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => { if (connectUsesRcloneLogin) setConnectRcloneAuthorizationAction("check"); else void checkExistingVault(); }}>{connectChecking && <span className="spinner" />}{t("ui.pages.protect.check.existing.vault")}</button>}
+						{!connectUsesRcloneSignIn && connectOrderedOptions.some((option) => option.advanced) && <button className="btn advanced-toggle" onClick={() => setConnectAdvanced((value) => !value)}><Icon name="settings" size={14} />{connectAdvanced ? t("ui.pages.protect.hide.advanced.settings") : t("ui.pages.protect.advanced.settings")}</button>}
+						{!connectUsesRcloneSignIn && connectAdvanced && <div className="advanced-panel">{connectOrderedOptions.filter((option) => option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={connectForm.connector} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}</div>}
+						<div className={`modal-footer${connectForm.connector === RCLONE_REMOTE_CONNECTOR ? " rclone-remote-dialog-footer" : ""}`}><button className="btn" disabled={connectSaving} onClick={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>{t("ui.pages.protect.cancel")}</button>
+										{matchingConnectionIntent && retryConnectionIntentId ? <button className="btn primary" disabled={connectChecking || connectSaving || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => void retryPendingConnection()}>{connectSaving && <span className="spinner" />}{retryConnectionError ? t("ui.protect.retryConnection") : t("ui.protect.continuePreviousConnection")}</button> : (!matchingConnectionIntent || canCheckAnotherRcloneAccount) && <button className="btn primary" disabled={connectChecking || !vaultLocation(connectForm) || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => { if (connectUsesRcloneSignIn) setConnectRcloneAuthorizationAction("check"); else void checkExistingVault(); }}>{connectChecking && <span className="spinner" />}{t("ui.pages.protect.check.existing.vault")}</button>}
 						</div>
 						</>}
 						{connectPreview && <>
@@ -5021,16 +5731,17 @@ export default function Protect() {
 							</fieldset>}
 							{connectNameConflictNotice && <div className="recovery-warning recovery-fallback-message"><p>{connectNameConflictNotice}</p></div>}
 							{connectPreview.mode === "fallback" && connectPreview.objectLockEnrollmentAvailable && <ObjectLockFields form={connectForm} creation onChange={setConnectForm} />}
-							<div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.vault.name")}</span><input aria-label={t("ui.pages.protect.vault.name")} disabled={connectUsesRcloneLogin} value={connectForm.name} onChange={(event) => setConnectForm({ ...connectForm, name: event.target.value })} /><small>{connectUsesRcloneLogin ? t("ui.protect.rcloneNameImmutableHelp", { provider: connectIntegration ? knownMessage(`ui.integration.${connectIntegration.id}.label`, connectIntegration.label) : "" }) : connectPreview.existingVault ? t("ui.protect.reviewSavedName") : t("ui.protect.nameImmutableHelp")}</small></label><label className="field"><span>{t("ui.pages.protect.description.optional")}</span><input value={connectForm.description} onChange={(event) => setConnectForm({ ...connectForm, description: event.target.value })} /></label></div>
+							<div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.vault.name")}</span><input aria-label={t("ui.pages.protect.vault.name")} disabled={connectUsesVaultFolder} value={connectForm.name} onChange={(event) => setConnectForm({ ...connectForm, name: event.target.value })} /><small>{connectUsesVaultFolder ? connectForm.connector === RCLONE_REMOTE_CONNECTOR ? t("ui.protect.rcloneRemoteNameImmutableHelp") : t("ui.protect.rcloneNameImmutableHelp", { provider: connectIntegration ? knownMessage(`ui.integration.${connectIntegration.id}.label`, connectIntegration.label) : "" }) : connectPreview.existingVault ? t("ui.protect.reviewSavedName") : t("ui.protect.nameImmutableHelp")}</small></label><label className="field"><span>{t("ui.pages.protect.description.optional")}</span><input value={connectForm.description} onChange={(event) => setConnectForm({ ...connectForm, description: event.target.value })} /></label></div>
 							<VaultCareFields form={connectForm} integrityDisabled={connectIntegrityLocked} maintenanceDisabled={connectMaintenanceLocked} integrityLockedHelp={connectIntegrityLockedHelp} maintenanceLockedHelp={connectMaintenanceLockedHelp} onChange={setConnectForm} />
-							{connectPreview.existingVault && <fieldset className="connection-decision field">
+							{connectPreview.existingVault && <fieldset className={`connection-decision field${connectReviewedRcloneAddress ? " rclone-remote-location-review" : ""}`}>
 								<legend>{t("ui.pages.protect.exact.update.existing.vault.changes")}</legend>
 								<ul>{existingVaultUpdateChanges.map((change) => <li key={change}>{change}</li>)}</ul>
 								<label><input type="checkbox" checked={connectUpdateConfirmedDigest === connectUpdateReviewDigest} onChange={(event) => setConnectUpdateConfirmedDigest(event.target.checked ? connectUpdateReviewDigest : "")} />{t("ui.pages.protect.update.this.existing.vault.registration.with.exactly.these.reviewed.ch")}</label>
 							</fieldset>}
 						</>}
 					</fieldset>
-					{connectPreview && <div className="modal-footer"><button className="btn" disabled={connectSaving} onClick={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>{t("ui.pages.protect.cancel")}</button><button className="btn" disabled={connectSaving} onClick={resetConnectForNewAttempt}>{t("ui.pages.protect.check.another.vault")}</button><button className="btn primary" disabled={connectSaving || connectChecking || connectRcloneNameConflict || !validVaultName(connectForm.name) || !connectProfileReady || !connectOwnerReady || Boolean(connectPreview.existingVault && connectUpdateConfirmedDigest !== connectUpdateReviewDigest) || !validObjectLockSettings(connectForm.objectLock, connectForm.maintenanceSchedule, connectPreview.mode === "profile")} onClick={() => void saveExistingVault()}>{connectSaving && <span className="spinner" />}{connectPreview.existingVault ? t("ui.protect.updateExistingVault") : t("ui.protect.connectVault")}</button></div>}
+					{connectPreview && <div className={`modal-footer${connectForm.connector === RCLONE_REMOTE_CONNECTOR ? " rclone-remote-dialog-footer" : ""}`}><button className="btn" disabled={connectSaving} onClick={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>{t("ui.pages.protect.cancel")}</button><button className="btn" disabled={connectSaving} onClick={resetConnectForNewAttempt}>{t("ui.pages.protect.check.another.vault")}</button><button className="btn primary" disabled={connectSaving || connectChecking || connectRcloneNameConflict || !validVaultName(connectForm.name) || !connectProfileReady || !connectOwnerReady || Boolean(connectPreview.existingVault && connectUpdateConfirmedDigest !== connectUpdateReviewDigest) || !validObjectLockSettings(connectForm.objectLock, connectForm.maintenanceSchedule, connectPreview.mode === "profile")} onClick={() => void saveExistingVault()}>{connectSaving && <span className="spinner" />}{connectPreview.existingVault ? t("ui.protect.updateExistingVault") : t("ui.protect.connectVault")}</button></div>}
+					{connectSaving && <KeepWindowOpenNotice />}
 					{(connectChecking || connectSaving) && <VaultActivityLog records={vaultProgress} />}
 				</Modal>
 			)}
@@ -5048,6 +5759,7 @@ export default function Protect() {
 							else void checkExistingVault().then((succeeded) => { if (succeeded) setConnectRcloneAuthorizationAction(null); });
 						}}>{(connectChecking || connectSaving) && <span className="spinner" />}{connectRcloneAuthorizationAction === "retry" ? t("ui.pages.protect.retry.connection") : t("ui.pages.protect.check.existing.vault")}</button>}
 					</div>
+					{connectSaving && <KeepWindowOpenNotice />}
 					{(connectChecking || connectSaving) && <VaultActivityLog records={vaultProgress} />}
 				</Modal>
 			)}
@@ -5056,31 +5768,36 @@ export default function Protect() {
 				<Modal title={t("ui.pages.protect.add.a.vault")} wide onClose={closeVaultCreate}>
 					<fieldset className="modal-workflow-fields" disabled={vaultSaving}>
 					<div className="modal-form">
+						{createUsesRcloneRemote && <RcloneRemoteWarning />}
 						<p className="section-copy">{t("ui.pages.protect.encryption.compression.and.deduplication.are.automatically.applied.to")}</p>
 						<label className="field"><span>{t("ui.pages.protect.storage.type")}</span><select autoFocus value={vaultForm.coldStorage ? "cold_s3" : vaultForm.connector} disabled={Boolean(vaultForm.pendingLocation)} onChange={(event) => { if (createRcloneAuth?.sessionId) void closeRcloneAuthorization(createRcloneAuth.sessionId); setCreateRcloneAuth(null); setShowCreateRcloneAuthorization(false); const coldStorage = event.target.value === "cold_s3"; const connector = coldStorage ? "s3" : event.target.value; const selected = vaultStorageIntegrations.find((item) => item.id === connector); const eligible = engineCatalog.filter((descriptor) => descriptor.installed && descriptor.providers.some((provider) => provider.id === connector && provider.supported)); const engine = coldStorage ? "restic" : eligible.some((descriptor) => descriptor.id === vaultForm.engine) ? vaultForm.engine : (eligible.find((descriptor) => descriptor.id === "restic")?.id ?? eligible[0]?.id ?? vaultForm.engine) as VaultForm["engine"]; setVaultForm({ ...vaultForm, engine, connector, coldStorage, archiveWriteClass: "GLACIER", checkSchedule: coldStorage ? "manual" : vaultForm.checkSchedule, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "", options: integrationOptionsForEngine(selected, engine, engineCatalog), objectLock: objectLockForSelection(vaultForm.objectLock, engine, connector) }); }}>{vaultStorageIntegrations.flatMap((item) => [<option key={item.id} value={item.id}>{knownMessage(`ui.integration.${item.id}.label`, item.label)}</option>, ...(item.id === "s3" ? [<option key="cold_s3" value="cold_s3">{t("ui.pages.protect.cold.storage.must.be.s3.compatible")}</option>] : [])])}</select>{integration && <small>{vaultForm.coldStorage ? t("ui.pages.protect.supports.all.s3.compatible.cold.object.storage.that.accept", { glacier: "GLACIER", deepArchive: "DEEP_ARCHIVE" }) : createIntegrationDescription}</small>}</label>
-						<label className="field"><span>{t("ui.pages.protect.vault.name")}</span><input aria-label={t("ui.pages.protect.vault.name")} disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.name} placeholder={t("ui.pages.protect.example.work.archive")} onChange={(event) => setVaultForm({ ...vaultForm, name: event.target.value })} /><small>{t("ui.protect.vaultNameLengthHelp", { count: MAX_VAULT_NAME_CODE_POINTS })}</small></label>
-							{createUsesRcloneLogin && <><label className="field"><span>{t("ui.pages.protect.description.optional")}</span><input disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.description} onChange={(event) => setVaultForm({ ...vaultForm, description: event.target.value })} /></label><div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.encryption.password")}</span><input type="password" value={vaultForm.password} onChange={(event) => setVaultForm({ ...vaultForm, password: event.target.value })} /><small>{vaultPasswordHelp()}</small></label><label className="field"><span>{t("ui.pages.protect.confirm.encryption.password")}</span><input type="password" value={vaultForm.passwordConfirmation} onChange={(event) => setVaultForm({ ...vaultForm, passwordConfirmation: event.target.value })} /></label></div>{vaultForm.password && vaultForm.passwordConfirmation && vaultForm.password !== vaultForm.passwordConfirmation && <small className="inline-error" role="alert">{t("ui.pages.protect.the.passwords.do.not.match")}</small>}</>}
-						{integration?.localBrowser ? <label className="field"><span>{t("ui.pages.protect.location")}</span><DirectoryField value={vaultForm.location} disabled={Boolean(vaultForm.pendingLocation)} placeholder={examplePlaceholder(integration.placeholder)} onChange={(location) => setVaultForm({ ...vaultForm, location })} /></label> : integration && !createUsesRcloneLogin ? <RemoteVaultFields form={vaultForm} integration={integration} onChange={setVaultForm} /> : null}
+						{!createUsesRcloneRemote && createVaultNameField}
+							{createUsesRcloneSignIn && <><label className="field"><span>{t("ui.pages.protect.description.optional")}</span><input disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.description} onChange={(event) => setVaultForm({ ...vaultForm, description: event.target.value })} /></label><div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.encryption.password")}</span><input type="password" value={vaultForm.password} onChange={(event) => setVaultForm({ ...vaultForm, password: event.target.value })} /><small>{vaultPasswordHelp()}</small></label><label className="field"><span>{t("ui.pages.protect.confirm.encryption.password")}</span><input type="password" value={vaultForm.passwordConfirmation} onChange={(event) => setVaultForm({ ...vaultForm, passwordConfirmation: event.target.value })} /></label></div>{vaultForm.password && vaultForm.passwordConfirmation && vaultForm.password !== vaultForm.passwordConfirmation && <small className="inline-error" role="alert">{t("ui.pages.protect.the.passwords.do.not.match")}</small>}</>}
+						{integration?.localBrowser ? <label className="field"><span>{t("ui.pages.protect.location")}</span><DirectoryField value={vaultForm.location} disabled={Boolean(vaultForm.pendingLocation)} placeholder={examplePlaceholder(integration.placeholder)} onChange={(location) => setVaultForm({ ...vaultForm, location })} /></label> : integration && !createUsesRcloneSignIn ? <RemoteVaultFields form={vaultForm} integration={integration} vaultFolderField={false} onChange={setVaultForm} /> : null}
+						{/* The vault name is the vault's folder name under the path in
+						    remote, so it follows the remote settings. */}
+						{createUsesRcloneRemote && createVaultNameField}
 						{/* Connection has no archive-class choice: managed Cold vaults recover the
 						    protected class, and native Cold imports start from the GLACIER default. */}
 						{vaultCreateError.includes("connect existing vault") && <div className="recovery-warning"><p>{vaultCreateError}</p><button className="btn sm" onClick={() => { if (!closeVaultCreate()) return; invalidateConnectPreview(); setRetryConnectionIntentId(""); setConnectForm((current) => restoreVaultDestinationFields({ ...current, connector: vaultForm.connector, coldStorage: vaultForm.coldStorage, archiveWriteClass: "GLACIER", checkSchedule: vaultForm.coldStorage ? "manual" : current.checkSchedule, location: vaultLocation(vaultForm, true), options: { ...vaultForm.options }, password: vaultForm.password })); setShowVaultConnect(true); refreshConnectionIntents(); }}>{t("ui.pages.protect.connect.to.existing.vault")}</button></div>}
 						{vaultCreateError.includes("selected location is not empty") && <div className="recovery-warning"><p>{vaultCreateError}</p><div className="tool-buttons"><button className="btn sm" onClick={() => { setVaultCreateError(""); setVaultForm({ ...vaultForm, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "" }); }}>{t("ui.pages.protect.select.empty.subfolder")}</button><button className="btn sm" onClick={() => { setVaultCreateError(""); setVaultForm({ ...vaultForm, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "" }); }}>{t("ui.pages.protect.select.different.destination")}</button></div></div>}
-						{!createUsesRcloneLogin && createOrderedOptions.filter((option) => !option.advanced && !creationOptionIsCustom(vaultForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={vaultForm.connector} option={option} value={vaultForm.options[option.key] ?? ""} disabled={creationOptionLockedForPending(vaultForm, option)} onChange={(value) => setVaultForm(updateConnectorOption(vaultForm, option.key, value))} />)}
-							{!createUsesRcloneLogin && <><label className="field"><span>{t("ui.pages.protect.description.optional")}</span><input disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.description} onChange={(event) => setVaultForm({ ...vaultForm, description: event.target.value })} /></label><div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.encryption.password")}</span><input type="password" value={vaultForm.password} onChange={(event) => setVaultForm({ ...vaultForm, password: event.target.value })} /><small>{vaultPasswordHelp()}</small></label><label className="field"><span>{t("ui.pages.protect.confirm.encryption.password")}</span><input type="password" value={vaultForm.passwordConfirmation} onChange={(event) => setVaultForm({ ...vaultForm, passwordConfirmation: event.target.value })} /></label></div>{vaultForm.password && vaultForm.passwordConfirmation && vaultForm.password !== vaultForm.passwordConfirmation && <small className="inline-error" role="alert">{t("ui.pages.protect.the.passwords.do.not.match")}</small>}</>}
+						{!createUsesRcloneSignIn && createOrderedOptions.filter((option) => !option.advanced && !creationOptionIsCustom(vaultForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={vaultForm.connector} option={option} value={vaultForm.options[option.key] ?? ""} disabled={creationOptionLockedForPending(vaultForm, option)} onChange={(value) => setVaultForm(updateConnectorOption(vaultForm, option.key, value))} />)}
+							{!createUsesRcloneSignIn && <><label className="field"><span>{t("ui.pages.protect.description.optional")}</span><input disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.description} onChange={(event) => setVaultForm({ ...vaultForm, description: event.target.value })} /></label><div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.encryption.password")}</span><input type="password" value={vaultForm.password} onChange={(event) => setVaultForm({ ...vaultForm, password: event.target.value })} /><small>{vaultPasswordHelp()}</small></label><label className="field"><span>{t("ui.pages.protect.confirm.encryption.password")}</span><input type="password" value={vaultForm.passwordConfirmation} onChange={(event) => setVaultForm({ ...vaultForm, passwordConfirmation: event.target.value })} /></label></div>{vaultForm.password && vaultForm.passwordConfirmation && vaultForm.password !== vaultForm.passwordConfirmation && <small className="inline-error" role="alert">{t("ui.pages.protect.the.passwords.do.not.match")}</small>}</>}
 						{vaultForm.coldStorage && <div className="recovery-warning">{coldStorageProviderGuidance().map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>}
                         <button className="btn advanced-toggle" onClick={() => setVaultAdvanced((value) => !value)}><Icon name="settings" size={14} />{vaultAdvanced ? t("ui.pages.protect.hide.advanced.settings") : t("ui.pages.protect.advanced.settings")}</button>
 						{vaultAdvanced && (
 							<div className="advanced-panel">
 								<ObjectLockFields form={vaultForm} creation creationAvailable={createObjectLockAvailable} disabled={Boolean(vaultForm.pendingLocation)} onChange={updateCreateObjectLock} />
-								<label className="field"><span>{t("ui.pages.protect.vault.engine")}</span><select value={vaultForm.engine} disabled={vaultForm.objectLock.enrolled || vaultForm.coldStorage || createUsesRcloneLogin || Boolean(vaultForm.pendingLocation)} onChange={(event) => { const engine = event.target.value as VaultForm["engine"]; const selected = vaultStorageIntegrations.find((item) => item.id === vaultForm.connector); setVaultForm({ ...vaultForm, engine, options: integrationOptionsForEngine(selected, engine, engineCatalog, vaultForm.options), objectLock: objectLockForSelection(vaultForm.objectLock, engine, vaultForm.connector) }); }}>{engineCatalog.filter((item) => vaultForm.coldStorage ? item.id === "restic" : !createUsesRcloneLogin || item.id === "restic").map((item) => <option key={item.id} value={item.id} disabled={!item.installed || !item.providers.some((provider) => provider.id === vaultForm.connector && provider.supported)}>{item.name}</option>)}</select><small>{vaultForm.objectLock.enrolled ? t("ui.pages.protect.kopia.is.the.required.engine.when.object.locking.is") : vaultEngineHelp(vaultForm.connector, vaultForm.coldStorage)}</small></label>
+								<label className="field"><span>{t("ui.pages.protect.vault.engine")}</span><select value={vaultForm.engine} disabled={vaultForm.objectLock.enrolled || vaultForm.coldStorage || createUsesVaultFolder || Boolean(vaultForm.pendingLocation)} onChange={(event) => { const engine = event.target.value as VaultForm["engine"]; const selected = vaultStorageIntegrations.find((item) => item.id === vaultForm.connector); setVaultForm({ ...vaultForm, engine, options: integrationOptionsForEngine(selected, engine, engineCatalog, vaultForm.options), objectLock: objectLockForSelection(vaultForm.objectLock, engine, vaultForm.connector) }); }}>{engineCatalog.filter((item) => vaultForm.coldStorage ? item.id === "restic" : !createUsesVaultFolder || item.id === "restic").map((item) => <option key={item.id} value={item.id} disabled={!item.installed || !item.providers.some((provider) => provider.id === vaultForm.connector && provider.supported)}>{item.name}</option>)}</select><small>{vaultForm.objectLock.enrolled ? t("ui.pages.protect.kopia.is.the.required.engine.when.object.locking.is") : vaultEngineHelp(vaultForm.connector, vaultForm.coldStorage)}</small></label>
 								{vaultForm.coldStorage && <label className="field"><span>{t("ui.pages.protect.storage.class")}</span><select value={vaultForm.archiveWriteClass} disabled={Boolean(vaultForm.pendingLocation)} onChange={(event) => setVaultForm({ ...vaultForm, archiveWriteClass: event.target.value as VaultForm["archiveWriteClass"] })}><option value="GLACIER">{t("ui.pages.protect.glacier.default", { glacier: "GLACIER" })}</option><option value="DEEP_ARCHIVE">{t("ui.pages.protect.deep.archive", { deepArchive: "DEEP_ARCHIVE" })}</option></select><small>{coldStorageArchiveClassHelp()}</small></label>}
-							{!createUsesRcloneLogin && createOrderedOptions.filter((option) => option.advanced && !creationOptionIsCustom(vaultForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={vaultForm.connector} option={option} value={vaultForm.options[option.key] ?? ""} disabled={creationOptionLockedForPending(vaultForm, option)} explanation={advancedCreationOptionExplanation(vaultForm.connector, option)} onChange={(value) => setVaultForm(updateConnectorOption(vaultForm, option.key, value))} />)}
+							{!createUsesRcloneSignIn && createOrderedOptions.filter((option) => option.advanced && !creationOptionIsCustom(vaultForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={vaultForm.connector} option={option} value={vaultForm.options[option.key] ?? ""} disabled={creationOptionLockedForPending(vaultForm, option)} explanation={advancedCreationOptionExplanation(vaultForm.connector, option)} onChange={(value) => setVaultForm(updateConnectorOption(vaultForm, option.key, value))} />)}
 								<VaultCareFields form={vaultForm} disabled={Boolean(vaultForm.pendingLocation)} onChange={setVaultForm} />
                             </div>
                         )}
                     </div>
-					<div className="modal-footer"><button className="btn" disabled={vaultSaving} onClick={closeVaultCreate}>{t("ui.pages.protect.cancel")}</button><button className="btn primary" disabled={vaultSaving || !integration || !validVaultName(vaultForm.name) || !vaultLocation(vaultForm, true) || !validVaultPassword(vaultForm.password) || vaultForm.password !== vaultForm.passwordConfirmation || createMissingRequiredOptions.length > 0 || !validObjectLockSettings(vaultForm.objectLock, vaultForm.maintenanceSchedule)} onClick={() => { if (createUsesRcloneLogin && !createRcloneAuth && !retryCreationIntentId) setShowCreateRcloneAuthorization(true); else void saveVault(); }}>{vaultSaving && <span className="spinner" />}{vaultSaving ? t("ui.pages.protect.creating") : retryCreationIntentId ? t("ui.pages.protect.retry.creation") : t("ui.pages.protect.create.vault")}</button></div>
+					<div className={`modal-footer${createUsesRcloneRemote ? " rclone-remote-dialog-footer" : ""}`}><button className="btn" disabled={vaultSaving} onClick={closeVaultCreate}>{t("ui.pages.protect.cancel")}</button><button className="btn primary" disabled={vaultSaving || !integration || !validVaultName(vaultForm.name) || !vaultLocation(vaultForm, true) || !validVaultPassword(vaultForm.password) || vaultForm.password !== vaultForm.passwordConfirmation || createMissingRequiredOptions.length > 0 || !validObjectLockSettings(vaultForm.objectLock, vaultForm.maintenanceSchedule)} onClick={() => { if (createUsesRcloneSignIn && !createRcloneAuth && !retryCreationIntentId) setShowCreateRcloneAuthorization(true); else void saveVault(); }}>{vaultSaving && <span className="spinner" />}{vaultSaving ? t("ui.pages.protect.creating") : retryCreationIntentId ? t("ui.pages.protect.retry.creation") : t("ui.pages.protect.create.vault")}</button></div>
 					</fieldset>
+					{vaultSaving && <KeepWindowOpenNotice />}
 					{vaultSaving && <VaultActivityLog records={vaultProgress} />}
                 </Modal>
             )}
@@ -5096,6 +5813,7 @@ export default function Protect() {
 						<button className="btn" disabled={vaultSaving} onClick={closeCreateRcloneAuthorization}>{t("ui.pages.protect.back")}</button>
 						{createRcloneAuth?.status === "ready" && <button className="btn primary" disabled={vaultSaving} onClick={() => void saveVault()}>{vaultSaving && <span className="spinner" />}{vaultSaving ? t("ui.pages.protect.creating") : t("ui.pages.protect.create.vault")}</button>}
 					</div>
+					{vaultSaving && <KeepWindowOpenNotice />}
 					{vaultSaving && <VaultActivityLog records={vaultProgress} />}
 				</Modal>
 			)}
@@ -5121,18 +5839,19 @@ export default function Protect() {
 								: vaultWorkState === "unavailable"
 									? t("ui.pages.protect.vault.work.status.could.not.be.checked.vault.settings")
 									: t("ui.pages.protect.checking.whether.vault.work.is.running.vault.settings.cannot")}</span><span className="spinner" aria-hidden="true" /></p>
-							{toolBusy === "maintenance" && vaultSettings.coldStorage && <button className="btn" onClick={cancelColdMaintenance}>{t("ui.pages.protect.cancel.reclamation")}</button>}
 						</div>}
 						<div inert={vaultWorkState !== "idle" ? true : undefined}>
 					<div className="modal-location mono">{vaultSettings.engine} · {vaultSettings.location}</div>
 					<div className="modal-section-label">{t("ui.pages.protect.vault.care")}</div>
 					{vaultOwnershipPresentation === "checking" && <section className="recovery-warning vault-owner-status checking" role="status"><span className="spinner" aria-hidden="true" />{t("ui.pages.protect.checking.vault.ownership.status")}</section>}
 					{vaultOwnershipPresentation === "unverified" && <section className="recovery-warning vault-owner-status" role="alert"><p>{t("ui.pages.protect.vault.ownership.status.could.not.be.verified.vault.owner.actions.are.d")}</p><button className="btn" onClick={() => detectVaultOwnership(vaultSettings, vaultSettingsSession.current)}>{t("ui.pages.protect.detect.vault.owner.status")}</button></section>}
-					{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && vaultOwnership && <section className="recovery-warning vault-owner-status"><p>{vaultOwnership.message}</p>{vaultOwnershipPresentation === "nonowner" && <><p>{vaultOwnership.takeoverExplanation}</p><button className="btn danger" disabled={vaultOwnershipBusy} onClick={() => void takeOverVaultOwnership()}>{vaultOwnershipBusy && <span className="spinner" />}{t("ui.pages.protect.click.here.to.take.over.vault.ownership")}</button></>}</section>}
+					{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && vaultOwnership && <section className="recovery-warning vault-owner-status"><p>{vaultOwnership.message}</p>{vaultOwnershipPresentation === "nonowner" && <><p>{vaultOwnership.takeoverExplanation}</p><button className="btn danger" disabled={vaultOwnershipBusy} onClick={() => void takeOverVaultOwnership()}>{vaultOwnershipBusy && <span className="spinner" />}{t("ui.pages.protect.click.here.to.take.over.vault.ownership")}</button>{vaultOwnershipBusy && <KeepWindowOpenNotice />}</>}</section>}
+					{vaultOwnershipPresentation === "transfer_unfinished" && vaultOwnership && <section className="recovery-warning vault-owner-status" role="alert"><p>{t("ui.protect.ownerTransferUnfinished")}</p><button className="btn danger" disabled={vaultOwnershipBusy} onClick={() => void takeOverVaultOwnership()}>{vaultOwnershipBusy && <span className="spinner" />}{t("ui.protect.finishTakeover")}</button>{vaultOwnershipBusy && <KeepWindowOpenNotice />}</section>}
+					{vaultOwnershipPresentation === "transfer_elsewhere" && <section className="recovery-warning vault-owner-status" role="alert"><p>{t("ui.protect.ownerTransferElsewhere")}</p><button className="btn" onClick={() => detectVaultOwnership(vaultSettings, vaultSettingsSession.current)}>{t("ui.pages.protect.detect.vault.owner.status")}</button></section>}
 					<div className="form-grid two vault-care-fields">
 						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <label className="field"><span>{t("ui.pages.protect.integrity.check")}</span><select value={vaultSettings.coldStorage ? "manual" : checkSchedule} disabled={vaultSettings.coldStorage || vaultOwnershipPresentation !== "owner"} onChange={(event) => setCheckSchedule(event.target.value)}>{(vaultSettings.coldStorage ? [["manual", () => t("ui.care.disabled")]] as const : careSchedules).map(([value, label]) => <option key={value} value={value}>{label()}</option>)}</select><small>{vaultSettings.coldStorage ? coldStorageIntegrityHelp() : integrityCheckHelp()}</small>{vaultOwnershipPresentation === "nonowner" && <small>{t("ui.pages.protect.only.the.current.vault.owner.can.change.or.run.integrity.checks.take.o")}</small>}<small>{t("ui.protect.lastCareRun", { last: vaultSettings.lastCheck ? `${timeAgo(vaultSettings.lastCheck)} (${vaultSettings.lastCheckStatus})` : t("ui.protect.never"), next: vaultSettings.nextCheck ? t("ui.protect.nextCareRun", { time: timeAgo(vaultSettings.nextCheck) }) : "" })}</small></label>}
 						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <label className="field"><span>{t("ui.pages.protect.space.reclamation")}</span><select value={maintenanceSchedule} disabled={vaultOwnershipPresentation !== "owner"} onChange={(event) => setMaintenanceSchedule(event.target.value)}>{careSchedules.map(([value, label]) => <option key={value} value={value} disabled={!objectLockScheduleEligible(objectLock, value)}>{label()}</option>)}</select><small>{objectLock.enrolled ? (objectLock.paused ? pausedObjectLockMaintenanceHelp() : objectLockMaintenanceHelp()) : maintenanceHelp()}</small>{vaultOwnershipPresentation === "nonowner" && <small>{t("ui.pages.protect.only.the.current.vault.owner.can.change.or.run.space.reclamation.take")}</small>}<small>{t("ui.protect.lastCareRun", { last: vaultSettings.lastMaintenance ? `${timeAgo(vaultSettings.lastMaintenance)} (${vaultSettings.lastMaintenanceStatus})` : t("ui.protect.never"), next: vaultSettings.nextMaintenance ? t("ui.protect.nextCareRun", { time: timeAgo(vaultSettings.nextMaintenance) }) : "" })}</small></label>}
-						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <div className="vault-care-actions"><div className="vault-care-action"><button className="btn" disabled={vaultSettings.coldStorage || vaultOwnershipPresentation !== "owner" || Boolean(toolBusy)} onClick={() => void runTool("check")}>{toolBusy === "check" && <span className="spinner" />}{t("ui.pages.protect.run.check.now")}</button></div><div className="vault-care-action"><button className="btn" disabled={vaultOwnershipPresentation !== "owner" || Boolean(toolBusy)} onClick={() => void runTool("maintenance")}>{toolBusy === "maintenance" && <span className="spinner" />}{t("ui.pages.protect.run.reclamation.now")}</button>{vaultSettings.coldStorage && toolBusy === "maintenance" && <button className="btn" onClick={cancelColdMaintenance}>{t("ui.pages.protect.cancel.reclamation")}</button>}</div></div>}
+						{(vaultOwnershipPresentation === "owner" || vaultOwnershipPresentation === "nonowner") && <div className="vault-care-actions"><div className="vault-care-action"><button className="btn" disabled={vaultSettings.coldStorage || vaultOwnershipPresentation !== "owner" || Boolean(toolBusy)} onClick={() => runTool("check")}>{toolBusy === "check" && <span className="spinner" />}{t("ui.pages.protect.run.check.now")}</button></div><div className="vault-care-action"><button className="btn" disabled={vaultOwnershipPresentation !== "owner" || Boolean(toolBusy)} onClick={() => runTool("maintenance")}>{toolBusy === "maintenance" && <span className="spinner" />}{t("ui.pages.protect.run.reclamation.now")}</button></div></div>}
 						<JobSpeedField connector={vaultSettings.connector} value={concurrencyMode} onChange={(mode) => setConcurrencyMode(compatibleConcurrencyMode(vaultSettings.connector, mode))} />
 					</div>
 					<ObjectLockFields
@@ -5143,11 +5862,6 @@ export default function Protect() {
 					/>
 					{vaultSettings.coldStorage && <p><strong>{t("ui.pages.protect.archive.write.class")}</strong> {vaultSettings.archiveWriteClass} {t("ui.protect.readOnly")}</p>}
 					{vaultSettings.coldStorage && <div className="recovery-warning">{coldStorageProviderGuidance().map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>}
-					{vaultSettings.coldStorage && toolBusy === "maintenance" && <p className="recovery-warning">{t("ui.protect.coldMaintenanceWait")}</p>}
-                    {toolOutput && <>
-                        <button type="button" className="text-button" aria-pressed={showRawToolLog} onClick={() => setShowRawToolLog((raw) => !raw)}>{showRawToolLog ? t("ui.pages.protect.show.readable.log") : t("ui.pages.protect.show.raw.log")}</button>
-                        <pre className="output tool-output">{showRawToolLog ? toolOutput : formatNativeLogText(vaultSettings.engine, "care", toolOutput)}</pre>
-                    </>}
 					{vaultSettings.engine === "restic" && <>
 						<button className="btn advanced-toggle vault-settings-advanced-toggle" onClick={() => setVaultSettingsAdvanced((value) => !value)}><Icon name="settings" size={14} />{vaultSettingsAdvanced ? t("ui.pages.protect.hide.advanced.settings") : t("ui.pages.protect.advanced.settings")}</button>
 						{vaultSettingsAdvanced && <div className="advanced-panel"><div className="advanced-setting"><label className="check"><input type="checkbox" checked={autoUnlock} onChange={(event) => setAutoUnlock(event.target.checked)} />{t("ui.pages.protect.auto.unlock.for.stuck.vaults")}</label><small>{t("ui.pages.protect.restic.will.sometimes.block.use.of.a.vault.when.running.an.operation.t")}</small></div></div>}
@@ -5166,7 +5880,7 @@ export default function Protect() {
 						</>}
 					</section>
 					{dormantJobs.length > 0 && <section className="unowned-snapshots"><div className="modal-section-label">{t("ui.pages.protect.dormant.recovery.jobs")}</div><p>{t("ui.pages.protect.these.definitions.remain.protected.in.vault.replicaro.but.do.not.run.o", { sidecar: "vault.replicaro" })}</p>{dormantJobs.map((item) => <div className="unowned-snapshot" key={item.jobId}><span><strong>{item.definition.name}</strong><small>{displayPath(item.definition.source)} · {scheduleLabel(item.definition.schedule)}</small><small>{t("ui.protect.dormantScriptSummary", { before: item.definition.beforeScriptPath ? `${item.definition.beforeScriptPath} (${item.definition.beforeScriptMustSucceed ? t("ui.protect.required") : t("ui.protect.optional")})` : t("ui.protect.noneLower"), after: item.definition.afterScriptPath ? `${item.definition.afterScriptPath} (${item.definition.afterScriptMustSucceed ? t("ui.protect.required") : t("ui.protect.optional")})` : t("ui.protect.noneLower") })}</small></span><div className="tool-buttons"><button className="btn sm" disabled={Boolean(dormantBusy)} onClick={() => void changeDormant(item.repositoryId, item.jobId, "restore")}>{dormantBusy === `restore:${item.jobId}` && <span className="spinner" />}{t("ui.pages.protect.restore.disabled")}</button><button className="btn sm danger-outline" disabled={Boolean(dormantBusy)} onClick={() => void changeDormant(item.repositoryId, item.jobId, "discard")}>{dormantBusy === `discard:${item.jobId}` && <span className="spinner" />}{t("ui.pages.protect.discard.definition")}</button></div></div>)}</section>}
-					{vaultSettingsIntegration && (!usesRcloneNativeLogin(vaultSettings.connector) || (vaultSettings.engine === "restic" && vaultSettingsRcloneSupported)) && <section className="vault-connection-panel"><div className="modal-section-label">{t("ui.pages.protect.vault.connection")}</div><p>{t("ui.pages.protect.use.this.to.reconnect.to.the.vault.after.disconnection.for.any.reason")}</p><button className="btn" onClick={() => requestSavedVaultReconnect(vaultSettings)}>{t("ui.pages.protect.reconnect.vault")}</button></section>}
+					{vaultSettingsIntegration && (!usesRcloneSignIn(vaultSettings.connector) || (vaultSettings.engine === "restic" && vaultSettingsRcloneSupported)) && <section className="vault-connection-panel"><div className="modal-section-label">{t("ui.pages.protect.vault.connection")}</div><p>{t("ui.pages.protect.use.this.to.reconnect.to.the.vault.after.disconnection.for.any.reason")}</p><button className="btn" onClick={() => requestSavedVaultReconnect(vaultSettings)}>{t("ui.pages.protect.reconnect.vault")}</button></section>}
 					<div className="danger-zone"><div className="modal-section-label">{t("ui.pages.protect.danger.zone")}</div><p>{t("ui.pages.protect.removing.this.vault.also.removes.it.as.a.destination.from.matching.bac")}</p><button className="btn danger-outline" onClick={() => { const repository = vaultSettings; dismissVaultSettings(); openVaultDelete(repository); }}>{t("ui.pages.protect.remove.vault.from.replicaro")}</button></div>
 						</div>
 						<div className="modal-footer"><button className="btn" onClick={closeVault}>{t("ui.pages.protect.cancel")}</button><button className="btn primary" disabled={vaultWorkState !== "idle" || !validObjectLockSettings(objectLock, maintenanceSchedule, true, vaultSettings.objectLock)} onClick={saveCare}>{t("ui.pages.protect.save")}</button></div>
@@ -5203,7 +5917,7 @@ export default function Protect() {
                 <SaveChangesDialog
                     onSave={saveChangesBeforeClose}
                     onDiscard={discardChanges}
-                    onCancel={() => setClosePrompt(null)}
+                    onCancel={cancelClosePrompt}
                     busy={jobSaving}
                 />
             )}

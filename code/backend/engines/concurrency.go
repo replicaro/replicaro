@@ -35,7 +35,10 @@ func resticConcurrency(repo models.Repository) (backend string, connections, rea
 		backend = "azure"
 	case repo.Connector == "gcs":
 		backend = "gs"
-	case IsResticRcloneConnector(repo.Connector):
+	case IsResticRcloneConnector(repo.Connector), repo.Connector == "webdav":
+		// WebDAV goes through Restic's rclone backend (prepareResticStorage), so
+		// the option is rclone.connections. Unlike the OAuth providers it is not
+		// capped at Normal, so all four modes map to 3/5/7/10 like SFTP.
 		backend = "rclone"
 	default:
 		return "", 0, 0, fmt.Errorf("Restic concurrency is unsupported for connector %q", repo.Connector)

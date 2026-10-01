@@ -1,5 +1,7 @@
 // Package operationruntime owns bounded, process-local previews and cancellation
-// handles for operations whose durable state remains in the database.
+// handles for operations whose durable state remains in the database, and the
+// application-owned lifetime of operations that a request starts and then hands
+// off to a background worker.
 package operationruntime
 
 import (
@@ -29,6 +31,11 @@ const (
 var (
 	ErrNotFound      = errors.New("operation runtime is unavailable")
 	ErrNotCancelable = errors.New("operation is not cancelable")
+	// ErrStopping is returned once shutdown has begun. The app calls BeginStop
+	// before it drains HTTP, so a request still in flight at that point gets
+	// this error (the API answers 503) instead of creating an operation record
+	// that nothing would run.
+	ErrStopping = errors.New("background operations are stopping")
 )
 
 type Entry struct {
@@ -88,6 +95,18 @@ type Manager struct {
 	maxEntries        int
 	maxOperationBytes int
 	maxProcessBytes   int
+
+	// Background work started by a request (restore, manual check and
+	// maintenance, snapshot and job deletion, vault password change, settings
+	// save and removal) must not live on the request's
+	// context: closing the browser or a proxy timeout would cancel it. It runs
+	// on this lifetime instead. BeginStop cancels it and Wait joins every
+	// worker before main closes the database, the same contract the backup
+	// runner and scheduler follow.
+	lifetime       context.Context
+	cancelLifetime context.CancelFunc
+	stopping       bool
+	background     sync.WaitGroup
 }
 
 func New() *Manager {
@@ -98,8 +117,63 @@ func NewWithLimits(maxEntries, maxOperationBytes, maxProcessBytes int) *Manager 
 	if maxEntries <= 0 || maxOperationBytes <= 0 || maxProcessBytes <= 0 {
 		panic("operation runtime limits must be positive")
 	}
+	lifetime, cancel := context.WithCancel(context.Background())
 	return &Manager{entries: map[string]*runtimeEntry{}, maxEntries: maxEntries,
-		maxOperationBytes: maxOperationBytes, maxProcessBytes: maxProcessBytes}
+		maxOperationBytes: maxOperationBytes, maxProcessBytes: maxProcessBytes,
+		lifetime: lifetime, cancelLifetime: cancel}
+}
+
+// BeginBackground admits one background worker. The returned context ends when
+// BeginStop (or Stop) is called; done must be called exactly once when the worker has saved
+// its final state and released everything it holds. Admission and Stop share
+// the manager mutex, so a worker is either counted before Stop starts waiting
+// or refused with ErrStopping.
+func (m *Manager) BeginBackground() (context.Context, func(), error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.stopping {
+		return nil, nil, ErrStopping
+	}
+	m.background.Add(1)
+	var once sync.Once
+	return m.lifetime, func() { once.Do(m.background.Done) }, nil
+}
+
+// BeginStop refuses new background workers and cancels the running ones
+// without waiting for them. Shutdown is split in two on purpose: main calls
+// BeginStop before it drains HTTP and joins the workers later with Wait.
+// A request can be blocked on a vault lock that a background worker holds; if
+// the cancel only came after the HTTP drain, that drain would time out, the
+// rest of shutdown would be skipped and the worker would never be cancelled
+// or record its interrupted state. Calling it again is harmless.
+func (m *Manager) BeginStop() {
+	m.mu.Lock()
+	m.stopping = true
+	m.mu.Unlock()
+	m.cancelLifetime()
+}
+
+// Wait waits until every admitted background worker has called its done, or
+// until ctx ends. A worker has to write its interrupted state after the
+// cancel, so callers keep the database open until Wait returns nil.
+func (m *Manager) Wait(ctx context.Context) error {
+	done := make(chan struct{})
+	go func() {
+		m.background.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// Stop is BeginStop followed by Wait.
+func (m *Manager) Stop(ctx context.Context) error {
+	m.BeginStop()
+	return m.Wait(ctx)
 }
 
 // Register is called only after the durable operation row exists. Re-registering

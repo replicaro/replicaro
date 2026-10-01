@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
+	"strconv"
 	"strings"
+	"unicode/utf8"
 
+	"github.com/local/replicaro/engines"
 	"github.com/local/replicaro/integrations"
 )
 
@@ -17,6 +20,8 @@ type SupportPrivacyContext struct {
 	Paths   []string
 	Hosts   []string
 	Secrets []string
+	// SecretFragments are already encoded and must be matched literally.
+	SecretFragments []string
 }
 
 type supportPrivacyQueryer interface {
@@ -50,6 +55,19 @@ func LoadSupportPrivacyContext(query supportPrivacyQueryer, valueLimit, byteLimi
 		}
 		return nil
 	}
+	seenFragments := map[string]bool{}
+	appendFragments := func(fragments []string) error {
+		for _, fragment := range fragments {
+			if seenFragments[fragment] {
+				continue
+			}
+			if err := appendValues(&result.SecretFragments, fragment); err != nil {
+				return err
+			}
+			seenFragments[fragment] = true
+		}
+		return nil
+	}
 	repositories, err := query.Query(`SELECT connector,location,resolved_repository_path,passphrase,pending_passphrase,connector_options FROM repositories`)
 	if err != nil {
 		return result, fmt.Errorf("read support repository privacy context: %w", err)
@@ -73,7 +91,20 @@ func LoadSupportPrivacyContext(query supportPrivacyQueryer, valueLimit, byteLimi
 			_ = repositories.Close()
 			return result, err
 		}
-		if err := appendValues(&result.Secrets, append([]string{passphrase}, integrations.SecretValues(connector, options)...)...); err != nil {
+		if err := appendValues(&result.Secrets, append([]string{passphrase}, supportCatalogSecretValues(connector, options)...)...); err != nil {
+			_ = repositories.Close()
+			return result, err
+		}
+		rclonePaths, rcloneSecrets, rcloneFragments := rcloneRemotePrivacyValues(connector, options, valueByteLimit)
+		if err := appendValues(&result.Paths, rclonePaths...); err != nil {
+			_ = repositories.Close()
+			return result, err
+		}
+		if err := appendValues(&result.Secrets, rcloneSecrets...); err != nil {
+			_ = repositories.Close()
+			return result, err
+		}
+		if err := appendFragments(rcloneFragments); err != nil {
 			_ = repositories.Close()
 			return result, err
 		}
@@ -131,6 +162,12 @@ func LoadSupportPrivacyContext(query supportPrivacyQueryer, valueLimit, byteLimi
 				_ = rows.Close()
 				return result, err
 			}
+			// Intents keep only the reviewed settings, so this adds the paths.
+			rclonePaths, _, _ := rcloneRemotePrivacyValues(connector, options, valueByteLimit)
+			if err := appendValues(&result.Paths, rclonePaths...); err != nil {
+				_ = rows.Close()
+				return result, err
+			}
 		}
 		if err := rows.Err(); err != nil {
 			_ = rows.Close()
@@ -164,6 +201,118 @@ func LoadSupportPrivacyContext(query supportPrivacyQueryer, valueLimit, byteLimi
 		return result, err
 	}
 	return result, nil
+}
+
+// supportCatalogSecretValues is integrations.SecretValues, except that an Any
+// Rclone Remote vault's environment variables are left to
+// rcloneRemotePrivacyValues, which redacts each value on its own. As one JSON
+// list they could pass the per-value bound and fail the whole report.
+func supportCatalogSecretValues(connector string, options map[string]string) []string {
+	if connector != engines.RcloneRemoteConnector {
+		return integrations.SecretValues(connector, options)
+	}
+	rest := make(map[string]string, len(options))
+	for key, value := range options {
+		if key != engines.RcloneRemoteEnvironmentOption {
+			rest[key] = value
+		}
+	}
+	return integrations.SecretValues(connector, rest)
+}
+
+// Environment variable values shorter than this are not redacted. They are
+// settings such as RCLONE_TRANSFERS=1 or "true", not credentials, and as plain
+// substrings they would blank every matching digit or word in the report.
+const supportRcloneVariableMinimumLength = 6
+
+// rcloneRemotePrivacyValues returns what an Any Rclone Remote vault adds to
+// the privacy context: the config file path (which often holds the user
+// name), the remote name, and the path in remote (which can hold a bucket
+// name) as paths, and each environment variable value as a secret on its own,
+// because rclone can echo a single value in its own error text. A path in
+// remote made only of "/" names nothing private, and redacting it would blank
+// every "/" in the report, so it is left out.
+//
+// A value whose longest representation exceeds the report's per-value bound
+// contributes literal fragments of each complete representation instead. Encode
+// before splitting: quoting individual raw pieces inserts delimiters that never
+// occur inside a quoted native value. Fragments remain bounded and are matched
+// against the original detail so overlapping matches cannot expose a remainder.
+func rcloneRemotePrivacyValues(connector string, options map[string]string, valueByteLimit int) (paths, secrets, fragments []string) {
+	if connector != engines.RcloneRemoteConnector {
+		return nil, nil, nil
+	}
+	paths = []string{options[engines.RcloneRemoteConfigFileOption], options[engines.RcloneRemoteNameOption]}
+	if remotePath := options[engines.RcloneRemotePathOption]; strings.Trim(strings.TrimSpace(remotePath), "/") != "" {
+		paths = append(paths, remotePath)
+	}
+	raw := options[engines.RcloneRemoteEnvironmentOption]
+	variables, err := engines.ParseRcloneRemoteEnvironment(raw)
+	if err != nil {
+		// A list that can't be read never reached rclone, because every run
+		// checks it first. It is still redacted whole.
+		return paths, []string{raw}, nil
+	}
+	for _, variable := range variables {
+		trimmed := strings.TrimSpace(variable.Value)
+		if utf8.RuneCountInString(trimmed) < supportRcloneVariableMinimumLength {
+			continue
+		}
+		values := []string{variable.Value}
+		if trimmed != variable.Value {
+			// Response diagnostics trim their detail before storage. Include
+			// that literal too, including for diagnostics already saved.
+			values = append(values, trimmed)
+		}
+		for _, value := range values {
+			representations := SupportSecretRepresentations(value)
+			longest := 0
+			for _, representation := range representations {
+				longest = max(longest, len(representation))
+			}
+			if longest <= valueByteLimit {
+				secrets = append(secrets, value)
+			} else {
+				for _, representation := range representations {
+					fragments = append(fragments, splitSupportSecret(representation, max(1, valueByteLimit/8))...)
+				}
+			}
+		}
+	}
+	return paths, secrets, fragments
+}
+
+// SupportSecretRepresentations returns a secret and the escaped forms of it
+// that the support report also redacts, because native output can print a
+// value URL-escaped, quoted, or JSON-escaped.
+func SupportSecretRepresentations(secret string) []string {
+	if secret == "" {
+		return nil
+	}
+	encoded, _ := json.Marshal(secret)
+	return []string{secret, url.QueryEscape(secret), url.PathEscape(secret), strconv.Quote(secret),
+		string(encoded), strings.ReplaceAll(secret, `\`, `\\`)}
+}
+
+// splitSupportSecret cuts value into consecutive pieces of about the same
+// length, each at most size bytes plus the rest of a character, cut only
+// between characters.
+func splitSupportSecret(value string, size int) []string {
+	count := (len(value) + size - 1) / size
+	target := (len(value) + count - 1) / count
+	pieces := make([]string, 0, count)
+	for len(value) > target {
+		cut := target
+		for cut < len(value) && !utf8.RuneStart(value[cut]) {
+			cut++
+		}
+		pieces = append(pieces, value[:cut])
+		value = value[cut:]
+	}
+	if value != "" {
+		pieces = append(pieces, value)
+	}
+	return pieces
 }
 
 func preflightSupportPrivacyContext(query supportPrivacyQueryer, byteLimit, valueByteLimit int) error {

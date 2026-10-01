@@ -1,71 +1,41 @@
 import english from "../public/locales/en.json";
-import german from "../public/locales/de.json";
-import french from "../public/locales/fr.json";
-import arabic from "../public/locales/ar.json";
-import urdu from "../public/locales/ur.json";
-import hindi from "../public/locales/hi.json";
-import spanish from "../public/locales/es.json";
-import italian from "../public/locales/it.json";
-import mandarin from "../public/locales/zh-Hans.json";
-import cantonese from "../public/locales/yue-Hant.json";
-import japanese from "../public/locales/ja.json";
-import irish from "../public/locales/ga.json";
-import korean from "../public/locales/ko.json";
-import malay from "../public/locales/ms.json";
-import indonesian from "../public/locales/id.json";
-import turkish from "../public/locales/tr.json";
-import hebrew from "../public/locales/he.json";
-import portuguese from "../public/locales/pt-PT.json";
-import brazilianPortuguese from "../public/locales/pt-BR.json";
-import russian from "../public/locales/ru.json";
-import polish from "../public/locales/pl.json";
-import dutch from "../public/locales/nl.json";
-import bengali from "../public/locales/bn.json";
-import greek from "../public/locales/el.json";
-import persian from "../public/locales/fa.json";
-import vietnamese from "../public/locales/vi.json";
-import nigerianPidgin from "../public/locales/pcm.json";
 import type { ReactNode } from "react";
 
 export type Message = string | (Partial<Record<Intl.LDMLPluralRule, string>> & { other: string });
 export type Catalog = { locale: string; direction: "ltr" | "rtl"; messages: Record<string, Message> };
 
 // Catalogs are application data, never markup or executable templates. Adding a
-// locale requires an explicit bundled import so a settings/API value cannot turn
-// into an arbitrary network fetch or an unreviewed translation source.
+// locale requires an explicit entry here so a settings/API value cannot turn
+// into an arbitrary network fetch or an unreviewed translation source: the
+// loader below only ever requests /locales/<id>.json for an id in this list.
 // English is the source of truth for wording, including the strength of claims
 // and warnings. Report source issues separately; translations must preserve the
 // same meaning and keep Replicaro, Restic, Kopia, and rclone unchanged.
-const catalogs = {
-    en: english as Catalog,
-    de: german as Catalog,
-    fr: french as Catalog,
-    ar: arabic as Catalog,
-    ur: urdu as Catalog,
-    hi: hindi as Catalog,
-    es: spanish as Catalog,
-    it: italian as Catalog,
-    "zh-Hans": mandarin as Catalog,
-    "yue-Hant": cantonese as Catalog,
-    ja: japanese as Catalog,
-    ga: irish as Catalog,
-    ko: korean as Catalog,
-    ms: malay as Catalog,
-    id: indonesian as Catalog,
-    tr: turkish as Catalog,
-    he: hebrew as Catalog,
-    "pt-PT": portuguese as Catalog,
-    "pt-BR": brazilianPortuguese as Catalog,
-    ru: russian as Catalog,
-    pl: polish as Catalog,
-    nl: dutch as Catalog,
-    bn: bengali as Catalog,
-    el: greek as Catalog,
-    fa: persian as Catalog,
-    vi: vietnamese as Catalog,
-    pcm: nigerianPidgin as Catalog,
-};
-export type LanguagePreference = "system" | keyof typeof catalogs;
+const supportedLocales = [
+    "en", "de", "fr", "ar", "ur", "hi", "es", "it", "zh-Hans", "yue-Hant", "ja", "ga", "ko", "ms", "id",
+    "tr", "he", "pt-PT", "pt-BR", "ru", "pl", "nl", "bn", "el", "fa", "vi", "pcm",
+] as const;
+type SupportedLocale = typeof supportedLocales[number];
+export type LanguagePreference = "system" | SupportedLocale;
+
+// English is the only catalog compiled into the main bundle. t() falls back to
+// English for any key a translation lacks, and English is what the UI renders
+// when another catalog can't be downloaded, so it has to be available without
+// a request. Bundling all 27 catalogs made the main script roughly 3.5 MB, most
+// of it translations nobody on that install would read.
+//
+// Every other catalog is fetched on demand from the plain copy Vite already
+// copies to dist/locales/. Those files have to stay in the build because the
+// backend reads them from the embedded UI for its own translated notifications
+// (locale.LoadFS), so fetching them keeps one copy of each catalog in the
+// binary. Switching to import() would give each catalog a hashed chunk *as
+// well as* the plain copy, i.e. every catalog embedded twice. Because the
+// plain names don't change between releases, the server sends /locales/ with
+// Cache-Control: no-cache (see serveWebUIFile) so an upgrade can't leave a
+// browser on last version's catalog.
+const englishCatalog = english as Catalog;
+const loadedCatalogs: Partial<Record<SupportedLocale, Catalog>> = { en: englishCatalog };
+const pendingCatalogs = new Map<SupportedLocale, Promise<Catalog>>();
 
 // Endonyms let users find a language even when the current UI is unfamiliar.
 // English and the system option keep their existing translated catalog labels.
@@ -98,25 +68,108 @@ export const languageNames = {
     pcm: "Nigerian Pidgin",
 } satisfies Record<Exclude<LanguagePreference, "system" | "en">, string>;
 
-let effectiveLocale: keyof typeof catalogs = "en";
+let effectiveLocale: SupportedLocale = "en";
 const listeners = new Set<() => void>();
 
 export function getEffectiveLocale(): string { return effectiveLocale; }
+export function isRightToLeft(): boolean { return loadedCatalogs[effectiveLocale]?.direction === "rtl"; }
 export function subscribeLocale(listener: () => void): () => void {
     listeners.add(listener);
     return () => listeners.delete(listener);
 }
 
-export function activateLocale(requested: string | undefined): void {
+function supportedLocale(requested: string | undefined): SupportedLocale {
     // The backend resolves OS language variants to a registered catalog. Use
     // that catalog's locale for text and formatting, not the browser's locale.
-    const next = requested && Object.hasOwn(catalogs, requested) ? requested as keyof typeof catalogs : "en";
-    effectiveLocale = next;
+    return requested && (supportedLocales as readonly string[]).includes(requested) ? requested as SupportedLocale : "en";
+}
+
+function isCatalog(value: unknown, locale: string): value is Catalog {
+    if (!value || typeof value !== "object") return false;
+    const candidate = value as Partial<Catalog>;
+    return candidate.locale === locale && (candidate.direction === "ltr" || candidate.direction === "rtl") &&
+        typeof candidate.messages === "object" && candidate.messages !== null && !Array.isArray(candidate.messages);
+}
+
+// Adds a catalog that is already in memory. The loader uses it for downloaded
+// catalogs, and tests use it to make a language available without a network
+// round trip. Only locales from the supported list are accepted.
+export function registerCatalog(catalog: Catalog): void {
+    const locale = catalog.locale;
+    if (!(supportedLocales as readonly string[]).includes(locale) || !isCatalog(catalog, locale)) {
+        throw new Error(`not a supported locale catalog: ${locale}`);
+    }
+    loadedCatalogs[locale as SupportedLocale] = catalog;
+}
+
+// A catalog request that hangs would otherwise hold the first render forever
+// (main.tsx waits for it). After this long the request is aborted and treated
+// like any other failed load, so the UI starts in English.
+const catalogFetchTimeoutMs = 15_000;
+
+async function fetchCatalog(locale: SupportedLocale): Promise<Catalog> {
+    const response = await fetch(`/locales/${locale}.json`, { credentials: "same-origin", signal: AbortSignal.timeout(catalogFetchTimeoutMs) });
+    if (!response.ok) throw new Error(`catalog ${locale} returned ${response.status}`);
+    const catalog: unknown = await response.json();
+    // A catalog for another language (or something that isn't a catalog at
+    // all) is a failed load, not a reason to show the wrong language.
+    if (!isCatalog(catalog, locale)) throw new Error(`catalog ${locale} is not the requested catalog`);
+    return catalog;
+}
+
+function loadCatalog(locale: SupportedLocale): Promise<Catalog> {
+    const loaded = loadedCatalogs[locale];
+    if (loaded) return Promise.resolve(loaded);
+    // Share one request between callers asking for the same catalog. A failed
+    // request is forgotten so the next attempt downloads it again.
+    let pending = pendingCatalogs.get(locale);
+    if (!pending) {
+        pending = fetchCatalog(locale)
+            .then((catalog) => { registerCatalog(catalog); return catalog; })
+            .finally(() => pendingCatalogs.delete(locale));
+        pendingCatalogs.set(locale, pending);
+    }
+    return pending;
+}
+
+function applyLocale(locale: SupportedLocale, catalog: Catalog): void {
+    effectiveLocale = locale;
     if (typeof document !== "undefined") {
-        document.documentElement.lang = catalogs[next].locale;
-        document.documentElement.dir = catalogs[next].direction;
+        document.documentElement.lang = catalog.locale;
+        document.documentElement.dir = catalog.direction;
     }
     listeners.forEach((listener) => listener());
+}
+
+// "failed" means the catalog couldn't be downloaded or wasn't valid; the
+// current language stays active.
+export type LocaleActivation = "activated" | "failed";
+
+// Switches the UI to a locale, downloading its catalog first when this session
+// hasn't loaded it yet. In the app only main.tsx calls this, before the first
+// render: once for the saved language and, if that catalog fails, a second
+// time for English. Changing the language on the System page saves the
+// settings and reloads the page, so a catalog is never swapped while the UI is
+// showing.
+// A catalog that is already loaded (always the case for English) is applied
+// before this function first awaits, so tests can switch languages
+// synchronously. Nothing here throws: a failed download leaves the current
+// language in place so the UI never stalls on a missing translation.
+export async function activateLocale(requested: string | undefined): Promise<LocaleActivation> {
+    const next = supportedLocale(requested);
+    const loaded = loadedCatalogs[next];
+    if (loaded) {
+        applyLocale(next, loaded);
+        return "activated";
+    }
+    let catalog: Catalog;
+    try {
+        catalog = await loadCatalog(next);
+    } catch {
+        return "failed";
+    }
+    applyLocale(next, catalog);
+    return "activated";
 }
 
 // Intl data varies by browser. If a catalog's locale is unsupported for a
@@ -152,17 +205,33 @@ export function formatMessage(message: Message, values: Record<string, string | 
     return interpolate(template, values, locale);
 }
 
+// t(), renderMessage(), and the formatters stay synchronous. They only read
+// catalogs that are already loaded; activateLocale does any downloading first.
+const englishMessages = englishCatalog.messages;
+function currentMessages(): Record<string, Message> {
+    return (loadedCatalogs[effectiveLocale] ?? englishCatalog).messages;
+}
+
 export function t(key: string, values: Record<string, string | number> = {}): string {
-    const message = catalogs[effectiveLocale].messages[key] ?? catalogs.en.messages[key];
+    const message = currentMessages()[key] ?? englishMessages[key];
     return message === undefined ? key : formatMessage(message, values);
 }
 
+// English text regardless of the active language, for the few places that must
+// stay in English: the Reset to English dialog, and the notice that the saved
+// language couldn't be loaded. English picked in the selector is confirmed in
+// the current language and doesn't use this.
+export function englishText(key: string, values: Record<string, string | number> = {}): string {
+    const message = englishMessages[key];
+    return message === undefined ? key : formatMessage(message, values, "en");
+}
+
 export function knownMessage(key: string, fallback: string): string {
-    return Object.hasOwn(catalogs.en.messages, key) ? t(key) : fallback;
+    return Object.hasOwn(englishMessages, key) ? t(key) : fallback;
 }
 
 export function renderMessage(key: string, values: Record<string, ReactNode>): ReactNode[] {
-    const message = catalogs[effectiveLocale].messages[key] ?? catalogs.en.messages[key];
+    const message = currentMessages()[key] ?? englishMessages[key];
     if (message === undefined) return [key];
     const template = typeof message === "string" ? message :
         (message[new Intl.PluralRules(effectiveLocale).select(Number(values.count))] ?? message.other);

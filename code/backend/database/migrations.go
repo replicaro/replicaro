@@ -325,6 +325,28 @@ func Migrate(db *sql.DB) error {
 		updated_at TEXT NOT NULL
 	);
 
+	-- One row per vault that has, or had, a reconnect problem (see
+	-- vault_reconnect.go). It is kept apart from vault_profile_sync and
+	-- kopia_policy_state on purpose: a local edit resets the profile sync
+	-- attempt count and startup resets every Kopia policy error to dirty,
+	-- and the failing-since times here must survive both. Schema 70
+	-- databases from before this table existed get it from this same
+	-- CREATE TABLE IF NOT EXISTS on their next start; nothing is backfilled,
+	-- so every existing vault starts with no reconnect state and no clock.
+	CREATE TABLE IF NOT EXISTS vault_reconnect_state (
+		repository_id TEXT PRIMARY KEY,
+		reconnect_required INTEGER NOT NULL DEFAULT 0 CHECK (reconnect_required IN (0,1)),
+		reconnect_source TEXT NOT NULL DEFAULT '',
+		reconnect_set_at TEXT NOT NULL DEFAULT '',
+		profile_sync_failing_since TEXT NOT NULL DEFAULT '',
+		kopia_policy_failing_since TEXT NOT NULL DEFAULT '',
+		profile_sync_last_failure_at TEXT NOT NULL DEFAULT '',
+		kopia_policy_last_failure_at TEXT NOT NULL DEFAULT '',
+		CHECK ((reconnect_required = 0 AND reconnect_source = '' AND reconnect_set_at = '') OR
+		       (reconnect_required = 1 AND reconnect_source <> '' AND reconnect_set_at <> '')),
+		FOREIGN KEY (repository_id) REFERENCES repositories(id) ON DELETE CASCADE
+	);
+
 	CREATE TABLE IF NOT EXISTS dormant_recovery_jobs (
 		repository_id TEXT NOT NULL,
 		job_id TEXT NOT NULL,
@@ -438,6 +460,25 @@ func Migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	// vault_reconnect_state tables created by an earlier start of this version
+	// have no last-failure columns. Add them in place, empty: an empty last
+	// failure makes the next failure start a new run (see
+	// RecordVaultWorkerFailure), so a clock saved before the column existed can
+	// only escalate later than it would have, never earlier. Every other column
+	// and row is kept.
+	for _, column := range []string{"profile_sync_last_failure_at", "kopia_policy_last_failure_at"} {
+		var present int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM pragma_table_info('vault_reconnect_state')
+			WHERE name=?`, column).Scan(&present); err != nil {
+			return err
+		}
+		if present == 0 {
+			if _, err := tx.Exec(`ALTER TABLE vault_reconnect_state
+				ADD COLUMN ` + column + ` TEXT NOT NULL DEFAULT ''`); err != nil {
+				return err
+			}
+		}
+	}
 	if _, err := tx.Exec(`INSERT INTO settings (key,value) VALUES ('installationId',?)
 		ON CONFLICT(key) DO NOTHING`, uuid.NewString()); err != nil {
 		return err
@@ -457,11 +498,18 @@ func Migrate(db *sql.DB) error {
 	)`); err != nil {
 		return err
 	}
+	// Only the kinds that run native Restic commands under the vault lock can
+	// leave a stale Restic lock behind: backup, restore, check, maintenance and
+	// snapshot deletion ("delete"). A job deletion record runs no Restic
+	// command, and a queued record never started anything, so neither selects
+	// a vault for the unlock. Keep this list to those kinds when adding new
+	// operation kinds.
 	if _, err := tx.Exec(`INSERT INTO startup_stuck_restic_repositories (repository_id)
 		SELECT r.id FROM repositories r
 		WHERE r.engine = 'restic' AND r.auto_unlock = 1 AND (
 			r.last_check_status = 'running' OR r.last_maintenance_status = 'running' OR
-			EXISTS (SELECT 1 FROM operations o WHERE o.repository_id = r.id AND o.status = 'running')
+			EXISTS (SELECT 1 FROM operations o WHERE o.repository_id = r.id AND o.status = 'running'
+				AND o.kind IN ('backup', 'restore', 'check', 'maintenance', 'delete'))
 		)`); err != nil {
 		return err
 	}
@@ -544,6 +592,33 @@ func Migrate(db *sql.DB) error {
 			return err
 		}
 	}
+	// A request-started operation (restore, manual check or maintenance,
+	// snapshot or job deletion, vault password change, settings save or
+	// removal) is queued while it waits for the vault. Queued
+	// means nothing has run yet, so there is nothing to recover: it becomes
+	// interrupted and is not resumed. Queued backups are the exception handled
+	// above; their scheduled occurrence goes back for catch-up. Without this the
+	// record would stay queued forever and keep blocking vault removal.
+	neverStartedRows, err := tx.Query(`SELECT id FROM operations WHERE status='queued' AND kind<>'backup' ORDER BY started_at,id`)
+	if err != nil {
+		return err
+	}
+	neverStartedIDs := []string{}
+	for neverStartedRows.Next() {
+		var operationID string
+		if err := neverStartedRows.Scan(&operationID); err != nil {
+			_ = neverStartedRows.Close()
+			return err
+		}
+		neverStartedIDs = append(neverStartedIDs, operationID)
+	}
+	if err := neverStartedRows.Close(); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE operations SET status='interrupted', finished_at=?
+		WHERE status='queued' AND kind<>'backup'`, formatSortableTimestamp(time.Now())); err != nil {
+		return err
+	}
 	type startupStep struct{ operationID, engine, domain, kind string }
 	startupSteps := []startupStep{}
 	stepRows, err := tx.Query(`SELECT s.operation_id,o.engine,s.domain,s.kind
@@ -565,7 +640,14 @@ func Migrate(db *sql.DB) error {
 	}
 	type startupOperation struct{ id, engine, kind string }
 	startupOperations := []startupOperation{}
-	operationRows, err := tx.Query(`SELECT id,engine,kind FROM operations WHERE status='running' ORDER BY started_at,id`)
+	// A running vault password change is the one exception to "every running
+	// operation becomes interrupted": its saved phase record is the recovery
+	// authority, and startup password recovery (runner.RecoverVaultPasswordChangesOnce,
+	// which runs right after Migrate) resumes it and finishes this record with
+	// the phase outcome. Marking it interrupted here would report a change that
+	// recovery then completes. A queued one never started and is interrupted
+	// above like every other queued operation.
+	operationRows, err := tx.Query(`SELECT id,engine,kind FROM operations WHERE status='running' AND kind<>? ORDER BY started_at,id`, VaultPasswordChangeKind)
 	if err != nil {
 		return err
 	}
@@ -641,7 +723,7 @@ func Migrate(db *sql.DB) error {
 	if _, err := tx.Exec(`UPDATE operations
 		SET status = 'interrupted',
 			finished_at = ?
-		WHERE status = 'running'`, interruptedAt); err != nil {
+		WHERE status = 'running' AND kind <> ?`, interruptedAt, VaultPasswordChangeKind); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`UPDATE operation_steps
@@ -650,10 +732,12 @@ func Migrate(db *sql.DB) error {
 		WHERE status = 'running'`, interruptedAt); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE repositories SET last_check_status = 'failed' WHERE last_check_status = 'running'`); err != nil {
+	// The running check or maintenance operation was just marked interrupted,
+	// so the vault's own last status says the same instead of failed.
+	if _, err := tx.Exec(`UPDATE repositories SET last_check_status = 'interrupted' WHERE last_check_status = 'running'`); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`UPDATE repositories SET last_maintenance_status = 'failed' WHERE last_maintenance_status = 'running'`); err != nil {
+	if _, err := tx.Exec(`UPDATE repositories SET last_maintenance_status = 'interrupted' WHERE last_maintenance_status = 'running'`); err != nil {
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -669,7 +753,7 @@ func Migrate(db *sql.DB) error {
 	}
 	// Startup status repair remains authoritative even when its corresponding
 	// local diagnostic append fails; the file can be absent or incomplete.
-	for _, operationID := range queuedIDs {
+	for _, operationID := range append(queuedIDs, neverStartedIDs...) {
 		var engine, kind string
 		_ = db.QueryRow(`SELECT engine,kind FROM operations WHERE id=?`, operationID).Scan(&engine, &kind)
 		_ = operationlog.AppendFinal(operationID, engine, kind, "interrupted", "Application stopped before the operation started.")

@@ -17,12 +17,17 @@ const notificationContract = {
   'notifications.message.failed': 'taskName',
   'notifications.message.sourceUnavailable30Days': 'jobName',
   'notifications.message.vaultUnavailable30Days': 'jobName,vaultName',
+  'notifications.message.vaultReconnectRequired': '',
   'notifications.appUpdate.title': '',
   'notifications.appUpdate.message': '',
   'notifications.task.backup': 'name',
   'notifications.task.backupTarget': 'name,target',
   'notifications.task.check': 'name',
   'notifications.task.deleteSnapshot': 'name',
+  'notifications.task.deleteJob': 'name',
+  'notifications.task.changeVaultPassword': 'name',
+  'notifications.task.saveVaultSettings': 'name',
+  'notifications.task.removeVault': 'name',
   'notifications.task.restoreSnapshot': 'name',
   'notifications.task.restoreSelectedItems': 'name',
 };
@@ -113,7 +118,8 @@ if (english) {
   const referenced = new Set();
   for (const file of collectSourceFiles(join(root, 'src'))) {
     const source = readFileSync(file, 'utf8');
-    for (const match of source.matchAll(/\b(?:t|renderMessage)\(\s*["'`]([^"'`]+)["'`]/g)) referenced.add(match[1]);
+    // englishText() reads the English catalog directly for text that must stay in English.
+    for (const match of source.matchAll(/\b(?:t|renderMessage|englishText)\(\s*["'`]([^"'`]+)["'`]/g)) referenced.add(match[1]);
   }
   // Backend notification calls consume the same catalog without appearing in
   // frontend source, so these are explicit cross-process contract keys.

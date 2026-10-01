@@ -29,10 +29,11 @@ import type {
 	OperationLiveResponse,
     Repository,
 } from "../types";
-import { dashboardIssueEvent, logTag } from "./dashboardIssue";
+import { dashboardIssueEvent, logTag, logTagLabel } from "./dashboardIssue";
 import type { TimelineEvent } from "./dashboardIssue";
 import { formatReadableLog, noSummaryDiagnosticsLine } from "./nativeLogFormat";
 import { NativeLogPager, retainReadableLog } from "./nativeLogPaging";
+import { passwordChangeStillBlocksVault } from "../services/trackedOperations";
 
 type TimelineFilter = "all" | "backups" | "restores" | "checks" | "maintenance" | "other" | "issues";
 
@@ -65,6 +66,9 @@ const logPresentation = (kind?: string) => ({concise: true, operationKind: kind,
 // of the formatted readable string, the diagnostics, or Raw, so log
 // formatting and paging are unaffected.
 const retryAdviceOperationKinds = new Set(["backup", "restore", "check", "maintenance", "prune"]);
+// Text inside the log output is never translated, so the advice is English in
+// every language, like the engine output around it.
+const retryAdvice = "Retrying this backup/restore/integrity check/maintenance will often automatically fix errors and warnings.";
 
 function withRetryAdvice(readable: string, kind?: string): ReactNode {
     if (!kind || !retryAdviceOperationKinds.has(kind)) return readable;
@@ -73,7 +77,7 @@ function withRetryAdvice(readable: string, kind?: string): ReactNode {
     const rest = headingEnd < 0 ? "" : readable.slice(headingEnd);
     const firstSummaryLine = rest.slice(1).split("\n", 1)[0];
     if (headingEnd < 0 || !firstSummaryLine || firstSummaryLine === noSummaryDiagnosticsLine) return readable;
-    return <>{heading}{"\n"}<strong><em>{t("ui.pages.overview.retryAdvice")}</em></strong>{rest}</>;
+    return <>{heading}{"\n"}<strong><em>{retryAdvice}</em></strong>{rest}</>;
 }
 
 async function loadDashboardSnapshot(operationID: string, requiredOperationIDs: string[] = []) {
@@ -168,7 +172,92 @@ function operationTag(entry: OperationEntry) {
     if (entry.status === "completed_with_issues") return t("ui.operation.completedWithIssues");
     if (entry.status === "partial") return t("ui.operation.partial");
     if (entry.status === "success" && (entry.kind === "backup" || entry.kind === "restore")) return t("ui.operation.success");
-    return entry.kind;
+    return operationKindLabel(entry.kind);
+}
+
+// Unknown kinds (for example from a newer backend) keep their internal name.
+function operationKindLabel(kind: string) {
+    switch (kind) {
+        case "backup": return t("ui.operation.kind.backup");
+        case "restore": return t("ui.operation.kind.restore");
+        case "check": return t("ui.operation.kind.check");
+        case "maintenance": return t("ui.operation.kind.maintenance");
+        case "delete": return t("ui.operation.kind.delete");
+        case "delete_job": return t("ui.operation.kind.deleteJob");
+        case "vault_password": return t("ui.operation.kind.vaultPassword");
+        case "vault_settings": return t("ui.operation.kind.vaultSettings");
+        case "remove_vault": return t("ui.operation.kind.removeVault");
+        default: return kind;
+    }
+}
+
+// The tone of a finished operation, shared by the dashboard timeline and the
+// live log header. A skipped or unfamiliar persisted result is not proof of
+// failure, so only known failure outcomes use red and the rest get the
+// warning color.
+function operationOutcomeTone(status: OperationEntry["status"]): "ok" | "danger" | "warn" {
+    return status === "success" ? "ok" : ["failed", "interrupted", "partial", "reconnect_required"].includes(status) ? "danger" : "warn";
+}
+
+// The live log header is colored by the operation's status, not by its label:
+// a successful check shows its own name, in green. Queued and running work
+// has no outcome yet, so it keeps the normal text color.
+function operationHeaderTone(status: OperationEntry["status"]) {
+    return status === "queued" || status === "running" ? undefined : operationOutcomeTone(status);
+}
+
+type OperationStep = NonNullable<OperationEntry["steps"]>[number];
+
+// Step kinds are internal names; show a plain name instead. An unknown kind
+// keeps its internal name with spaces for underscores. The names are nouns
+// ("Vault storage check", not "Checking the vault's storage") because each one
+// sits next to its status, which may already be finished or failed.
+function operationStepLabel(kind: string) {
+    switch (kind) {
+        case "backup": return t("ui.operation.kind.backup");
+        case "restore": return t("ui.operation.kind.restore");
+        case "repository_integrity_check": return t("ui.operation.kind.check");
+        case "maintenance": return t("ui.operation.kind.maintenance");
+        case "snapshot_deletion": return t("ui.operation.kind.delete");
+        case "retention": return t("ui.operation.step.retention");
+        case "integrity_cache_prepare": return t("ui.operation.step.prepareIntegrityCheck");
+        case "integrity_cache_cleanup": return t("ui.operation.step.cleanUpIntegrityCheck");
+        case "kopia_policy_reconciliation": return t("ui.operation.step.kopiaPolicies");
+        // The writer validation confirms the vault's owner (and, for Kopia,
+        // its maintenance owner) before anything writes; it checks ownership,
+        // not write access.
+        case "repository_writer_storage_validation":
+        case "integrity_owner_admission": return t("ui.operation.step.vaultOwnership");
+        case "repository_storage_admission": return t("ui.operation.step.vaultStorage");
+        case "integrity_owner_revalidation":
+        case "maintenance_owner_revalidation": return t("ui.operation.step.vaultOwnershipRecheck");
+        case "integrity_owner_final_admission": return t("ui.operation.step.vaultOwnershipFinal");
+        case "native_process_admission": return t("ui.operation.step.engineStartCheck");
+        case "output_processing": return t("ui.operation.step.engineOutput");
+        case "backup_output_processing": return t("ui.operation.step.backupOutput");
+        case "retention_output_processing": return t("ui.operation.step.retentionOutput");
+        case "backup_admission": return t("ui.operation.step.backupPreparation");
+        case "before_script": return t("ui.operation.step.beforeScript");
+        case "after_script": return t("ui.operation.step.afterScript");
+        case "metadata_cache":
+        case "metadata_cache_invalidation": return t("ui.operation.step.snapshotList");
+        case "notification": return t("ui.operation.step.notification");
+        case "vault_password_blocked": return t("ui.operation.step.passwordChangeBlocked");
+        case "recovery_profile_publication": return t("ui.operation.step.recoveryProfile");
+        default: return kind.replaceAll("_", " ");
+    }
+}
+
+function operationStepStatus(status: OperationStep["status"]): { label: string; tone?: string } {
+    switch (status) {
+        case "running": return { label: t("ui.operation.running"), tone: "running" };
+        case "succeeded": return { label: t("ui.operation.step.status.succeeded"), tone: "ok" };
+        case "failed": return { label: t("ui.operation.failed"), tone: "danger" };
+        case "interrupted": return { label: t("ui.operation.stopped"), tone: "danger" };
+        case "warning": return { label: t("ui.operation.step.status.warning"), tone: "warn" };
+        case "skipped": return { label: t("ui.operation.step.status.skipped") };
+        default: return { label: status };
+    }
 }
 
 function operationTitle(entry: OperationEntry) {
@@ -176,9 +265,23 @@ function operationTitle(entry: OperationEntry) {
     return `${entry.title}${elapsed !== "—" ? ` · ${elapsed}` : ""}`;
 }
 
+// activeOperationSummary is the "kind · engine · progress" line of an active
+// operation. A job deletion has no engine of its own (a job can target Restic
+// and Kopia vaults at once), so empty parts are left out: it shows
+// "Job deletion · Waiting for the vault" rather than
+// "Job deletion ·  · Waiting for the vault".
+function activeOperationSummary(entry: OperationEntry) {
+    return [operationKindLabel(entry.kind), entry.engine, activeOperationProgress(entry)].filter(Boolean).join(" · ");
+}
+
 function activeOperationProgress(entry: OperationEntry) {
     if (entry.kind !== "backup") {
-        return entry.status === "queued" ? t("ui.overview.operationQueuedAt", { time: timeAgo(entry.startedAt) }) : t("ui.overview.operationStartedAt", { time: timeAgo(entry.startedAt) });
+        // A restore, manual check or maintenance, snapshot or job deletion, or
+        // vault password change, settings save or removal is queued only while
+        // it waits for a busy vault (a job deletion or vault removal also waits
+        // for the job's or vault's other work first). Backups keep their queued wording: they
+        // also wait for a free run slot.
+        return entry.status === "queued" ? t("ui.overview.waitingForVault") : t("ui.overview.operationStartedAt", { time: timeAgo(entry.startedAt) });
     }
     const backup = entry.steps?.find((step) =>
         step.domain === "native" && step.kind === "backup" && step.status === "succeeded"
@@ -195,7 +298,7 @@ function activeOperationProgress(entry: OperationEntry) {
 
 function backupCompletedWithIssues(operation?: OperationEntry, event?: TimelineEvent) {
     return (operation?.kind ?? event?.operationKind) === "backup" &&
-        (operation ? operation.status === "completed_with_issues" : event?.tag === "completed with issues");
+        (operation?.status ?? event?.operationStatus) === "completed_with_issues";
 }
 
 export default function Overview() {
@@ -579,7 +682,7 @@ export default function Overview() {
     const readableLog = (text: string, operation?: OperationEntry, event?: TimelineEvent,
         page?: OperationLogResponse | null, live = false) => {
         return formatReadableLog(text, {
-            operationStatus: operation?.status ?? (event?.tag === "completed with issues" ? "completed_with_issues" : undefined),
+            operationStatus: operation?.status ?? event?.operationStatus,
             operationKind: operation?.kind ?? event?.operationKind,
             engine: operation?.engine ?? event?.engine ?? openOutputEngine,
         }, live, page?.readableBody, page?.readableDiagnostics);
@@ -608,10 +711,9 @@ export default function Overview() {
                 kind: "operation",
                 operationKind: operation.kind,
                 operationID: operation.id,
+                operationStatus: operation.status,
 				engine: operation.engine,
-                // A skipped or unfamiliar persisted result is not proof of failure.
-                // Keep the warning fallback; only known failure outcomes use red.
-                tone: operation.status === "success" ? "ok" : ["failed", "interrupted", "partial", "reconnect_required"].includes(operation.status) ? "danger" : "warn",
+                tone: operationOutcomeTone(operation.status),
                 tag: operationTag(operation),
                 title: operationTitle({ ...operation, title }),
                 outputAvailable: true,
@@ -626,7 +728,7 @@ export default function Overview() {
                 timestamp: entry.timestamp,
                 kind: "log",
                 tone: entry.level === "ERROR" ? "danger" : entry.level === "WARN" ? "warn" : "faint",
-                tag: logTag(entry),
+                tag: logTagLabel(logTag(entry)),
                 title: entry.message,
                 outputAvailable: false,
                 issue,
@@ -1045,7 +1147,7 @@ export default function Overview() {
                                     ) : (
                                         <strong>{operation.title}</strong>
                                     )}
-                                    <span>{operation.kind} · {operation.engine} · {activeOperationProgress(operation)}</span>
+                                    <span className="active-operation-summary">{activeOperationSummary(operation)}</span>
 									{activeRepositoryByID.get(operation.repositoryId || "")?.coldStorage && ["restore", "check", "maintenance"].includes(operation.kind) && <span>{t("ui.pages.overview.cold.storage.retrieval.can.take.hours.or.days.replicaro.is.waiting.for")}</span>}
                                 </div>
 							</button></Tooltip>
@@ -1062,14 +1164,15 @@ export default function Overview() {
 				>
 					<div className="operation-detail">
 						<div className="operation-detail-state">
-							<strong>{operationTag(detailedOperation)}</strong>
-							<span>{detailedOperation.kind} · {detailedOperation.engine} · {activeOperationProgress(detailedOperation)}</span>
+							<strong className={operationHeaderTone(detailedOperation.status)}>{operationTag(detailedOperation)}</strong>
+							<span>{activeOperationSummary(detailedOperation)}</span>
 						</div>
 						{(detailedOperation.steps ?? []).length > 0 && (
 							<div className="operation-detail-steps" aria-label={t("ui.pages.overview.operation.steps")}>
-								{detailedOperation.steps?.map((step) => (
-									<div key={step.id}><strong>{step.kind.replaceAll("_", " ")}</strong><span>{step.status}</span></div>
-								))}
+								{detailedOperation.steps?.map((step) => {
+									const status = operationStepStatus(step.status);
+									return <div key={step.id}><strong>{operationStepLabel(step.kind)}</strong><span className={status.tone}>{status.label}</span></div>;
+								})}
 							</div>
 						)}
 						<div className="modal-section-label">{t("ui.pages.overview.live.log")}</div>
@@ -1082,16 +1185,19 @@ export default function Overview() {
 							<p className="muted">{t("ui.pages.overview.waiting.for.output")}</p>
 						) : (
 							<pre className="output operation-live-log" aria-live="polite">{[
+								// The live log is never translated, including this marker;
+								// the engine output after it is shown exactly as written.
 								...(operationDetail.live.truncated ? ["[Earlier live output omitted]"] : []),
 								readableLog(operationDetail.live.entries.map((entry) => entry.text).join("\n"), detailedOperation, undefined, undefined, true),
 							].join("\n")}</pre>
 						) : (
 							<>
+								{/* Nothing inside the log output is translated, including these load states. */}
 								<pre className="output operation-live-log">{completedOperationLogLoadState === "failed"
-									? t("ui.pages.overview.log.could.not.be.loaded")
+									? "Log could not be loaded."
 									: completedOperationLogLoadState === "pending"
-										? t("ui.pages.overview.loading.log")
-										: completedOperationLog ? showRawLog ? completedOperationLog : completedReadableLog(completedOperationLog, detailedOperation, undefined, completedOperationLogPage) : t("ui.pages.overview.no.output.recorded")}</pre>
+										? "Loading log…"
+										: completedOperationLog ? showRawLog ? completedOperationLog : completedReadableLog(completedOperationLog, detailedOperation, undefined, completedOperationLogPage) : "(no output recorded)"}</pre>
 								{showRawLog && operationLogHasMultiplePages(completedOperationLogPage) && completedOperationLogPage && (
 									<div className="log-page-controls">
 										<button type="button" className="btn" disabled={completedOperationLogPage.offset === 0 || completedOperationLogLoadState === "pending"} onClick={() => void loadCompletedOperationLogPage(completedOperationLogPage.previousOffset)}>{t("ui.pages.overview.previous.log.page")}</button>
@@ -1168,12 +1274,22 @@ export default function Overview() {
                                         </button>
                                     )}
                                 </div>
+								{/* A password change that stopped before commit blocks every
+								    operation on the vault until it is retried; its issue says
+								    so and leads to the vault card's Continue password change.
+								    Only while it is the vault's newest password change: after a
+								    later change or Retry the old issue no longer describes the
+								    vault. */}
+								{event.operationKind === "vault_password" && passwordChangeStillBlocksVault(operations.find((operation) => operation.id === event.operationID), operations) && (
+									<Link className="text-button" to="/protect#vaults">{t("ui.protect.vaultPasswordChangeBlocking")}</Link>
+								)}
 								{openOutput === event.id && (
 									<div>
 										<button type="button" className="text-button" aria-pressed={showRawLog} onClick={() => setShowRawLog((raw) => !raw)}>{showRawLog ? t("ui.pages.overview.show.readable.log") : t("ui.pages.overview.show.raw.log")}</button>
+										{/* Nothing inside the log output is translated, including these load states. */}
                                         <pre className="output timeline-output">{openOutputLoadFailed
-											? t("ui.pages.overview.log.could.not.be.loaded")
-											: openOutputLoading ? t("ui.pages.overview.loading.log") : openOutputText ? showRawLog ? openOutputText : completedReadableLog(openOutputText, operations.find(operation => operation.id === event.operationID), event, openOutputPage) : t("ui.pages.overview.no.output.recorded")}</pre>
+											? "Log could not be loaded."
+											: openOutputLoading ? "Loading log…" : openOutputText ? showRawLog ? openOutputText : completedReadableLog(openOutputText, operations.find(operation => operation.id === event.operationID), event, openOutputPage) : "(no output recorded)"}</pre>
 										{showRawLog && event.operationID && operationLogHasMultiplePages(openOutputPage) && openOutputPage && (
 											<div className="log-page-controls">
 												<button type="button" className="btn" disabled={openOutputPage.offset === 0} onClick={() => void loadTimelineOperationLogPage(event.operationID!, openOutputPage.previousOffset)}>{t("ui.pages.overview.previous.log.page")}</button>

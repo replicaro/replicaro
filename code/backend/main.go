@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -84,10 +85,55 @@ type startupOptions struct {
 	// environment-variable or settings alias, and is never handed to desktop,
 	// notification, rendezvous, or rclone code, which all stay on loopback.
 	lanOrigins runtimeendpoint.LANOrigins
+	// unknownOptions holds the names of unrecognized "--" arguments, without
+	// any "=value" part, so run() can warn about them. A mistyped option can
+	// still carry a password or token in its value, so the value is dropped
+	// here and never reaches the log.
+	unknownOptions []string
+	// help is set by --help or -h. When it is set, every other field is left
+	// empty and run() only prints startupUsage.
+	help bool
 }
 
+// startupUsage is printed for --help and -h. Keep it in step with the cases in
+// parseStartupOptions, and keep lines within 80 columns so it reads well in a
+// plain terminal.
+const startupUsage = `Usage: replicaro [options]
+
+Options:
+  --loopback-port=<port>
+      Use exactly this loopback port, and fail to start if it is busy.
+      Default: 9460, or any free port.
+  --container-published-port=<port>
+      Docker package only: the host port the UI is published on.
+  --lan-origin=<origin>
+      Accept browsers coming through your HTTPS reverse proxy at this
+      address. Repeatable. Needs one of the port options above. On Linux
+      outside the Docker package, this also keeps Start at login on.
+  --rclone-auth-no-open-browser
+      Show cloud sign-in links instead of opening a browser, for headless
+      installs. On Linux outside the Docker package, this also
+      keeps Start at login on.
+  --headless
+      Another name for --rclone-auth-no-open-browser.
+  --help, -h
+      Show this help and exit.
+`
+
 func parseStartupOptions(arguments []string) (startupOptions, error) {
+	// Help wins over everything else on the command line, including options
+	// that would otherwise be rejected, so asking for help always gets an
+	// answer. Repeating it is harmless.
+	for _, argument := range arguments {
+		if argument == "--help" || argument == "-h" {
+			return startupOptions{help: true}, nil
+		}
+	}
 	var options startupOptions
+	// --headless is an alias of --rclone-auth-no-open-browser, and both set the
+	// same field. Each spelling is tracked on its own so passing both is
+	// accepted while repeating either one is still rejected.
+	var sawNoOpenBrowser, sawHeadless bool
 	for _, argument := range arguments {
 		switch {
 		case strings.HasPrefix(argument, "--loopback-port="):
@@ -118,17 +164,29 @@ func parseStartupOptions(arguments []string) (startupOptions, error) {
 		case argument == "--container-published-port":
 			return startupOptions{}, fmt.Errorf("--container-published-port must use exactly --container-published-port=<port>")
 		case argument == "--rclone-auth-no-open-browser":
-			if options.rcloneAuthNoOpenBrowser {
+			if sawNoOpenBrowser {
 				return startupOptions{}, fmt.Errorf("--rclone-auth-no-open-browser may be supplied only once")
 			}
+			sawNoOpenBrowser = true
 			options.rcloneAuthNoOpenBrowser = true
 		case strings.HasPrefix(argument, "--rclone-auth-no-open-browser="):
 			return startupOptions{}, fmt.Errorf("--rclone-auth-no-open-browser does not accept a value")
+		case argument == "--headless":
+			// Only an easier name to put in a service drop-in. Keep it a pure
+			// alias: anything headless-specific belongs to
+			// rcloneAuthNoOpenBrowser, so both spellings always behave the same.
+			if sawHeadless {
+				return startupOptions{}, fmt.Errorf("--headless may be supplied only once")
+			}
+			sawHeadless = true
+			options.rcloneAuthNoOpenBrowser = true
+		case strings.HasPrefix(argument, "--headless="):
+			return startupOptions{}, fmt.Errorf("--headless does not accept a value")
 		case strings.HasPrefix(argument, "--lan-origin="):
 			// Unlike the other options this one repeats, so one install can be
 			// reached by, say, a LAN hostname and a VPN hostname. There are no
-			// numbered or comma-separated forms: unknown arguments are ignored
-			// below, so a "--lan-origin2" would silently do nothing.
+			// numbered or comma-separated forms: a "--lan-origin2" falls through
+			// to the unknown-option warning below and otherwise does nothing.
 			origin, err := runtimeendpoint.ParseLANOrigin(strings.TrimPrefix(argument, "--lan-origin="))
 			if err != nil {
 				return startupOptions{}, fmt.Errorf("--lan-origin: %w", err)
@@ -136,42 +194,66 @@ func parseStartupOptions(arguments []string) (startupOptions, error) {
 			options.lanOrigins = append(options.lanOrigins, origin)
 		case argument == "--lan-origin":
 			return startupOptions{}, fmt.Errorf("--lan-origin must use exactly --lan-origin=<origin>")
+		case strings.HasPrefix(argument, "--help="), strings.HasPrefix(argument, "-h="):
+			// Handled like the other options that take no value, which reject
+			// one (see --headless=), rather than showing help or ignoring it.
+			// That includes -h=, even though other single-dash arguments are
+			// ignored: -h is a known option, so a value on it is a mistake worth
+			// reporting.
+			name, _, _ := strings.Cut(argument, "=")
+			return startupOptions{}, fmt.Errorf("%s does not accept a value", name)
 		default:
-			// Preserve the baseline CLI behavior: arguments outside the four
-			// Replicaro-owned namespaces are ignored.
-			continue
+			// Unrecognized arguments are ignored, but "--" ones are recorded so
+			// run() can warn about a typo such as "--headles" that would
+			// otherwise leave the intended option quietly unset. Do not make
+			// this fail startup: an older build started from a drop-in that
+			// passes a newer option must keep working, and launchers may add
+			// arguments of their own. Arguments without "--" stay silent.
+			if strings.HasPrefix(argument, "--") {
+				name, _, _ := strings.Cut(argument, "=")
+				options.unknownOptions = append(options.unknownOptions, name)
+			}
 		}
 	}
+	// The checks below fail on a combination of options, and a mistyped name
+	// (say "--loopback-prt") is the most likely reason the combination looks
+	// wrong. Keep the unknown names on these errors so run() can still warn
+	// about the typo next to the error it caused.
 	if options.loopbackPort != nil && options.containerPublishedPort != nil {
-		return startupOptions{}, fmt.Errorf("--loopback-port and --container-published-port are mutually exclusive")
+		return startupOptions{unknownOptions: options.unknownOptions}, fmt.Errorf("--loopback-port and --container-published-port are mutually exclusive")
 	}
 	// The reverse proxy is configured with a fixed upstream port. Without an
 	// explicit port a host install falls back to a random loopback port when
 	// 9460 is busy, and the proxy would quietly point at nothing (or at
 	// something else), so require the port to be pinned.
 	if len(options.lanOrigins) > 0 && options.loopbackPort == nil && options.containerPublishedPort == nil {
-		return startupOptions{}, fmt.Errorf("--lan-origin requires --loopback-port=<port> or --container-published-port=<port>")
+		return startupOptions{unknownOptions: options.unknownOptions}, fmt.Errorf("--lan-origin requires --loopback-port=<port> or --container-published-port=<port>")
 	}
 	return options, nil
 }
 
-// headlessLANMode is Linux with at least one --lan-origin, outside the
-// container package. Replicaro has no other reliable signal that it runs as a
-// headless user service, and in that layout Start at login is what keeps
-// replicaro.service enabled (see keepStartAtLoginOn). The container package is
-// excluded because it never manages a login service. On other platforms Start
-// at login is a normal desktop preference with no headless service behind
-// it, and --lan-origin doesn't change how it works.
-func headlessLANMode(goos string, options startupOptions) bool {
-	return goos == "linux" && len(options.lanOrigins) > 0 && options.containerPublishedPort == nil
+// headlessServiceMode is Linux with at least one --lan-origin or with
+// --rclone-auth-no-open-browser (also spelled --headless), outside the
+// container package. Replicaro cannot tell from the environment that it runs
+// as a headless user service: desktop Start at login uses the same systemd
+// user unit, and desktop services often have no display variable. These
+// options are the only reliable signal, and in that layout Start at login is
+// what keeps replicaro.service enabled (see keepStartAtLoginOn). The container
+// package is excluded because it never manages a login service. On other
+// platforms Start at login is a normal desktop preference with no headless
+// service behind it, and these options don't change how it works.
+func headlessServiceMode(goos string, options startupOptions) bool {
+	return goos == "linux" && (len(options.lanOrigins) > 0 || options.rcloneAuthNoOpenBrowser) &&
+		options.containerPublishedPort == nil
 }
 
 // keepStartAtLoginOn saves Start at login as on when it is off, before the
 // desktop settings are applied. On Linux, applying Start at login off runs
 // `systemctl --user disable replicaro.service` on every start, which would
 // leave a headless install unable to come back after a reboot. The settings API
-// enforces the same rule for later saves. Removing --lan-origin leaves the
-// setting on, and the user can then turn it off as usual.
+// enforces the same rule for later saves. Removing the options that select
+// headlessServiceMode leaves the setting on, and the user can then turn it off
+// as usual.
 //
 // This runs before HTTP is published and before any background worker starts,
 // so nothing else can be writing settings at the same time.
@@ -369,7 +451,12 @@ type shutdownHooks struct {
 	rcloneAuth                                                           func() error
 	http, scheduler, runner, metadata, statistics, profiles, kopiaPolicy func(context.Context) error
 	kopiaReconnect, resticRecovery                                       func(context.Context) error
-	updater, notifications, database                                     func(context.Context) error
+	// operations joins the request-started background operations (restore,
+	// manual check and maintenance, snapshot and job deletion): it waits for
+	// each to save its final state. Their cancel happens earlier, before the
+	// HTTP drain; see shutdownWithTrackedOperations.
+	operations                       func(context.Context) error
+	updater, notifications, database func(context.Context) error
 }
 
 var recoverKopiaFilesystemReconnects = runner.RecoverKopiaFilesystemReconnects
@@ -568,7 +655,7 @@ func shutdownInOrder(ctx context.Context, hooks shutdownHooks) error {
 	// resources stay open.
 	producers := []func(context.Context) error{
 		hooks.scheduler, hooks.statistics, hooks.runner, hooks.metadata, hooks.profiles, hooks.kopiaPolicy,
-		hooks.kopiaReconnect, hooks.resticRecovery,
+		hooks.kopiaReconnect, hooks.resticRecovery, hooks.operations,
 	}
 	done := make(chan error, len(producers))
 	pending := 0
@@ -617,11 +704,55 @@ func shutdownInOrder(ctx context.Context, hooks shutdownHooks) error {
 	return errors.Join(errs...)
 }
 
+// shutdownWithTrackedOperations cancels the request-started background
+// operations before anything else and then runs shutdownInOrder with their
+// join as one of the producers. The cancel has to come before the HTTP drain:
+// a request can be waiting for a vault lock that one of these workers holds
+// (for example a vault ownership read behind a running restore). If the
+// workers were only cancelled in the producer step, that request would keep
+// the drain busy until the shutdown deadline, shutdownInOrder would return
+// early, and the worker would never be cancelled or record its interrupted
+// state. Startup Restic recovery is cancelled early in run for the same reason.
+func shutdownWithTrackedOperations(ctx context.Context, operations *operationruntime.Manager, hooks shutdownHooks) error {
+	operations.BeginStop()
+	hooks.operations = operations.Stop
+	return shutdownInOrder(ctx, hooks)
+}
+
 func shutdownHTTPServer(ctx context.Context, server *http.Server) error {
 	if err := server.Shutdown(ctx); err != nil {
 		return errors.Join(err, server.Close())
 	}
 	return nil
+}
+
+// httpShutdownHook gives every request on server a base context that is
+// cancelled when shutdown begins, and returns the HTTP shutdown step that does
+// that cancel right before shutdownHTTPServer. It has to be called before
+// Serve, because Serve reads BaseContext once.
+//
+// http.Server.Shutdown closes the listener and waits for active requests, but
+// it never cancels their contexts. Several foreground actions (connecting a
+// vault, ownership takeover and the ownership status read, credential
+// rotation, cloud sign-in apply, the existing-vault Check) wait on
+// r.Context() for a vault lock. When a scheduled backup or another runner
+// task holds that lock, such a request would keep the drain busy until the
+// shutdown deadline; shutdownInOrder then stops at the HTTP step, so the
+// scheduler, runner and workers are never stopped and the database is never
+// closed. Cancelling the base context ends those waits at once. A request that
+// is still waiting has not changed anything yet. A request already past its
+// wait gets the same cancellation a closed browser tab gives it, which
+// foreground work has to handle anyway. Background operations a request
+// started run on the operation runtime's lifetime, not on the request
+// context, so they are unaffected here and are still stopped and joined by
+// shutdownWithTrackedOperations.
+func httpShutdownHook(server *http.Server) func(context.Context) error {
+	requests, cancelRequests := context.WithCancel(context.Background())
+	server.BaseContext = func(net.Listener) context.Context { return requests }
+	return func(ctx context.Context) error {
+		cancelRequests()
+		return shutdownHTTPServer(ctx, server)
+	}
 }
 
 func normalizeHTTPServeError(err error) error {
@@ -653,6 +784,25 @@ func startupRollbackHooks(
 
 func run() (result error) {
 	options, err := parseStartupOptions(os.Args[1:])
+	// Answer help before any startup work, so asking for it never starts
+	// Replicaro, never hands off to (and so never opens) a running instance,
+	// and never touches app data, the instance lock, or settings.
+	//
+	// The Windows build is a GUI program with no console, so there the text is
+	// only visible when output is redirected, as in
+	// "replicaro.exe --help > help.txt". Attaching to the parent console would
+	// not help much: the shell doesn't wait for a GUI program, so the text
+	// would land after its next prompt. A write error is ignored for the same
+	// reason: with no console there is nowhere to report it.
+	if options.help {
+		_, _ = io.WriteString(os.Stdout, startupUsage)
+		return nil
+	}
+	// Warn before checking the error: the parser keeps the unknown names when
+	// a combination of options is rejected, and the typo is usually the cause.
+	for _, name := range options.unknownOptions {
+		log.Printf("ignoring unknown option %q", name)
+	}
 	if err != nil {
 		return err
 	}
@@ -746,7 +896,8 @@ func run() (result error) {
 		return fmt.Errorf("reconcile native rclone vault configs: %w", err)
 	}
 	passwordRecoveryCtx, cancelPasswordRecovery := context.WithTimeout(context.Background(), 30*time.Minute)
-	if err := runner.RecoverVaultPasswordChangesOnce(passwordRecoveryCtx, db); err != nil {
+	sendRecoveredPasswordNotifications, err := runner.RecoverVaultPasswordChangesOnce(passwordRecoveryCtx, db)
+	if err != nil {
 		cancelPasswordRecovery()
 		_ = db.Close()
 		return fmt.Errorf("recover interrupted vault-password changes: %w", err)
@@ -757,10 +908,10 @@ func run() (result error) {
 		_ = db.Close()
 		return err
 	}
-	if headlessLANMode(runtime.GOOS, options) {
+	if headlessServiceMode(runtime.GOOS, options) {
 		if err := keepStartAtLoginOn(db, &settings); err != nil {
 			_ = db.Close()
-			return fmt.Errorf("keep Start at login on for headless LAN mode: %w", err)
+			return fmt.Errorf("keep Start at login on for headless service mode: %w", err)
 		}
 	}
 	if err := desktop.ApplySettings(db); err != nil {
@@ -812,12 +963,13 @@ func run() (result error) {
 	} else {
 		server, closeRcloneAuth = api.NewServerAtWithReaderAndRuntime(
 			db, readDB, endpoint, options.lanOrigins, record, desktop.RestoreWindow,
-			options.rcloneAuthNoOpenBrowser, headlessLANMode(runtime.GOOS, options), operationRuntime, updater,
+			options.rcloneAuthNoOpenBrowser, headlessServiceMode(runtime.GOOS, options), operationRuntime, updater,
 		)
 	}
 	defer func() {
 		result = errors.Join(result, closeRcloneAuth())
 	}()
+	shutdownHTTP := httpShutdownHook(server)
 	serveDone, err := runtimeOwner.ServeAndPublish(server)
 	if err != nil {
 		rollbackCtx, cancelRollback := context.WithTimeout(context.Background(), 10*time.Second)
@@ -839,7 +991,13 @@ func run() (result error) {
 	stopScheduler := scheduler.StartContextWithRuntime(db, operationRuntime)
 	stopProfiles := profilesync.StartContext(db)
 	updater.StartAutomatic(updateCtx)
-	serveErr := desktop.Run(func() error { return <-serveDone })
+	serveErr := desktop.Run(func() error {
+		// Startup password recovery registered these before the desktop
+		// integration existed; desktop.Run has set it up by the time it calls
+		// this, so a native notification is no longer dropped.
+		sendRecoveredPasswordNotifications()
+		return <-serveDone
+	})
 
 	// Close HTTP admission and drain/cancel request contexts before any handler
 	// can recreate or submit work to a worker coordinator being torn down.
@@ -851,8 +1009,8 @@ func run() (result error) {
 	// native deadline during normal operation and does not replay interrupted work.
 	resticRecovery.cancel()
 	cancelUpdate()
-	shutdownErr := shutdownInOrder(shutdownCtx, shutdownHooks{
-		http:           func(ctx context.Context) error { return shutdownHTTPServer(ctx, server) },
+	shutdownErr := shutdownWithTrackedOperations(shutdownCtx, operationRuntime, shutdownHooks{
+		http:           shutdownHTTP,
 		rcloneAuth:     closeRcloneAuth,
 		updater:        updater.Wait,
 		scheduler:      stopScheduler,

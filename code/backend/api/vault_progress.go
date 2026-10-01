@@ -86,6 +86,15 @@ func withVaultProgress(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// With full duplex on, a handler that returns before reading the whole
+		// body leaves net/http to drain it after the handler, and that drain
+		// races the server's own keep-alive read for the next request ("invalid
+		// concurrent Body.Read call"). Closing the connection after the response
+		// skips the keep-alive read, so leftover body bytes are never parsed as
+		// another request. These requests only come from vault create/connect,
+		// so giving up keep-alive for them costs nothing noticeable. Set it here
+		// so the admission rejection below carries it too.
+		w.Header().Set("Connection", "close")
 		// Admission also supplies CORS and security headers on the outer stream.
 		// The normal route retains its own check and remains the request authority.
 		if !secureAPIRequest(w, r) {

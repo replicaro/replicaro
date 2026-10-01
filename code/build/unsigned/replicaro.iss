@@ -76,6 +76,16 @@ Name: "{group}\Replicaro"; Filename: "{app}\replicaro.exe"; WorkingDir: "{app}"
 
 [Registry]
 Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: none; ValueName: "Replicaro"; Flags: uninsdeletevalue dontcreatekey
+; Notification app IDs. The app registers these itself when it first shows a
+; notification of each kind (backend/desktop/windows_toast.go), so installing
+; creates nothing here; the entries only remove the keys on uninstall. The
+; plain "Replicaro" key is the success ID used by older versions. The app
+; deletes it the next time it shows a notification, so keep it here for
+; machines where that has not happened yet, or an older version ran again.
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\Replicaro.Success"; ValueType: none; Flags: uninsdeletekey dontcreatekey
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\Replicaro.Warning"; ValueType: none; Flags: uninsdeletekey dontcreatekey
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\Replicaro.Failure"; ValueType: none; Flags: uninsdeletekey dontcreatekey
+Root: HKCU; Subkey: "Software\Classes\AppUserModelId\Replicaro"; ValueType: none; Flags: uninsdeletekey dontcreatekey
 
 [Run]
 Filename: "{app}\replicaro.exe"; Description: "{cm:LaunchProgram,Replicaro}"; WorkingDir: "{app}"; Flags: nowait postinstall skipifsilent

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"os"
 	"regexp"
 	"runtime"
@@ -20,6 +19,7 @@ import (
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/operationlog"
+	"github.com/local/replicaro/runner"
 	"github.com/local/replicaro/storageavailability"
 )
 
@@ -234,6 +234,7 @@ func truncateSupportText(value string, limit int) string {
 
 var (
 	supportPrivateKeyStartPattern      = regexp.MustCompile(`(?i)-----BEGIN ([A-Z0-9 ]*PRIVATE KEY)-----`)
+	supportPrivateKeyEndPattern        = regexp.MustCompile(`(?i)-----END ([A-Z0-9 ]*PRIVATE KEY)-----`)
 	supportAuthorizationPattern        = regexp.MustCompile(`(?i)\b(authorization\s*[:=]\s*)[^\r\n]+`)
 	supportCredentialSchemePattern     = regexp.MustCompile(`(?i)\b(basic|bearer|digest)\s+\S+`)
 	supportCredentialAssignmentPattern = regexp.MustCompile(`(?i)\b((?:["'])?(?:password|passphrase|token|secret|api[_ -]?key|access[_ -]?key|secret[_ -]?key|account[_ -]?key|storage[_ -]?key|application[_ -]?key|private[_ -]?key|credential|cookie|[A-Z][A-Z0-9_]*(?:PASSWORD|PASSPHRASE|TOKEN|SECRET|ACCESS_KEY|ACCOUNT_KEY|STORAGE_KEY|APPLICATION_KEY|PRIVATE_KEY|CREDENTIAL|COOKIE)[A-Z0-9_]*|[A-Z][A-Z0-9_]*_(?:PASS|KEY))(?:["'])?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;]+)`)
@@ -252,39 +253,77 @@ var (
 	supportPresentationTag             = regexp.MustCompile(`replicaro-(?:client|machine):[A-Za-z0-9._%@-]+`)
 )
 
+// Restic's --json error records (restore and backup) name the affected file
+// only in "item":"<path>", and the message beside it may not repeat the
+// path. The general path patterns need a separator before the leading "/"
+// and only match ASCII segments, so without this a quoted item value such
+// as "/home/ünïcode/file" would leave its non-ASCII parts behind. Only the
+// quoted JSON key form is matched: the word "item" is common in ordinary
+// messages ("failed item 1234") and must not swallow the rest of a line.
+// JSON escapes are followed so an escaped quote cannot end the value early.
+var supportStructuredItem = regexp.MustCompile(`(?i)(["']item["']\s*:\s*)"(?:[^"\\\r\n]|\\.)*"`)
+
 type supportPrivatePattern struct {
-	pattern     *regexp.Regexp
-	replacement string
+	pattern       *regexp.Regexp
+	replacement   string
+	literalSecret string
 }
 
 func sanitizeSupportDetail(value string, privatePatterns []supportPrivatePattern) string {
+	// Configured values can overlap assignment labels. Keep the original
+	// credential omission decision before any replacement hides those labels.
+	if supportAuthorizationPattern.MatchString(value) || supportCredentialAssignmentPattern.MatchString(value) {
+		return ""
+	}
+	for _, pattern := range []*regexp.Regexp{supportStructuredHost, supportStructuredPath, supportStructuredFilename} {
+		for _, match := range pattern.FindAllStringSubmatchIndex(value, -1) {
+			start, end := match[3], match[1]
+			if pattern == supportStructuredFilename {
+				// This pattern captures the label without its assignment separator.
+				for start < end && strings.ContainsRune(" \t\r\n\f:=", rune(value[start])) {
+					start++
+				}
+			}
+			if start >= end || value[start] != '"' && value[start] != '\'' {
+				continue
+			}
+			// These patterns do not follow escaped quotes. Omit a detail if
+			// the matched range cannot establish the complete quoted value.
+			if end <= start+1 || value[end-1] != value[start] {
+				return ""
+			}
+			backslashes := 0
+			for index := end - 2; index > start && value[index] == '\\'; index-- {
+				backslashes++
+			}
+			if backslashes%2 != 0 {
+				return ""
+			}
+		}
+	}
+	value = redactSupportSecrets(value, privatePatterns)
 	value = strings.ToValidUTF8(value, "�")
 	value = strings.TrimSpace(value)
 	if value == "" {
 		return ""
 	}
-	value = redactSupportPrivateKeys(value)
 	// Native logs remain byte-preserved. The public report copy removes both
 	// internal presentation namespaces explicitly, including percent-encoded
 	// machine labels that ordinary hostname matching cannot recognize.
 	value = supportPresentationTag.ReplaceAllString(value, "[REDACTED PRESENTATION TAG]")
-	for _, pattern := range privatePatterns {
-		if pattern.replacement == "[REDACTED CREDENTIAL]" {
-			value = pattern.pattern.ReplaceAllString(value, pattern.replacement)
-		}
-	}
 	value = supportAuthorizationPattern.ReplaceAllString(value, "$1[REDACTED]")
 	value = supportCredentialSchemePattern.ReplaceAllString(value, "$1 [REDACTED]")
 	value = supportCredentialAssignmentPattern.ReplaceAllString(value, "$1[REDACTED]")
 	value = supportEmailPattern.ReplaceAllString(value, "[REDACTED EMAIL]")
 	for _, pattern := range privatePatterns {
-		if pattern.replacement != "[REDACTED CREDENTIAL]" {
+		if pattern.literalSecret == "" {
 			value = pattern.pattern.ReplaceAllString(value, pattern.replacement)
 		}
 	}
 	value = supportStructuredHost.ReplaceAllString(value, "$1[REDACTED COMPUTER]")
 	value = supportURLPattern.ReplaceAllString(value, "[REDACTED URL]")
 	value = supportNativeRemote.ReplaceAllString(value, "[REDACTED REMOTE]")
+	value = supportStructuredItem.ReplaceAllString(value, "$1[REDACTED PATH]")
 	value = supportStructuredPath.ReplaceAllString(value, "$1[REDACTED PATH]")
 	value = supportWindowsPath.ReplaceAllString(value, "[REDACTED PATH]")
 	value = supportPOSIXPath.ReplaceAllString(value, "$1[REDACTED PATH]")
@@ -319,25 +358,151 @@ func sanitizeSupportDetail(value string, privatePatterns []supportPrivatePattern
 	return truncateSupportText(value, supportDetailByteLimit)
 }
 
-func redactSupportPrivateKeys(value string) string {
-	var result strings.Builder
-	for {
-		match := supportPrivateKeyStartPattern.FindStringSubmatchIndex(value)
-		if match == nil {
-			result.WriteString(value)
-			return result.String()
-		}
-		result.WriteString(value[:match[0]])
-		result.WriteString("[REDACTED CREDENTIAL]")
-		label := value[match[2]:match[3]]
-		endMarker := "-----END " + label + "-----"
-		remainder := value[match[1]:]
-		end := strings.Index(strings.ToUpper(remainder), strings.ToUpper(endMarker))
-		if end < 0 {
-			return result.String()
-		}
-		value = remainder[end+len(endMarker):]
+// Discover sensitive ranges before editing the detail. Their overlapping
+// ranges are combined so no replacement can hide another privacy match and
+// leave its original bytes behind.
+func redactSupportSecrets(value string, patterns []supportPrivatePattern) string {
+	// One marker represents each combined range. Credentials take precedence;
+	// email and presentation markers remain recognizable when paths or filenames
+	// overlap them.
+	const (
+		genericMarker = iota
+		filenameMarker
+		filenameAssignmentMarker
+		pathMarker
+		remoteMarker
+		urlMarker
+		computerMarker
+		emailMarker
+		presentationMarker
+		credentialMarker
+	)
+	replacements := [...]string{
+		"[REDACTED]", "[REDACTED FILENAME]", "=[REDACTED FILENAME]", "[REDACTED PATH]",
+		"[REDACTED REMOTE]", "[REDACTED URL]", "[REDACTED COMPUTER]", "[REDACTED EMAIL]",
+		"[REDACTED PRESENTATION TAG]", "[REDACTED CREDENTIAL]",
 	}
+	var coverage []int
+	var markerStarts []uint8
+	cover := func(start, end int, marker uint8) {
+		if coverage == nil {
+			coverage = make([]int, len(value)+1)
+			markerStarts = make([]uint8, len(value))
+		}
+		coverage[start]++
+		coverage[end]--
+		if marker > markerStarts[start] {
+			markerStarts[start] = marker
+		}
+	}
+	for _, pattern := range patterns {
+		fragment := pattern.literalSecret
+		if fragment == "" {
+			marker := uint8(pathMarker)
+			if pattern.replacement == "[REDACTED COMPUTER]" {
+				marker = computerMarker
+			}
+			for _, match := range pattern.pattern.FindAllStringIndex(value, -1) {
+				cover(match[0], match[1], marker)
+			}
+			continue
+		}
+		for offset := 0; offset < len(value); {
+			index := strings.Index(value[offset:], fragment)
+			if index < 0 {
+				break
+			}
+			start := offset + index
+			cover(start, start+len(fragment), credentialMarker)
+			offset = start + 1
+		}
+	}
+	for offset := 0; offset < len(value); {
+		match := supportPrivateKeyStartPattern.FindStringSubmatchIndex(value[offset:])
+		if match == nil {
+			break
+		}
+		start := offset + match[0]
+		label := value[offset+match[2] : offset+match[3]]
+		end := len(value)
+		for search := offset + match[1]; search < len(value); {
+			closing := supportPrivateKeyEndPattern.FindStringSubmatchIndex(value[search:])
+			if closing == nil {
+				break
+			}
+			if strings.EqualFold(label, value[search+closing[2]:search+closing[3]]) {
+				end = search + closing[1]
+				break
+			}
+			search += closing[1]
+		}
+		cover(start, end, credentialMarker)
+		offset = end
+	}
+	for _, pattern := range []*regexp.Regexp{supportAuthorizationPattern, supportCredentialSchemePattern, supportCredentialAssignmentPattern} {
+		for _, match := range pattern.FindAllStringSubmatchIndex(value, -1) {
+			start := match[3]
+			// The scheme captures only its name; keep the separator outside
+			// the sensitive range, just like an assignment's captured label.
+			if pattern == supportCredentialSchemePattern {
+				for start < match[1] && strings.ContainsRune(" \t\r\n\f", rune(value[start])) {
+					start++
+				}
+			}
+			cover(start, match[1], genericMarker)
+		}
+	}
+	for _, item := range []struct {
+		pattern    *regexp.Regexp
+		marker     uint8
+		keepPrefix bool
+	}{
+		{supportPresentationTag, presentationMarker, false},
+		{supportEmailPattern, emailMarker, false},
+		{supportStructuredHost, computerMarker, true},
+		{supportURLPattern, urlMarker, false},
+		{supportNativeRemote, remoteMarker, false},
+		{supportStructuredItem, pathMarker, true},
+		{supportStructuredPath, pathMarker, true},
+		{supportWindowsPath, pathMarker, false},
+		{supportPOSIXPath, pathMarker, true},
+		{supportRelativePath, pathMarker, true},
+		{supportBareRelativePath, pathMarker, false},
+		{supportStructuredFilename, filenameAssignmentMarker, true},
+		{supportQuotedFilename, filenameMarker, false},
+		{supportFilename, filenameMarker, false},
+	} {
+		for _, match := range item.pattern.FindAllStringSubmatchIndex(value, -1) {
+			start := match[0]
+			if item.keepPrefix {
+				start = match[3]
+			}
+			cover(start, match[1], item.marker)
+		}
+	}
+	if coverage == nil {
+		return value
+	}
+	var result strings.Builder
+	depth := 0
+	marker := uint8(genericMarker)
+	for index := 0; index <= len(value); index++ {
+		previous := depth
+		depth += coverage[index]
+		if previous > 0 && depth == 0 {
+			result.WriteString(replacements[marker])
+			marker = genericMarker
+		}
+		if index < len(value) {
+			if markerStarts[index] > marker {
+				marker = markerStarts[index]
+			}
+			if depth == 0 {
+				result.WriteByte(value[index])
+			}
+		}
+	}
+	return result.String()
 }
 
 func supportDetailField(value string, privatePatterns []supportPrivatePattern) string {
@@ -466,11 +631,15 @@ func loadSupportPrivatePatterns(query supportQueryer) ([]supportPrivatePattern, 
 		value, replacement string
 		caseInsensitive    bool
 		wordBoundary       bool
+		fragment           bool
 	}
-	values := make([]privateValue, 0, len(configured.Paths)+len(configured.Hosts)+len(configured.Secrets)*4+1)
+	values := make([]privateValue, 0, len(configured.Paths)+len(configured.Hosts)+len(configured.Secrets)*4+len(configured.SecretFragments)+1)
 	valueBytes := 0
-	appendValue := func(value, replacement string, caseInsensitive, wordBoundary bool) error {
-		value = strings.TrimSpace(strings.ToValidUTF8(value, "�"))
+	appendValue := func(value, replacement string, caseInsensitive, wordBoundary, fragment bool) error {
+		value = strings.ToValidUTF8(value, "�")
+		if !fragment {
+			value = strings.TrimSpace(value)
+		}
 		if value == "" {
 			return nil
 		}
@@ -478,28 +647,33 @@ func loadSupportPrivatePatterns(query supportQueryer) ([]supportPrivatePattern, 
 			valueBytes+len(value) > supportRedactionContextByteLimit {
 			return fmt.Errorf("support privacy context exceeds its safe bound")
 		}
-		values = append(values, privateValue{value, replacement, caseInsensitive, wordBoundary})
+		values = append(values, privateValue{value: value, replacement: replacement, caseInsensitive: caseInsensitive, wordBoundary: wordBoundary, fragment: fragment})
 		valueBytes += len(value)
 		return nil
 	}
-	if err := appendValue(hostname, "[REDACTED COMPUTER]", true, true); err != nil {
+	if err := appendValue(hostname, "[REDACTED COMPUTER]", true, true, false); err != nil {
 		return nil, err
 	}
 	for _, value := range configured.Paths {
-		if err := appendValue(value, "[REDACTED PATH]", runtime.GOOS == "windows", false); err != nil {
+		if err := appendValue(value, "[REDACTED PATH]", runtime.GOOS == "windows", false, false); err != nil {
 			return nil, err
 		}
 	}
 	for _, value := range configured.Hosts {
-		if err := appendValue(value, "[REDACTED COMPUTER]", true, true); err != nil {
+		if err := appendValue(value, "[REDACTED COMPUTER]", true, true, false); err != nil {
 			return nil, err
 		}
 	}
 	for _, secret := range configured.Secrets {
-		for _, representation := range supportSecretRepresentations(secret) {
-			if err := appendValue(representation, "[REDACTED CREDENTIAL]", false, false); err != nil {
+		for _, representation := range database.SupportSecretRepresentations(secret) {
+			if err := appendValue(representation, "[REDACTED CREDENTIAL]", false, false, false); err != nil {
 				return nil, err
 			}
+		}
+	}
+	for _, fragment := range configured.SecretFragments {
+		if err := appendValue(fragment, "[REDACTED CREDENTIAL]", false, false, true); err != nil {
+			return nil, err
 		}
 	}
 	sort.Slice(values, func(i, j int) bool {
@@ -511,7 +685,7 @@ func loadSupportPrivatePatterns(query supportQueryer) ([]supportPrivatePattern, 
 	patterns := make([]supportPrivatePattern, 0, len(values))
 	seen := map[string]bool{}
 	for _, item := range values {
-		key := item.value + "\x00" + item.replacement
+		key := item.value + "\x00" + item.replacement + strconv.FormatBool(item.fragment)
 		if item.caseInsensitive {
 			key = strings.ToLower(key)
 		}
@@ -519,6 +693,10 @@ func loadSupportPrivatePatterns(query supportQueryer) ([]supportPrivatePattern, 
 			continue
 		}
 		seen[key] = true
+		if item.fragment || item.replacement == "[REDACTED CREDENTIAL]" {
+			patterns = append(patterns, supportPrivatePattern{literalSecret: item.value})
+			continue
+		}
 		expression := regexp.QuoteMeta(item.value)
 		if item.wordBoundary {
 			expression = `\b` + expression + `\b`
@@ -533,15 +711,6 @@ func loadSupportPrivatePatterns(query supportQueryer) ([]supportPrivatePattern, 
 		patterns = append(patterns, supportPrivatePattern{pattern: pattern, replacement: item.replacement})
 	}
 	return patterns, nil
-}
-
-func supportSecretRepresentations(secret string) []string {
-	if secret == "" {
-		return nil
-	}
-	encoded, _ := json.Marshal(secret)
-	return []string{secret, url.QueryEscape(secret), url.PathEscape(secret), strconv.Quote(secret),
-		string(encoded), strings.ReplaceAll(secret, `\`, `\\`)}
 }
 
 func loadSupportSettings(query supportQueryer) (models.Settings, error) {
@@ -606,7 +775,7 @@ func supportEngineLabel(value string) string {
 }
 
 func supportStorageLabel(value string) string {
-	for _, candidate := range []string{"fs", "s3", "sftp", "azblob", "gcs", "google_drive", "dropbox", "onedrive"} {
+	for _, candidate := range []string{"fs", "s3", "sftp", "azblob", "gcs", "webdav", "google_drive", "dropbox", "onedrive", "rclone_remote"} {
 		if value == candidate {
 			return value
 		}
@@ -625,8 +794,51 @@ func supportBoundedRawDetail(value string, truncated bool) string {
 	if truncated {
 		return ""
 	}
-	value = strings.ToValidUTF8(value, "�")
 	return value
+}
+
+func supportHasIncompleteSecretTail(value string, patterns []supportPrivatePattern) bool {
+	var prefix []int
+	for _, pattern := range patterns {
+		literal := pattern.literalSecret
+		if len(literal) < 2 || value == "" {
+			continue
+		}
+		// Match only the raw EOF against proper prefixes. An unfinished append
+		// can contain blank lines that otherwise look like complete sections.
+		// Prefix fallback keeps repeated bytes linear in the literal's size.
+		if cap(prefix) < len(literal) {
+			prefix = make([]int, len(literal))
+		} else {
+			prefix = prefix[:len(literal)]
+		}
+		for index, matched := 1, 0; index < len(literal); index++ {
+			for matched > 0 && literal[index] != literal[matched] {
+				matched = prefix[matched-1]
+			}
+			if literal[index] == literal[matched] {
+				matched++
+			}
+			prefix[index] = matched
+		}
+		start := len(value) - len(literal) + 1
+		if start < 0 {
+			start = 0
+		}
+		matched := 0
+		for index := start; index < len(value); index++ {
+			for matched > 0 && value[index] != literal[matched] {
+				matched = prefix[matched-1]
+			}
+			if value[index] == literal[matched] {
+				matched++
+			}
+		}
+		if matched > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func loadSupportIssues(query supportQueryer, cutoff, generatedAt time.Time, privatePatterns []supportPrivatePattern) ([]supportIssue, error) {
@@ -657,6 +869,9 @@ func loadSupportIssues(query supportQueryer, cutoff, generatedAt time.Time, priv
 				supportAllowedLabel(level, "ERROR", "WARN", "SUPPORT"), matches[1], matches[2], matches[3])
 			if matches[4] != "" {
 				if recorded, unquoteErr := strconv.Unquote(matches[4]); unquoteErr == nil {
+					// Quoting can cut a raw error below the SQL read bound. A valid
+					// quoted prefix still cannot establish complete privacy matches.
+					recorded = supportBoundedRawDetail(recorded, strings.HasSuffix(recorded, "…[truncated]"))
 					detail += " " + supportDetailField(recorded, privatePatterns)
 				}
 			}
@@ -714,7 +929,14 @@ func loadSupportIssues(query supportQueryer, cutoff, generatedAt time.Time, priv
 			// A best-effort diagnostic sample may be incomplete without changing the
 			// authoritative snapshot. Read only the bounded window and omit an
 			// over-limit or unsafe detail.
-			operation.output, _ = operationlog.ReadBoundedBestEffortCompleteSections(operation.id, supportRawDetailByteLimit)
+			output, truncated, _ := operationlog.ReadBoundedBestEffort(operation.id, supportRawDetailByteLimit)
+			if !truncated && !supportHasIncompleteSecretTail(output, privatePatterns) {
+				if strings.HasSuffix(output, "\n\n") {
+					operation.output = output
+				} else if boundary := strings.LastIndex(output, "\n\n["); boundary >= 0 {
+					operation.output = output[:boundary+2]
+				}
+			}
 		}
 		steps, err := loadSupportOperationSteps(query, operation.id, generatedAt)
 		if err != nil {
@@ -799,7 +1021,8 @@ func supportOperationStepLabel(step supportOperationStep) string {
 			"repository_writer_storage_validation", "repository_storage_admission", "native_process_admission",
 			"integrity_cache_prepare",
 			"repository_integrity_check", "integrity_cache_cleanup", "kopia_policy_reconciliation",
-			"metadata_cache", "metadata_cache_invalidation"),
+			"metadata_cache", "metadata_cache_invalidation",
+			runner.VaultPasswordChangeBlockingStep, vaultRemovalProfileStep),
 		supportAllowedLabel(step.status, "running", "succeeded", "failed", "skipped", "warning", "interrupted"))
 }
 
@@ -807,7 +1030,8 @@ func buildSupportOperationDetail(kind, status, engine, storage, output string, s
 	redactionContextComplete bool, privatePatterns []supportPrivatePattern,
 ) (string, error) {
 	base := fmt.Sprintf("kind=%s status=%s engine=%s storage=%s",
-		supportAllowedLabel(kind, "backup", "restore", "retention", "check", "maintenance", "delete"),
+		supportAllowedLabel(kind, "backup", "restore", "retention", "check", "maintenance", "delete", database.JobDeletionKind,
+			database.VaultPasswordChangeKind, database.VaultSettingsKind, database.VaultRemovalKind),
 		supportAllowedLabel(status, "failed", "interrupted", "partial", "completed_with_issues", "reconnect_required"),
 		supportEngineLabel(engine), supportStorageLabel(storage))
 	stepDetails := make([]string, len(steps))

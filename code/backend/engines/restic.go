@@ -494,7 +494,13 @@ func (e *resticEngine) Restore(ctx context.Context, repo models.Repository, id s
 		return "", fmt.Errorf("restic original-location restore is unsupported")
 	}
 	restoreID := id
-	args := []string{"restore"}
+	// --json is how a partly failed restore is recognised. Restic carries on
+	// past files it cannot write and ends with exit code 1, but so does every
+	// fatal failure; only the structured records (per-file errors, the summary
+	// and "There were N errors") tell them apart. See
+	// resticRestoreCompletedWithErrors before removing it or reading the text
+	// output instead.
+	args := []string{"restore", "--json"}
 	if selection != "" {
 		source := options.NativeRoot.Path
 		if source == "" {
@@ -529,7 +535,15 @@ func (e *resticEngine) Restore(ctx context.Context, repo models.Repository, id s
 	default:
 		return "", fmt.Errorf("unsupported Restic conflict mode %q", options.ConflictMode)
 	}
-	out, err := e.runRepo(ctx, repo, args, command.NoTotalDeadline)
+	capture, out, err := e.runRepoCommandCaptured(ctx, repo, nil, args, command.NoTotalDeadline)
+	if capture != nil {
+		defer capture.Close()
+	}
+	if err != nil {
+		if count, reported := resticRestoreCompletedWithErrors(capture, err); reported {
+			return out, &RestoreCompletedWithErrors{Engine: ResticID, NativeErr: err, Errors: count}
+		}
+	}
 	return out, err
 }
 
@@ -624,19 +638,16 @@ func (e *resticEngine) DeleteSnapshots(ctx context.Context, repo models.Reposito
 	out, err := e.runRepo(ctx, repo, args, command.NoTotalDeadline)
 	return out, err
 }
-func (e *resticEngine) Check(ctx context.Context, repo models.Repository, id string) (output string, err error) {
-	if repo.ColdStorage && id == "" {
+func (e *resticEngine) Check(ctx context.Context, repo models.Repository) (output string, err error) {
+	// Cold storage has no integrity check path at all. The whole-repository
+	// check would read every archived pack, and the snapshot-filtered
+	// `check --read-data <id>` that cold vaults could once use was removed with
+	// the unused snapshot check endpoint. Don't add a snapshot argument back
+	// here as a way around this refusal.
+	if repo.ColdStorage {
 		return "", fmt.Errorf("%s", models.ColdStorageIntegrityHelp)
 	}
 	args := []string{"check", "--read-data"}
-	if id != "" {
-		if !resticSnapshotIDPattern.MatchString(id) || id != strings.ToLower(id) {
-			return "", fmt.Errorf("invalid canonical Restic snapshot ID")
-		}
-		// Restic 0.19.1 accepts snapshot IDs after --read-data, so a selected
-		// integrity check remains a native check instead of staging a restore.
-		args = append(args, id)
-	}
 	// Replicaro runs integrity checks only for the current vault owner and
 	// serializes all of its own work with the managed vault UUID lock. For the
 	// supported external-backup overlap, Restic's publication order keeps this
@@ -1120,12 +1131,29 @@ func prepareResticStorage(
 	func() error,
 	error,
 ) {
+	if repo.Connector == "webdav" {
+		repository, args, env, cleanup, err := prepareResticWebDAVStorage(ctx, repo)
+		if err != nil {
+			return "", nil, nil, nil, &privateOutputError{
+				message: "native Restic preparation failed",
+				cause:   err,
+			}
+		}
+		return repository, args, env, cleanup, nil
+	}
 	if !IsResticRcloneConnector(repo.Connector) {
 		repository, args, env, err := resticStorage(repo)
 		return repository, args, env, nil, err
 	}
 	session, err := newResticRcloneSession(ctx, repo)
 	if err != nil {
+		// A refused Any Rclone Remote setting, such as a saved environment
+		// variable that a newer rule refuses, carries only names and fixed
+		// text, so its message is shown instead of the generic one.
+		var remoteErr *RcloneRemoteError
+		if errors.As(err, &remoteErr) {
+			return "", nil, nil, nil, &userSafeConnectorError{message: remoteErr.Message, cause: remoteErr}
+		}
 		return "", nil, nil, nil, &privateOutputError{
 			message: "native Restic preparation failed",
 			cause:   err,

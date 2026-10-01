@@ -22,7 +22,7 @@ func prepareOperationNotification(db *sql.DB, operationID, kind, title, status s
 	}
 
 	success := status == "success"
-	nativeEnabled, webhookEnabled := settings.NotificationChannels(success)
+	nativeEnabled, webhookEnabled := settings.NotificationChannels(status)
 	event := notifications.Event{
 		Event:       kind,
 		Status:      status,
@@ -46,6 +46,22 @@ func prepareOperationNotification(db *sql.DB, operationID, kind, title, status s
 	case "delete":
 		if name, ok := strings.CutPrefix(title, "Delete snapshot: "); ok {
 			event.TaskKey, event.TaskName = "notifications.task.deleteSnapshot", name
+		}
+	case database.JobDeletionKind:
+		if name, ok := strings.CutPrefix(title, "Delete job: "); ok {
+			event.TaskKey, event.TaskName = "notifications.task.deleteJob", name
+		}
+	case database.VaultPasswordChangeKind:
+		if name, ok := strings.CutPrefix(title, "Change vault password: "); ok {
+			event.TaskKey, event.TaskName = "notifications.task.changeVaultPassword", name
+		}
+	case database.VaultSettingsKind:
+		if name, ok := strings.CutPrefix(title, "Save vault settings: "); ok {
+			event.TaskKey, event.TaskName = "notifications.task.saveVaultSettings", name
+		}
+	case database.VaultRemovalKind:
+		if name, ok := strings.CutPrefix(title, "Remove vault: "); ok {
+			event.TaskKey, event.TaskName = "notifications.task.removeVault", name
 		}
 	case "restore":
 		// File History supplies the count explicitly. The operation title and

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { useLocation, useNavigate, useOutletContext } from "react-router-dom";
 
 import { preventNumberInputWheel } from "../components/numberInput";
@@ -7,10 +7,15 @@ import { checkForAppUpdate, getEngines, getPlatform, getSettings, getSupportRepo
 import type { AppUpdateStatus, EngineDescriptor, PlatformInfo, Settings as SettingsType } from "../types";
 import type { AppUpdateOutletContext } from "../layouts/MainLayout";
 import { applyThemePreference } from "../theme";
-import { activateLocale, languageNames, t } from "../i18n";
+import { englishText, languageNames, t } from "../i18n";
+import { reloadPage } from "../reloadPage";
 
 const supportReportByteLimit = 256 * 1024;
-type PendingSaveAction = "save" | "save-and-leave";
+type PendingSaveAction = "save" | "save-and-leave" | "save-and-reload";
+type LanguageChoice = NonNullable<SettingsType["language"]>;
+// "committed" means the save reported an error but the re-read settings show
+// it was stored anyway.
+type SaveResult = "saved" | "committed" | "failed";
 let supportClipboardTail: Promise<void> = Promise.resolve();
 
 function writeSupportReportToClipboard(report: string): Promise<void> {
@@ -52,16 +57,6 @@ function sameSettings(left: SettingsType, right: SettingsType): boolean {
     return JSON.stringify(left) === JSON.stringify(right);
 }
 
-// Locale shown while a Language choice is an unsaved draft. An explicit choice
-// names a bundled catalog directly (activateLocale falls back to English, as
-// the backend does). Only the backend resolves the OS language, so "system"
-// uses the read-only systemLocale from the last settings GET, which the backend
-// sends even while a specific language is saved; saveSettings strips it again.
-function languagePreviewLocale(language: SettingsType["language"], saved: SettingsType): string | undefined {
-    const selection = language ?? "system";
-    return selection === "system" ? saved.systemLocale : selection;
-}
-
 export default function System() {
     const toast = useToast();
     const location = useLocation();
@@ -84,12 +79,26 @@ export default function System() {
     const [supportError, setSupportError] = useState("");
     const [copyStatus, setCopyStatus] = useState("");
     const [copySucceeded, setCopySucceeded] = useState(false);
+    // A language picked in the selector (or by Reset to English) that hasn't
+    // been saved yet; null means the selector shows the saved language.
+    // Picking only records the choice. The confirmation dialog opens from the
+    // Change language button, so browsing the list with the arrow keys, which
+    // fires a change event for every option passed, never opens it.
+    const [languageChoice, setLanguageChoice] = useState<LanguageChoice | null>(null);
+    // Which button opened the confirmation dialog, or null while it's closed.
+    const [languageDialog, setLanguageDialog] = useState<"change" | "reset" | null>(null);
+    const languageSelect = useRef<HTMLSelectElement>(null);
+    // The Change language button is disabled again once the choice is dropped,
+    // so focus can't go back to it when its dialog closes; the selector gets it.
+    const focusLanguageSelectOnClose = useRef(false);
+    const languageMessageId = useId();
     const supportGeneration = useRef(0);
     const supportAbort = useRef<AbortController | null>(null);
     const supportCopyAttempt = useRef(0);
     const supportCopyPending = useRef(false);
     const historyIndex = useRef<number | null>(typeof window === "undefined" ? null : window.history.state?.idx ?? null);
     const restoringHistory = useRef(false);
+    const reloadingAfterSave = useRef(false);
 
     const load = useCallback(() => {
         void Promise.all([getEngines(), getSettings(), typeof getPlatform === "function" ? getPlatform() : Promise.resolve(null)]).then(([catalog, nextSettings, nextPlatform]) => {
@@ -99,7 +108,6 @@ export default function System() {
             setSavedSettings(nextSettings);
             setPlatform(nextPlatform);
 			applyThemePreference(nextSettings.theme);
-            activateLocale(nextSettings.effectiveLocale);
         }).catch((error: Error) => toast("error", error.message));
     }, [toast]);
 
@@ -110,39 +118,20 @@ export default function System() {
         supportAbort.current?.abort();
     }, []);
 
-    const save = async (resetEnglish = false) => {
-        if (!settings || !savedSettings || saving) return false;
-        // The recovery button saves only the language. Other edits stay in the
-        // draft and still pass through the normal Save settings confirmations.
-		const attemptedSettings: SettingsType = resetEnglish
-            ? { ...savedSettings, language: "en", effectiveLocale: "en" }
-            : settings;
+    // A language change is passed in rather than kept in the draft, and is
+    // saved together with every other pending edit.
+    const save = async (language?: LanguageChoice): Promise<SaveResult> => {
+        if (!settings || !savedSettings || saving) return "failed";
+        const draftSettings = settings;
+        const attemptedSettings: SettingsType = language === undefined ? draftSettings : { ...draftSettings, language };
 		const previouslySavedSettings = savedSettings;
         setSaving(true);
         try {
             await saveSettings(attemptedSettings);
-            // The backend owns OS-language resolution. Re-read only when the
-            // language preference changed so the selected catalog follows its
-            // authoritative effectiveLocale without consulting the browser.
-            let confirmedSettings = attemptedSettings;
-            if ((attemptedSettings.language ?? "system") !== (previouslySavedSettings?.language ?? "system")) {
-                try { confirmedSettings = await getSettings(); }
-                catch {
-                    // The saved choice is durable; the next load retries locale
-                    // resolution. Until then keep showing the previewed catalog
-                    // instead of the stale effectiveLocale from the prior save.
-                    confirmedSettings = { ...attemptedSettings, effectiveLocale: languagePreviewLocale(attemptedSettings.language, previouslySavedSettings) };
-                }
-            }
-            setSavedSettings(confirmedSettings);
-            setSettings((current) => {
-                if (!current) return current;
-                if (resetEnglish) return { ...current, language: confirmedSettings.language, effectiveLocale: confirmedSettings.effectiveLocale };
-                return sameSettings(current, attemptedSettings) ? confirmedSettings : current;
-            });
-            activateLocale(confirmedSettings.effectiveLocale);
+            setSavedSettings(attemptedSettings);
+            setSettings((current) => current && sameSettings(current, draftSettings) ? attemptedSettings : current);
             toast("ok", t("ui.system.settingsSaved"));
-            return true;
+            return "saved";
         } catch (error) {
             toast("error", (error as Error).message);
 			let committed = false;
@@ -151,19 +140,16 @@ export default function System() {
 				if (!previouslySavedSettings || !sameSettings(persistedSettings, previouslySavedSettings)) {
 					committed = true;
 					setSavedSettings(persistedSettings);
-                    if (resetEnglish) activateLocale(persistedSettings.effectiveLocale);
 					setSettings((currentSettings) => {
-                        if (resetEnglish && currentSettings) return { ...currentSettings, language: persistedSettings.language, effectiveLocale: persistedSettings.effectiveLocale };
-						if (!currentSettings || !sameSettings(currentSettings, attemptedSettings)) return currentSettings;
+						if (!currentSettings || !sameSettings(currentSettings, draftSettings)) return currentSettings;
 						applyThemePreference(persistedSettings.theme);
-                        activateLocale(persistedSettings.effectiveLocale);
 						return persistedSettings;
 					});
 				}
 			} catch {
 				// Keep the draft when the authoritative state cannot be confirmed.
 			}
-			return committed;
+			return committed ? "committed" : "failed";
         }
         finally { setSaving(false); }
     };
@@ -251,6 +237,8 @@ export default function System() {
     };
 
     const dirty = Boolean(settings && savedSettings && !sameSettings(settings, savedSettings));
+    const savedLanguage: LanguageChoice = savedSettings?.language ?? "system";
+    const languageChangePending = languageChoice !== null && languageChoice !== savedLanguage;
 
     useEffect(() => {
         if (!dirty) return;
@@ -286,6 +274,10 @@ export default function System() {
             }
         };
         const onBeforeUnload = (event: BeforeUnloadEvent) => {
+            // Everything was just saved, so the reload loses nothing. The
+            // saved state may not have rendered yet, which is why this
+            // listener can still be attached.
+            if (reloadingAfterSave.current) return;
             event.preventDefault();
             event.returnValue = "";
         };
@@ -304,16 +296,41 @@ export default function System() {
 		if (savedSettings) {
 			setSettings(savedSettings);
 			applyThemePreference(savedSettings.theme);
-            // Drop any unsaved Language preview before the page unmounts.
-            activateLocale(savedSettings.effectiveLocale);
 		}
         setPendingNavigation(null);
         if (target) navigate(target);
     };
 
+    const closeLanguageChange = () => {
+        setLanguageChoice(null);
+        setLanguageDialog(null);
+    };
+
     const performSaveAction = async (action: PendingSaveAction) => {
         const target = pendingNavigation;
-        if (await save()) {
+        if (action === "save-and-reload") {
+            // The dialog is usable again while the page unloads. A second
+            // click only asks for the reload again instead of saving twice.
+            if (reloadingAfterSave.current) {
+                reloadPage();
+                return;
+            }
+            // The page's language is only ever set by main.tsx at startup,
+            // so the new language takes effect by reloading, not by swapping
+            // catalogs here. Only a clean save reloads: when the save reported
+            // an error the page stays so the error remains visible, even if
+            // the settings (and so the language) were stored anyway. The
+            // selector then shows the saved language, which applies from the
+            // next load.
+            if (languageChoice !== null && await save(languageChoice) === "saved") {
+                reloadingAfterSave.current = true;
+                reloadPage();
+            } else {
+                closeLanguageChange();
+            }
+            return;
+        }
+        if (await save() !== "failed") {
             if (action === "save-and-leave") {
                 setPendingNavigation(null);
                 if (target) navigate(target);
@@ -323,6 +340,17 @@ export default function System() {
 
     const requestSave = (action: PendingSaveAction) => {
         if (!settings) return;
+        // A plain save would leave out a language that was picked but not
+        // confirmed, while the selector still shows it. So any save with a
+        // language pending goes through the language dialog instead: Save and
+        // reload saves everything with the language, Cancel saves nothing.
+        // A pending navigation is dropped because the page reloads on save.
+        if (action !== "save-and-reload" && languageChangePending) {
+            focusLanguageSelectOnClose.current = false;
+            setPendingNavigation(null);
+            setLanguageDialog("change");
+            return;
+        }
         // Confirmation is tied to a changed high value, not merely a high
         // persisted value. Keeping the pending action transient prevents a
         // cancel from committing settings or changing navigation state.
@@ -338,6 +366,71 @@ export default function System() {
         const action = pendingSaveAction;
         setPendingSaveAction(null);
         if (action) void performSaveAction(action);
+    };
+
+    const cancelHighConcurrencySave = () => {
+        // Without the save there is no language change either.
+        if (pendingSaveAction === "save-and-reload") closeLanguageChange();
+        setPendingSaveAction(null);
+    };
+
+    // A new language is not previewed. Changing it saves the settings and
+    // reloads, and main.tsx then loads that language at startup like on any
+    // other launch. Startup is the only tested path that loads a catalog, so
+    // there is no in-page catalog switching to get wrong.
+    const chooseLanguage = (language: LanguageChoice) => {
+        setLanguageChoice(language === savedLanguage ? null : language);
+    };
+
+    const openLanguageChange = () => {
+        if (!languageChangePending) return;
+        focusLanguageSelectOnClose.current = true;
+        setLanguageDialog("change");
+    };
+
+    const resetToEnglish = () => {
+        if (savedLanguage === "en") {
+            setLanguageChoice(null);
+            return;
+        }
+        // Focus goes back to this button, which stays enabled.
+        focusLanguageSelectOnClose.current = false;
+        setLanguageChoice("en");
+        setLanguageDialog("reset");
+    };
+
+    // Cancel, Escape, Close and a click outside all end here.
+    const cancelLanguageChange = () => {
+        if (!saving) closeLanguageChange();
+    };
+
+    useEffect(() => {
+        // Runs after the dialog's own cleanup, which returns focus to the
+        // element that opened it.
+        if (languageDialog !== null || !focusLanguageSelectOnClose.current) return;
+        focusLanguageSelectOnClose.current = false;
+        languageSelect.current?.focus();
+    }, [languageDialog]);
+
+    // Reset to English must be usable by someone who can't read the current
+    // language, so its dialog is in English too. Picking English in the
+    // selector is confirmed in the current language like any other choice.
+    const languageDialogText = languageDialog === "reset" ? {
+        title: englishText("system.language.changeTitle"),
+        message: englishText("system.language.changeMessage"),
+        cancel: englishText("ui.components.ui.cancel"),
+        confirm: englishText("system.language.saveAndReload"),
+        close: englishText("ui.components.ui.close"),
+        lang: "en",
+        dir: "ltr" as const,
+    } : {
+        title: t("system.language.changeTitle"),
+        message: t("system.language.changeMessage"),
+        cancel: t("ui.components.ui.cancel"),
+        confirm: t("system.language.saveAndReload"),
+        close: undefined,
+        lang: undefined,
+        dir: undefined,
     };
 
     if (!settings) return <div className="page"><Loading /></div>;
@@ -365,15 +458,10 @@ export default function System() {
 				<label className="field system-control-field"><span>{t("ui.pages.system.theme")}</span><select value={settings.theme} onChange={(event) => { const theme = event.target.value as SettingsType["theme"]; applyThemePreference(theme); setSettings({ ...settings, theme }); }}><option value="system">{t("ui.pages.system.system")}</option><option value="light">{t("ui.pages.system.light")}</option><option value="neutral">{t("ui.pages.system.neutral")}</option><option value="dark">{t("ui.pages.system.dark")}</option></select></label>
 				<div className="setting-hint system-control-hint">{t("ui.pages.system.system.follows.your.operating.system.s.light.or.dark.theme.setting")}</div>
                 <div className="system-language-controls">
-                    <label className="field system-control-field system-language-field"><span>{t("system.language.label")}</span><select value={settings.language ?? "system"} disabled={saving} onChange={(event) => {
-                        const language = event.target.value as SettingsType["language"];
-                        // Preview the choice across the UI without saving it, like
-                        // the theme. Save persists it; discarding restores the saved locale.
-                        if (savedSettings) activateLocale(languagePreviewLocale(language, savedSettings));
-                        setSettings({ ...settings, language });
-                    }}><option value="system">{t("system.language.system")}</option><option value="en">{t("system.language.english")}</option>{Object.entries(languageNames).map(([locale, name]) => <option key={locale} value={locale} lang={locale}>{name}</option>)}</select></label>
+                    <label className="field system-control-field system-language-field"><span>{t("system.language.label")}</span><select ref={languageSelect} value={languageChoice ?? savedLanguage} disabled={saving} onChange={(event) => chooseLanguage(event.target.value as LanguageChoice)}><option value="system">{t("system.language.system")}</option><option value="en">{t("system.language.english")}</option>{Object.entries(languageNames).map(([locale, name]) => <option key={locale} value={locale} lang={locale}>{name}</option>)}</select></label>
+                    <button type="button" className="btn" disabled={saving || !languageChangePending} onClick={openLanguageChange}>{t("system.language.changeButton")}</button>
                     {/* Keep this recovery action in English so it remains recognizable in every UI language. */}
-                    <button type="button" className="btn" lang="en" dir="ltr" translate="no" disabled={saving} onClick={() => void save(true)}>Reset to English</button>
+                    <button type="button" className="btn" lang="en" dir="ltr" translate="no" disabled={saving} onClick={resetToEnglish}>Reset to English</button>
                 </div>
 			</section>
             <div className="system-label">{t("ui.pages.system.default.engine.for.backups")}</div>
@@ -399,7 +487,17 @@ export default function System() {
                 <a className="btn" href={supportReport && !supportLoading ? "https://github.com/replicaro/replicaro/issues/new" : undefined} target="_blank" rel="noreferrer" role="link" aria-disabled={!supportReport || supportLoading} tabIndex={supportReport && !supportLoading ? 0 : -1} onClick={() => { if (supportReport && !supportLoading) void copySupportReport(); }}>{t("ui.pages.system.open.github.issue")}</a>
             </div>
         </div></Modal>}
-        {pendingSaveAction && <ConfirmDialog title={t("ui.pages.system.confirm.backup.admission.limit")} message={t("ui.system.highBackupConfirmation")} confirmLabel={t("ui.system.saveLimit")} busy={saving} onConfirm={confirmHighConcurrencySave} onCancel={() => setPendingSaveAction(null)} />}
+        {languageDialog !== null && languageChoice !== null && !pendingSaveAction && <Modal title={languageDialogText.title} onClose={cancelLanguageChange} lang={languageDialogText.lang} dir={languageDialogText.dir} closeLabel={languageDialogText.close} describedBy={languageMessageId}>
+            <p id={languageMessageId} className="muted" style={{ marginTop: 0 }}>{languageDialogText.message}</p>
+            <div className="modal-footer language-change-actions">
+                <button type="button" className="btn" onClick={cancelLanguageChange} disabled={saving}>{languageDialogText.cancel}</button>
+                <button type="button" className="btn primary" onClick={() => requestSave("save-and-reload")} disabled={saving}>
+                    {saving && <span className="spinner" />}
+                    {languageDialogText.confirm}
+                </button>
+            </div>
+        </Modal>}
+        {pendingSaveAction && <ConfirmDialog title={t("ui.pages.system.confirm.backup.admission.limit")} message={t("ui.system.highBackupConfirmation")} confirmLabel={t("ui.system.saveLimit")} busy={saving} onConfirm={confirmHighConcurrencySave} onCancel={cancelHighConcurrencySave} />}
         {pendingNavigation && !pendingSaveAction && <SaveChangesDialog onSave={() => requestSave("save-and-leave")} onDiscard={discardAndLeave} onCancel={() => setPendingNavigation(null)} busy={saving} />}
     </div>;
 }

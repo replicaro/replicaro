@@ -387,36 +387,11 @@ func MarkKopiaPolicyReconciliationError(
 	return nil
 }
 
-// RetryKopiaPolicyForTarget converts only the exact current terminal error for
-// a Kopia job target back to dirty. It neither changes the desired digest nor
-// touches an applying row's durable process fence.
-func RetryKopiaPolicyForTarget(db *sql.DB, jobID, repositoryID string) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var engine string
-	if err := tx.QueryRow(`
-		SELECT r.engine
-		FROM backup_job_targets t
-		JOIN repositories r ON r.id=t.repository_id
-		WHERE t.job_id=? AND t.repository_id=?`,
-		jobID, repositoryID).Scan(&engine); err != nil {
-		return err
-	}
-	if engine != engines.KopiaID {
-		return fmt.Errorf("job target is not a Kopia vault")
-	}
-	if err := retryKopiaPolicyForRepositoryTx(tx, repositoryID); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
-// RetryKopiaPolicyForRepository reopens the vault's policy only from its current
-// error state. Vault-care resubmission uses this for empty enrolled vaults, which
-// have no job target through which the per-target retry endpoint could be reached.
+// RetryKopiaPolicyForRepository reopens the vault's policy only from its
+// current error state. The reconciler's retry timer is its only caller: an
+// error is retried automatically, whether or not the vault has any job target,
+// and backups stay blocked until a later reconciliation proves the policy by
+// readback. It never changes the desired digest.
 func RetryKopiaPolicyForRepository(db *sql.DB, repositoryID string) error {
 	tx, err := db.Begin()
 	if err != nil {

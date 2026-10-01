@@ -41,13 +41,27 @@ export interface Repository {
 	native_repository_id: string;
 	isVaultOwner: boolean;
 	objectLock: ObjectLockSettings;
+	// Saved on the server; set when a job or background worker found that this
+	// vault needs a reconnect, cleared by a later success or a reconnect.
+	reconnectRequired?: boolean;
+	// Set only for an Any Rclone Remote vault. It never holds the rclone
+	// config password or a variable value.
+	rcloneRemote?: RcloneRemoteSettings;
+}
+
+export interface RcloneRemoteSettings {
+	configFile: string;
+	configEncrypted: boolean;
+	remote: string;
+	path: string;
+	variableNames: string[];
 }
 
 export interface IntegrationOption {
     key: string;
     label: string;
 	help?: string;
-    kind?: "boolean" | "textarea";
+    kind?: "boolean" | "textarea" | "environment";
     placeholder?: string;
     default?: string;
     required?: boolean;
@@ -287,6 +301,7 @@ export interface VaultSizeStatus {
 	running: boolean;
 	pending: boolean;
 	paused: boolean;
+	// A failure code such as "vault_size_refresh_failed", not display text.
 	failure?: string;
 }
 

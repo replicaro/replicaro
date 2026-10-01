@@ -930,9 +930,20 @@ func boundedDiagnosticWithOmissionLimit(value string, omitted bool, limit int) s
 	return value[:middle] + diagnosticTruncationMarker + value[middle:]
 }
 
+// minimalEnvironmentNames are the only variables a native child inherits from
+// Replicaro's own environment.
+var minimalEnvironmentNames = []string{"PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP", "SystemRoot", "WINDIR", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "OS", "LANG", "LC_ALL", "TERM"}
+
+// MinimalEnvironmentNames returns the names a native child inherits from
+// Replicaro's environment. Callers that accept variables from the user refuse
+// these so the inherited values can't be replaced.
+func MinimalEnvironmentNames() []string {
+	return append([]string(nil), minimalEnvironmentNames...)
+}
+
 func minimalEnvironment(overrides []string) []string {
 	allowed := map[string]bool{}
-	for _, name := range []string{"PATH", "HOME", "USERPROFILE", "HOMEDRIVE", "HOMEPATH", "TEMP", "TMP", "SystemRoot", "WINDIR", "APPDATA", "LOCALAPPDATA", "PROGRAMDATA", "SYSTEMDRIVE", "COMSPEC", "PATHEXT", "OS", "LANG", "LC_ALL", "TERM"} {
+	for _, name := range minimalEnvironmentNames {
 		allowed[strings.ToUpper(name)] = true
 	}
 	values := map[string]string{}

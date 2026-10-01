@@ -19,11 +19,14 @@ import (
 var (
 	ErrJobRunActive          = errors.New("backup job has queued or running target runs")
 	ErrJobConnectionReserved = errors.New("backup job is reserved by a pending repository connection")
-	ErrJobDefinitionBusy     = errors.New("backup job definition is being deleted")
-	ErrInvalidTargets        = errors.New("at least one unique existing repository target is required")
-	ErrJobSourceImmutable    = errors.New("backup job source cannot be changed after creation")
-	ErrJobSourceChanged      = errors.New("backup job source changed during binding; retry the operation")
-	ErrJobSourceUnbound      = errors.New("imported backup job source is not bound to this computer")
+	// ErrJobDefinitionBusy is what every job admission and edit gets while a
+	// deletion of the job holds its definition gate. The API shows this text to
+	// the user (with the job_being_deleted code the UI translates).
+	ErrJobDefinitionBusy  = errors.New("This job is being deleted.")
+	ErrInvalidTargets     = errors.New("at least one unique existing repository target is required")
+	ErrJobSourceImmutable = errors.New("backup job source cannot be changed after creation")
+	ErrJobSourceChanged   = errors.New("backup job source changed during binding; retry the operation")
+	ErrJobSourceUnbound   = errors.New("imported backup job source is not bound to this computer")
 )
 
 type jobDefinitionGateKey struct {
@@ -47,15 +50,37 @@ func acquireJobDefinitionUse(db *sql.DB, jobID string) (func(), error) {
 	return gate.RUnlock, nil
 }
 
-// AcquireJobDefinitionDeletion holds the one local per-job definition gate
-// across deletion admission, exact native cleanup, ownership removal, and the
-// final definition delete. It is intentionally process-local and run-scoped.
-func AcquireJobDefinitionDeletion(db *sql.DB, jobID string) (func(), error) {
+// JobDeletionKind is the operation kind of a job deletion. Its record carries
+// the job ID, so the "anything else queued or running for this job" checks
+// below leave it out; otherwise a deletion would wait for itself.
+const JobDeletionKind = "delete_job"
+
+// HoldJobDefinitionForDeletion takes the one local per-job definition gate for
+// a job deletion and keeps it across waiting for the job's other work, exact
+// native cleanup, ownership removal, and the final definition delete. It
+// blocks until in-flight admissions (short read holds) finish. Once it is
+// waiting or held, every new admission and edit of the job fails with
+// ErrJobDefinitionBusy, which is how a pending deletion holds back new work:
+// scheduled runs are skipped without an issue, user requests are refused. It
+// is process-local; after a restart the interrupted deletion releases nothing
+// because nothing is held.
+func HoldJobDefinitionForDeletion(db *sql.DB, jobID string) func() {
 	gate := jobDefinitionGate(db, jobID)
-	if !gate.TryLock() {
-		return nil, ErrJobDefinitionBusy
+	gate.Lock()
+	var once sync.Once
+	return func() { once.Do(gate.Unlock) }
+}
+
+// JobHasOtherActiveWork reports whether anything other than a deletion of the
+// job is queued or running for it. A job deletion polls this before taking any
+// vault lock (see HoldJobDefinitionForDeletion).
+func JobHasOtherActiveWork(db *sql.DB, jobID string) (bool, error) {
+	var active int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM operations WHERE job_id = ? AND kind <> ? AND status IN ('queued', 'running')`,
+		jobID, JobDeletionKind).Scan(&active); err != nil {
+		return false, err
 	}
-	return gate.Unlock, nil
+	return active > 0, nil
 }
 
 func requireJobConnectionUnreserved(tx *sql.Tx, jobID string) error {
@@ -907,7 +932,8 @@ func DeleteJob(db *sql.DB, id string) error {
 		return err
 	}
 	var active int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE job_id = ? AND status IN ('queued', 'running')`, id).Scan(&active); err != nil {
+	// The deletion's own operation record carries this job ID; see JobDeletionKind.
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE job_id = ? AND kind <> ? AND status IN ('queued', 'running')`, id, JobDeletionKind).Scan(&active); err != nil {
 		return err
 	}
 	if active > 0 {
@@ -971,13 +997,33 @@ func ValidateJobDeletionAdmission(db *sql.DB, id string) error {
 		return err
 	}
 	var active int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE job_id = ? AND status IN ('queued', 'running')`, id).Scan(&active); err != nil {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE job_id = ? AND kind <> ? AND status IN ('queued', 'running')`, id, JobDeletionKind).Scan(&active); err != nil {
 		return err
 	}
 	if active > 0 {
 		return ErrJobRunActive
 	}
 	return nil
+}
+
+// ValidateJobDeletionRequest is the part of deletion admission a request can
+// check without waiting: the job exists and no pending repository connection
+// has reserved it. Queued or running work for the job is not a refusal any
+// more; the deletion waits for it.
+func ValidateJobDeletionRequest(db *sql.DB, id string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM backup_jobs WHERE id = ?`, id).Scan(&exists); err != nil {
+		return err
+	}
+	if exists != 1 {
+		return sql.ErrNoRows
+	}
+	return requireJobConnectionUnreserved(tx, id)
 }
 
 func SetJobEnabledCommitted(db *sql.DB, id string, enabled bool) (bool, error) {

@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os/exec"
 	"strings"
 
 	"github.com/local/replicaro/command"
@@ -50,11 +49,13 @@ func IsBackupSourceReadFailure(err error) bool {
 	return false
 }
 
+// backupExit is the backup rule for trusting a native exit code: the requested
+// child exited with exactly this code and no follow-up of any kind failed next
+// to it. Backups are stricter than restores here on purpose; a saved-snapshot
+// claim is only made from a completely clean exit record.
 func backupExit(err error, code int) bool {
-	status, started, _, nativeErr, followupErr, known := RequestedOperationOutcome(err)
-	var exit *exec.ExitError
-	return known && started && status == RequestedOperationFailed && followupErr == nil &&
-		errors.As(nativeErr, &exit) && exit.ExitCode() == code
+	followupErr, exited := requestedNativeExit(err, code)
+	return exited && followupErr == nil
 }
 
 func resticPartialSnapshot(capture *command.CapturedOutput, runErr error) (models.Snapshot, bool) {

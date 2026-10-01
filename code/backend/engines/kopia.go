@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -147,6 +148,13 @@ func (e *kopiaEngine) baseArgs(repo models.Repository) ([]string, []string, erro
 		if sas := azureSASToken(repo.ConnectorOptions); sas != "" {
 			env = append(env, "AZURE_STORAGE_SAS_TOKEN="+sas)
 		}
+	case "webdav":
+		// Kopia reads these only for create and connect, then keeps the WebDAV
+		// password in its own per-vault repository.config like S3 and Azure keys.
+		// Passing them in the environment keeps them out of the process list; the
+		// --webdav-username/--webdav-password flags would put them on argv.
+		env = append(env, "KOPIA_WEBDAV_USERNAME="+repo.ConnectorOptions["username"],
+			"KOPIA_WEBDAV_PASSWORD="+repo.ConnectorOptions["password"])
 	}
 	if socket := strings.TrimSpace(repo.ConnectorOptions["ssh_auth_sock"]); socket != "" {
 		env = append(env, "SSH_AUTH_SOCK="+socket)
@@ -1038,7 +1046,18 @@ func (e *kopiaEngine) Restore(ctx context.Context, repo models.Repository, id st
 	// Kopia's default auto mode treats archive suffixes as output-format requests
 	// and uses os.Create, bypassing filesystem no-overwrite flags. This feature
 	// always requests native filesystem output, including filenames ending .zip.
-	args := []string{"snapshot", "restore", "--mode=local", "--parallel", strconv.Itoa(concurrency.restore)}
+	//
+	// --ignore-errors is passed on purpose. Without it Kopia stops at the first
+	// file it cannot write and leaves a partly restored destination, with no
+	// word on how much was restored. With it Kopia restores everything else,
+	// prints one "ignored error" line per failure and a final "ignored N
+	// errors" summary, and exits 0. Restic also carries on past failed files,
+	// but it ends such a restore with exit code 1; Kopia's exit code does not
+	// change. That means exit 0 proves nothing on its own, so the result is
+	// read from the output in kopiaRestoreOutcome. Other native failures (for
+	// example the repository cannot be opened) still exit non-zero and stay
+	// failed.
+	args := []string{"snapshot", "restore", "--mode=local", "--parallel", strconv.Itoa(concurrency.restore), "--ignore-errors"}
 	switch options.ConflictMode {
 	case "overwrite":
 	case "no-overwrite":
@@ -1048,8 +1067,60 @@ func (e *kopiaEngine) Restore(ctx context.Context, repo models.Repository, id st
 			fmt.Errorf("unsupported Kopia conflict mode %q", options.ConflictMode))
 	}
 	args = append(args, restoreSource, destination)
-	out, err := e.repoRun(ctx, repo, args, command.NoTotalDeadline)
-	return out, err
+	session, sessionOutput, err := e.openRepositorySession(ctx, repo, false)
+	if err != nil {
+		return sessionOutput, kopiaPreparationFailure(repo, err)
+	}
+	capture, out, err := session.runCaptured(ctx, args, command.NoTotalDeadline)
+	if capture != nil {
+		defer capture.Close()
+	}
+	return out, kopiaRestoreResult(capture, err)
+}
+
+// kopiaRestoreResult turns a finished Kopia restore (always run with
+// --ignore-errors) into its requested-operation result. A non-zero exit keeps
+// its ordinary failure; an exit 0 is read from the output by
+// kopiaRestoreOutcome.
+func kopiaRestoreResult(capture *command.CapturedOutput, err error) error {
+	var captureErr error
+	if err != nil {
+		status, _, _, _, followupErr, known := RequestedOperationOutcome(err)
+		if !known || status != RequestedOperationSucceeded {
+			return err
+		}
+		// Exit 0, but the output could not be captured completely, so the
+		// summary below cannot be trusted either.
+		captureErr = followupErr
+	}
+	ignored, recognized := kopiaRestoreOutcome(capture)
+	switch {
+	case !recognized || captureErr != nil:
+		// Kopia exited 0 but its final summary was not found, was repeated, or
+		// was not fully captured. The requested child stays succeeded, because
+		// that is what Kopia reported, so the native restore step and the log
+		// header agree with the exit code. Reading the result is what failed,
+		// so it is reported as a typed output-processing follow-up.
+		//
+		// A native success with a failed follow-up is normally completed with
+		// issues. Not here: Kopia carries on past errors, so exit 0 is no
+		// evidence that anything was restored, and the summary we could not
+		// read was the only evidence there is. RestoreOutcomeUnknown tells the
+		// restore outcome code to keep the operation failed. It must never be
+		// success or completed with issues. The output is kept unchanged for
+		// the log.
+		return &RequestedOperationFailure{
+			Engine: KopiaID, Status: RequestedOperationSucceeded, ProcessStarted: true,
+			FollowupError: errors.Join(&command.OutputProcessingFailure{
+				Err: &RestoreOutcomeUnknown{
+					Detail: "Kopia restore exited 0 but its final restore summary was not recognized, so the restore result is unknown",
+				},
+			}, captureErr),
+		}
+	case ignored > 0:
+		return &RestoreCompletedWithErrors{Engine: KopiaID, Errors: ignored}
+	}
+	return nil
 }
 
 type kopiaSelectedEntryType string
@@ -1195,22 +1266,19 @@ func (e *kopiaEngine) prepareIntegrityCheckCache(ctx context.Context, repo model
 	return output, nil
 }
 
-func (e *kopiaEngine) Check(ctx context.Context, repo models.Repository, id string) (output string, err error) {
+func (e *kopiaEngine) Check(ctx context.Context, repo models.Repository) (output string, err error) {
 	concurrency, err := kopiaConcurrency(repo)
 	if err != nil {
 		return "", kopiaPreparationFailure(repo, err)
 	}
+	// Always the whole repository: `snapshot verify` with no snapshot ID. The
+	// snapshot-scoped form went away with the unused snapshot check endpoint,
+	// and it was also the only form that verified through the canonical config.
+	// Every caller now has to prepare the operation-owned copy first
+	// (PrepareIntegrityCheck).
 	args := []string{"snapshot", "verify", "--verify-files-percent=100",
 		"--parallel", strconv.Itoa(concurrency.verify),
 		"--file-parallelism", strconv.Itoa(concurrency.verifyFiles)}
-	if id != "" {
-		if err := ValidateSnapshotIDArgument(id); err != nil {
-			return "", kopiaPreparationFailure(repo, err)
-		}
-		args = append(args, id)
-		out, runErr := e.repoRun(ctx, repo, args, command.NoTotalDeadline)
-		return out, runErr
-	}
 	operationConfig := integrityCheckKopiaConfig(ctx)
 	if operationConfig == "" {
 		return "", kopiaPreparationFailure(repo, fmt.Errorf("operation-owned Kopia integrity configuration is unavailable"))
@@ -1325,17 +1393,16 @@ func removeEnvironment(env []string, key string) []string {
 	return result
 }
 
+// repoRunWithInput runs ordinary commands against the canonical Kopia config.
+// Integrity checks never come through here: Check runs `snapshot verify` on an
+// operation-owned config copy via runCaptured and does its own
+// admitIntegrityCheck, so there is deliberately no verify admission below.
 func (e *kopiaEngine) repoRunWithInput(ctx context.Context, repo models.Repository, args []string, input string, timeout time.Duration) (string, error) {
 	repo = normalizedStorageRepository(repo, KopiaID)
 	if !kopiaBootstrapCommand(args) {
 		if session := scopedKopiaSession(ctx, repo); session != nil {
 			if len(args) >= 2 && args[0] == "snapshot" && args[1] == "delete" {
 				if admissionErr := admitNativeDeletion(ctx); admissionErr != nil {
-					return "", kopiaPreparationFailure(repo, admissionErr)
-				}
-			}
-			if len(args) >= 2 && args[0] == "snapshot" && args[1] == "verify" {
-				if admissionErr := admitIntegrityCheck(ctx); admissionErr != nil {
 					return "", kopiaPreparationFailure(repo, admissionErr)
 				}
 			}
@@ -1364,11 +1431,6 @@ func (e *kopiaEngine) repoRunWithInput(ctx context.Context, repo models.Reposito
 	}
 	if len(args) >= 2 && args[0] == "snapshot" && args[1] == "delete" {
 		if admissionErr := admitNativeDeletion(ctx); admissionErr != nil {
-			return "", kopiaPreparationFailure(repo, admissionErr)
-		}
-	}
-	if len(args) >= 2 && args[0] == "snapshot" && args[1] == "verify" {
-		if admissionErr := admitIntegrityCheck(ctx); admissionErr != nil {
 			return "", kopiaPreparationFailure(repo, admissionErr)
 		}
 	}
@@ -1414,7 +1476,16 @@ func (e *kopiaEngine) ensureKopiaRepository(ctx context.Context, repo models.Rep
 	if statErr != nil && !os.IsNotExist(statErr) {
 		return "", statErr
 	}
-	markerExists := repo.Connector != "fs" || kopiaRepositoryExists(repo.Location)
+	markerExists := true
+	if repo.Connector == "fs" {
+		// This runs under the Kopia initialization lock, so the marker stat on
+		// the vault folder is bounded by ctx; a hung share returns ctx's error
+		// and releases the lock instead of holding it until the OS call returns.
+		markerExists, err = ReadWithin(ctx, func() (bool, error) { return kopiaMarkerExists(repo.Location), nil })
+		if err != nil {
+			return "", err
+		}
+	}
 	output := ""
 	if os.IsNotExist(statErr) && markerExists {
 		output, err = e.connect(ctx, repo)
@@ -1516,12 +1587,6 @@ func validateKopiaBinding(repo models.Repository, output string) error {
 	// timed out and killed. If Kopia reports the vault under a different
 	// spelling, such as a link alias, this check fails with "bound to a different
 	// repository". That is intended.
-	//
-	// Other unbounded calls remain: ensureKopiaRepository stats the vault's marker
-	// files in-process (kopiaRepositoryExists), and admission reads the native
-	// identity marker in-process. Neither is bounded by the admission deadline,
-	// so a share that hangs exactly there can still stall this vault's work.
-	// That is a known limitation.
 	if actual != expected {
 		return fmt.Errorf("kopia configuration is bound to a different repository")
 	}
@@ -1590,6 +1655,31 @@ func kopiaStatusAddress(storage, config map[string]any) (vaultidentity.Effective
 		literalPrefix = stringValue("prefix")
 		actual.Connector = "gcs"
 		actual.Location = "gs://" + stringValue("bucket") + "/status-path"
+	case "webdav":
+		// Kopia reports the --url value exactly as kopiaStorageArgs passed it
+		// (vaultidentity.WebDAVURL). Only the scheme, host, and port are resolved;
+		// the path after the authority is compared literally, like the other
+		// connectors' prefixes, and never goes back through the input parser.
+		scheme, rest, found := strings.Cut(stringValue("url"), "://")
+		authority, storagePath := rest, ""
+		if index := strings.IndexByte(rest, '/'); index >= 0 {
+			authority, storagePath = rest[:index], rest[index:]
+		}
+		if !found || storagePath == "" || strings.ContainsAny(authority, "/\\?#@%") {
+			return vaultidentity.EffectiveAddress{}, fmt.Errorf("kopia repository status has an invalid storage address")
+		}
+		host, port := authority, ""
+		if splitHost, splitPort, splitErr := net.SplitHostPort(authority); splitErr == nil {
+			host, port = splitHost, splitPort
+		}
+		host = strings.Trim(host, "[]")
+		if strings.Contains(host, ":") {
+			host = "[" + host + "]"
+		}
+		actual.Connector = "webdav"
+		actual.Location = scheme + "://" + host + "/status-path"
+		actual.ConnectorOptions["port"] = port
+		literalPrefix = storagePath
 	default:
 		return vaultidentity.EffectiveAddress{}, fmt.Errorf("kopia repository status reported unsupported storage type %q", storageType)
 	}
@@ -1795,6 +1885,18 @@ func kopiaStorageArgs(repo models.Repository, operation string) ([]string, error
 		if domain := azureStorageDomain(address.Endpoint, account); domain != "" {
 			args = append(args, "--storage-domain", domain)
 		}
+	case "webdav":
+		// The WebDAV credentials come from KOPIA_WEBDAV_* in baseArgs, never argv.
+		// Kopia's defaults are kept on purpose. Without --flat, blobs are sharded
+		// into nested folders, so no single server folder grows huge and slow to
+		// list. Without --atomic-writes, each blob is uploaded under a temporary
+		// name and then MOVEd into place, so a half-uploaded blob never appears
+		// under its real name on servers that don't guarantee atomic PUTs.
+		vaultURL, err := vaultidentity.WebDAVURL(address)
+		if err != nil {
+			return nil, err
+		}
+		args = append(args, "webdav", "--url", vaultURL)
 	case "gcs":
 		if address.Endpoint != "" {
 			return nil, fmt.Errorf("Kopia GCS does not support custom endpoints")
@@ -1904,8 +2006,9 @@ func parseKopiaSnapshotReader(output io.Reader) (models.Snapshot, error) {
 }
 
 // kopiaRepositoryExists stats the marker files directly on the vault path,
-// in-process and without a deadline. It is not covered by the admission
-// deadline; see the note in the Kopia config address check.
+// in-process, and cannot be interrupted. Its callers (ensureKopiaRepository's
+// marker check and, through RepositoryMissingContext, the missing-repository
+// check) run it through ReadWithin so a hung share cannot hold their lock.
 func kopiaRepositoryExists(location string) bool {
 	for _, name := range []string{"kopia.repository.f", "kopia.blobcfg.f", "kopia.maintenance.f"} {
 		if _, err := os.Stat(filepath.Join(location, name)); err == nil {
@@ -1916,6 +2019,11 @@ func kopiaRepositoryExists(location string) bool {
 }
 
 func KopiaRepositoryExists(location string) bool { return kopiaRepositoryExists(location) }
+
+// kopiaMarkerExists is the marker check ensureKopiaRepository runs; tests
+// replace it to simulate a read that never returns.
+var kopiaMarkerExists = kopiaRepositoryExists
+
 func decodeUniqueJSON(data []byte) (any, error) {
 	value, _, err := decodeUniqueJSONAllowDuplicatePath(data, nil)
 	return value, err

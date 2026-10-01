@@ -1022,6 +1022,12 @@ func ReconnectRecoveredRepository(db *sql.DB, repo models.Repository, jobs []mod
 			return "", nil, err
 		}
 	}
+	// A successful reconnect is the user's answer to the saved reconnect state,
+	// whichever job or worker set it, so it clears the state together with the
+	// worker failure clocks: the attachment they measured is the old one.
+	if err := clearVaultReconnectStateTx(tx, repo.ID); err != nil {
+		return "", nil, err
+	}
 	if err := tx.Commit(); err != nil {
 		return "", nil, err
 	}

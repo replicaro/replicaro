@@ -42,6 +42,16 @@ const canonicalProfileObject = canonicalRootObject
 const previousProfileObject = previousRootObject
 const pendingProfilePrefix = pendingRootPrefix
 
+// sidecarRemoteName is the rclone crypt remote that carries the sidecar; see
+// engines.RcloneSidecarRemoteName for why it has this name.
+const sidecarRemoteName = engines.RcloneSidecarRemoteName
+
+// sidecarRemote addresses paths inside the sidecar remote in rclone arguments.
+const sidecarRemote = sidecarRemoteName + ":"
+
+// sidecarEnvPrefix is the prefix rclone reads the sidecar remote's options from.
+var sidecarEnvPrefix = "RCLONE_CONFIG_" + strings.ToUpper(sidecarRemoteName) + "_"
+
 var runRclone = command.RunWithInputSecretsPrivateOutput
 var materializeRclone = rclone.Materialize
 var newRclonePreviewSidecarConfig = engines.NewRclonePreviewSidecarConfig
@@ -71,6 +81,29 @@ func reconnectRequired(err error) error {
 // read failures are deliberately not treated as reconnect-required.
 func IsReconnectRequired(err error) bool {
 	return errors.Is(err, errReconnectRequired)
+}
+
+// MarkReconnectRequired lets a caller outside this package classify its own
+// conclusive attachment check the same way this store classifies its reads.
+// The profile sync worker uses it when the profile it would publish, or the
+// one it just read, belongs to a different attachment than the saved vault.
+// Do not use it for transport or ambiguous read failures.
+func MarkReconnectRequired(err error) error {
+	return reconnectRequired(err)
+}
+
+// ErrOwnerTransferUnfinished is matched (errors.Is) by the errors returned
+// when the protected root still carries an ownership transfer marker. The
+// error text is unchanged; the marker only lets background workers leave an
+// unfinished transfer out of their reconnect clock, since the transfer is
+// finished by repeating the takeover, not by reconnecting.
+var ErrOwnerTransferUnfinished = errors.New("protected vault ownership transfer is unfinished")
+
+type ownerTransferUnfinishedError struct{ message string }
+
+func (e *ownerTransferUnfinishedError) Error() string { return e.message }
+func (e *ownerTransferUnfinishedError) Is(target error) bool {
+	return target == ErrOwnerTransferUnfinished
 }
 
 type Store struct {
@@ -295,7 +328,7 @@ func (a RootCareAuthority) AssertRepositoryOwner(repo models.Repository) error {
 	return nil
 }
 
-const savedVaultPasswordFailureMessage = "The saved vault password no longer unlocks this vault. It may have been changed. Select Reconnect and enter the current password."
+const savedVaultPasswordFailureMessage = "The saved vault encryption password no longer unlocks this vault. It may have been changed. Select Reconnect and enter the current vault encryption password."
 
 // IsVaultPasswordDecryptionFailure recognizes only the secret-free marker from
 // a protected crypt read, without hiding a separate post-command failure.
@@ -347,8 +380,19 @@ func (s Store) session(ctx context.Context) (session *storeSession, err error) {
 	}
 	var cleanupConfig func() error
 	var configBinding *engines.RcloneVaultConfigBinding
+	// rcloneRemoteEnv is the Any Rclone Remote vault's own environment: no
+	// password prompts, the rclone config password, and the user's variables.
+	// It is kept apart from remote.env so nothing in it is obscured or
+	// filtered like the base remote's settings.
+	var rcloneRemoteEnv []string
 	configPath, pathErr := engines.RcloneVaultConfigPath(s.Repository.ID)
-	if pathErr != nil && !engines.IsResticRcloneConnector(s.Repository.Connector) &&
+	if s.Repository.Connector == engines.RcloneRemoteConnector {
+		// The user's own config file, read in place: there is no private
+		// config to create, bind, or check before and after each command.
+		var run engines.RcloneRemoteRun
+		run, err = engines.RcloneRemoteRunForRepository(s.Repository)
+		configPath, rcloneRemoteEnv = run.ConfigFile, run.Env
+	} else if pathErr != nil && !engines.IsResticRcloneConnector(s.Repository.Connector) &&
 		s.Repository.RcloneConfigPath == "" {
 		configPath, cleanupConfig, err = newRclonePreviewSidecarConfig(ctx)
 	} else if pathErr == nil &&
@@ -385,9 +429,11 @@ func (s Store) session(ctx context.Context) (session *storeSession, err error) {
 		}
 	}
 	baseEnv := append([]string{}, remote.env...)
+	// For an Any Rclone Remote vault even this step points at the user's file,
+	// so it gets the same no-prompt environment as every other command.
 	output, err := runStoreRclone(
 		ctx, configBinding, binary,
-		[]string{"obscure", "-", "--config", configPath}, nil,
+		[]string{"obscure", "-", "--config", configPath}, rcloneRemoteEnv,
 		s.Repository.Passphrase+"\n", time.Minute, "rclone",
 	)
 	if err != nil {
@@ -415,20 +461,21 @@ func (s Store) session(ctx context.Context) (session *storeSession, err error) {
 		baseEnv[index] = key + "=" + obscuredValue
 	}
 	baseEnv = append(baseEnv,
-		"RCLONE_CONFIG_CRYPT_TYPE=crypt",
-		"RCLONE_CONFIG_CRYPT_REMOTE="+strings.TrimSuffix(remote.cryptRoot, "/")+"/replicaro",
-		"RCLONE_CONFIG_CRYPT_FILENAME_ENCRYPTION=off",
-		"RCLONE_CONFIG_CRYPT_DIRECTORY_NAME_ENCRYPTION=false",
-		"RCLONE_CONFIG_CRYPT_SUFFIX=none",
-		"RCLONE_CONFIG_CRYPT_PASSWORD="+obscured,
-		"RCLONE_CONFIG_CRYPT_PASSWORD2=",
-		"RCLONE_CONFIG_CRYPT_SERVER_SIDE_ACROSS_CONFIGS=false",
-		"RCLONE_CONFIG_CRYPT_SHOW_MAPPING=false",
-		"RCLONE_CONFIG_CRYPT_NO_DATA_ENCRYPTION=false",
-		"RCLONE_CONFIG_CRYPT_PASS_BAD_BLOCKS=false",
-		"RCLONE_CONFIG_CRYPT_STRICT_NAMES=false",
-		"RCLONE_CONFIG_CRYPT_FILENAME_ENCODING=base32",
+		sidecarEnvPrefix+"TYPE=crypt",
+		sidecarEnvPrefix+"REMOTE="+strings.TrimSuffix(remote.cryptRoot, "/")+"/replicaro",
+		sidecarEnvPrefix+"FILENAME_ENCRYPTION=off",
+		sidecarEnvPrefix+"DIRECTORY_NAME_ENCRYPTION=false",
+		sidecarEnvPrefix+"SUFFIX=none",
+		sidecarEnvPrefix+"PASSWORD="+obscured,
+		sidecarEnvPrefix+"PASSWORD2=",
+		sidecarEnvPrefix+"SERVER_SIDE_ACROSS_CONFIGS=false",
+		sidecarEnvPrefix+"SHOW_MAPPING=false",
+		sidecarEnvPrefix+"NO_DATA_ENCRYPTION=false",
+		sidecarEnvPrefix+"PASS_BAD_BLOCKS=false",
+		sidecarEnvPrefix+"STRICT_NAMES=false",
+		sidecarEnvPrefix+"FILENAME_ENCODING=base32",
 	)
+	baseEnv = append(baseEnv, rcloneRemoteEnv...)
 	session = &storeSession{
 		binary: binary, config: configPath, root: remote.root, env: baseEnv,
 		repository:           s.Repository,
@@ -579,7 +626,7 @@ func runStoreRclone(
 }
 
 func rcloneCryptReadDecryptionFailure(args []string, err error) bool {
-	if len(args) < 2 || args[0] != "cat" || args[1] != "crypt:" || err == nil {
+	if len(args) < 2 || args[0] != "cat" || args[1] != sidecarRemote || err == nil {
 		return false
 	}
 	return command.PrivateOutputFailureKind(err) == command.PrivateFailureDecryptAuthentication
@@ -788,7 +835,7 @@ func boundedProfileObjects(ctx context.Context, session *storeSession, max int) 
 	// List only the protected profiles subtree. Decode one listing entry at a
 	// time and stop retaining identities at max+1, so an oversized protected
 	// tree cannot first become an unbounded in-memory object set.
-	output, err := session.run(ctx, "lsjson", "crypt:profiles", "--recursive", "--files-only", "--max-depth", "3",
+	output, err := session.run(ctx, "lsjson", sidecarRemote+"profiles", "--recursive", "--files-only", "--max-depth", "3",
 		"--include", "*/profile.replicaro", "--include", "*/profile.replicaro.previous")
 	if err != nil {
 		if rcloneObjectMissing(err) {
@@ -949,7 +996,7 @@ func (s Store) AssertRootOwner(ctx context.Context, clientUUID, profileUUID stri
 		return ErrNotVaultOwner
 	}
 	if root.OwnerTransfer != nil {
-		return fmt.Errorf("protected vault ownership is transitional")
+		return &ownerTransferUnfinishedError{message: "protected vault ownership is transitional"}
 	}
 	return s.ForProfile(profileUUID).AssertAttachment(ctx, clientUUID, generation)
 }
@@ -970,7 +1017,10 @@ func (s Store) ReadRootCareAuthority(ctx context.Context) (RootCareAuthority, er
 		root.Repository.NativeRepositoryID != s.Repository.NativeRepositoryID {
 		return RootCareAuthority{}, reconnectRequired(fmt.Errorf("the protected vault root does not match this saved vault"))
 	}
-	if root.PasswordChange != nil || root.OwnerTransfer != nil {
+	if root.OwnerTransfer != nil {
+		return RootCareAuthority{}, &ownerTransferUnfinishedError{message: "protected vault care is transitional"}
+	}
+	if root.PasswordChange != nil {
 		return RootCareAuthority{}, fmt.Errorf("protected vault care is transitional")
 	}
 	ownerResult, err := s.ForProfile(root.VaultOwner.ProfileUUID).ReadDetailed(ctx)
@@ -1101,9 +1151,9 @@ func (s Store) Replace(ctx context.Context, plaintext []byte) error {
 	return s.Publish(ctx, plaintext, PublishOptions{OperationID: uuid.NewString()})
 }
 
-// Create publishes a profile only if the exact object is still absent. It is
-// used by the missing-profile connect fallback so a profile created by another
-// actor after preview is never overwritten.
+// Create checks that the exact object is absent before publishing a profile.
+// The missing-profile connect fallback uses this check, but publication is not
+// atomic across computers; see the create-only copy below.
 func (s Store) Create(ctx context.Context, plaintext []byte) error {
 	return s.Publish(ctx, plaintext, PublishOptions{OperationID: uuid.NewString(), CreateOnly: true})
 }
@@ -1249,7 +1299,7 @@ func (s Store) publishUnderLock(ctx context.Context, plaintext []byte, options P
 		if string(pendingData) != string(plaintext) {
 			return fmt.Errorf("profile publication operation has conflicting pending data")
 		}
-	} else if _, err := session.run(ctx, "copyto", localPath, "crypt:"+pendingObject, "--immutable"); err != nil {
+	} else if _, err := session.run(ctx, "copyto", localPath, sidecarRemote+pendingObject, "--immutable"); err != nil {
 		return fmt.Errorf("upload pending vault recovery profile: %w", err)
 	}
 	pending, pendingErr := s.readObjectBounded(ctx, session, pendingObject)
@@ -1267,7 +1317,7 @@ func (s Store) publishUnderLock(ctx context.Context, plaintext []byte, options P
 				return err
 			}
 		}
-		if _, err := session.run(ctx, "copyto", "crypt:"+canonical, "crypt:"+previous, "--ignore-times"); err != nil {
+		if _, err := session.run(ctx, "copyto", sidecarRemote+canonical, sidecarRemote+previous, "--ignore-times"); err != nil {
 			return fmt.Errorf("preserve previous vault recovery profile: %w", err)
 		}
 		preserved, preserveErr := s.readObjectBounded(ctx, session, previous)
@@ -1283,8 +1333,13 @@ func (s Store) publishUnderLock(ctx context.Context, plaintext []byte, options P
 			return err
 		}
 	}
-	publishArgs := []string{"copyto", "crypt:" + pendingObject, "crypt:" + canonical}
+	publishArgs := []string{"copyto", sidecarRemote + pendingObject, sidecarRemote + canonical}
 	if options.CreateOnly {
+		// Pinned rclone's copyto --immutable can overwrite a differing destination.
+		// The listing above is the create-only check, not a remote reservation.
+		// Another computer can publish between that check and this copy; that
+		// small race is known and accepted product behavior. The local UUID lock
+		// and exact readback still apply, without adding remote coordination.
 		publishArgs = append(publishArgs, "--immutable")
 	} else {
 		publishArgs = append(publishArgs, "--ignore-times")
@@ -1349,7 +1404,7 @@ func (s Store) ensureExpectedCurrent(ctx context.Context, session *storeSession,
 func cleanupProfileObject(parent context.Context, session *storeSession, name string) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), 20*time.Second)
 	defer cancel()
-	_, _ = session.run(ctx, "deletefile", "crypt:"+name)
+	_, _ = session.run(ctx, "deletefile", sidecarRemote+name)
 }
 
 func stageProfile(plaintext []byte, pattern string) (string, error) {
@@ -1444,8 +1499,8 @@ func (s Store) readObjectBoundedValidated(
 	if limitErr != nil {
 		return nil, recoverableProfileRead(limitErr)
 	}
-	args := []string{"cat", "crypt:", "--files-from-raw", "-", "--no-traverse", "--count", strconv.Itoa(limit + 1)}
-	output, err := session.runWithInput(ctx, profileTimingLabel([]string{"cat", "crypt:" + name}), name+"\n", args...)
+	args := []string{"cat", sidecarRemote, "--files-from-raw", "-", "--no-traverse", "--count", strconv.Itoa(limit + 1)}
+	output, err := session.runWithInput(ctx, profileTimingLabel([]string{"cat", sidecarRemote + name}), name+"\n", args...)
 	if err != nil {
 		if rcloneObjectMissing(err) || rcloneObjectIsDirectory(err) {
 			return nil, recoverableProfileRead(err)
@@ -1488,7 +1543,7 @@ func profileObjects(ctx context.Context, session *storeSession) (map[string]obje
 	// The crypt remote is already rooted at <vault>/replicaro. Listing it
 	// directly avoids enumerating a potentially huge bucket or prefix merely to
 	// discover whether that one directory exists.
-	output, err := session.run(ctx, "lsjson", "crypt:", "--recursive", "--files-only", "--max-depth", "4")
+	output, err := session.run(ctx, "lsjson", sidecarRemote, "--recursive", "--files-only", "--max-depth", "4")
 	if err != nil {
 		if rcloneObjectMissing(err) {
 			return map[string]objectStat{}, nil
@@ -1744,6 +1799,27 @@ func translateRemote(repo models.Repository) (remoteConfig, error) {
 			"RCLONE_CONFIG_BASE_CLIENT_CREDENTIALS=false", "RCLONE_CONFIG_BASE_AUTH_URL=",
 			"RCLONE_CONFIG_BASE_TOKEN_URL=")
 		root = remotePath(effective.Bucket, effective.Prefix)
+	case "webdav":
+		// The same remote Restic's WebDAV transport uses. RCLONE_CONFIG_BASE_PASS
+		// is obscured by the session loop below before any command runs. These
+		// five names are the whole WebDAV remote; nothing is written to the
+		// vault's rclone config file, which stays empty.
+		settings, password, remoteErr := engines.WebDAVRcloneRemote(effective, repo.ConnectorOptions)
+		if remoteErr != nil {
+			return remoteConfig{}, remoteErr
+		}
+		env = append(env, settings...)
+		env = append(env, "RCLONE_CONFIG_BASE_PASS="+password)
+		root = "base:"
+	case engines.RcloneRemoteConnector:
+		// The base is the user's own remote, so there are no base variables:
+		// RCLONE_CONFIG_BASE_* would change a remote the user named "base".
+		// The run's environment is added separately by the session.
+		run, runErr := engines.RcloneRemoteRunForRepository(repo)
+		if runErr != nil {
+			return remoteConfig{}, runErr
+		}
+		root = run.Root
 	case "google_drive", "dropbox", "onedrive":
 		provider, ok := engines.RcloneProvider(repo.Connector)
 		if !ok || repo.Engine != engines.ResticID {
@@ -1849,7 +1925,7 @@ func (s Store) RemoveProfileForTests(ctx context.Context) (err error) {
 	sort.Strings(names)
 	var cleanupErr error
 	for _, name := range names {
-		if _, deleteErr := session.run(ctx, "deletefile", "crypt:"+name); deleteErr != nil {
+		if _, deleteErr := session.run(ctx, "deletefile", sidecarRemote+name); deleteErr != nil {
 			cleanupErr = errors.Join(cleanupErr, fmt.Errorf("delete vault recovery profile %q for test cleanup: %w", name, deleteErr))
 		}
 	}

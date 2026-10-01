@@ -51,8 +51,43 @@ type ExistingVaultStorage struct {
 	ReviewJoin           bool              `json:"-"`
 }
 
+// kopiaRcloneProviderUnsupportedCode marks the preview error for a Kopia
+// repository found on a Restic-only rclone provider. The UI replaces the
+// English text with its catalog message, passing the provider name.
+const kopiaRcloneProviderUnsupportedCode = "kopia_rclone_provider_unsupported"
+
+type kopiaRcloneProviderError struct {
+	provider string
+}
+
+func newKopiaRcloneProviderError(connector string) *kopiaRcloneProviderError {
+	provider, _ := engines.RcloneProvider(connector)
+	return &kopiaRcloneProviderError{provider: provider.Label}
+}
+
+func (err *kopiaRcloneProviderError) Error() string {
+	return fmt.Sprintf("Replicaro does not support %[1]s for the Kopia engine, because Kopia is no longer actively maintaining its rclone support. Replicaro supports %[1]s using the Restic engine.", err.provider)
+}
+
+// writeExistingVaultPreviewError answers a failed connection check. Only the
+// Kopia provider message and the Any Rclone Remote checks carry a code; every
+// other error keeps its text.
+func writeExistingVaultPreviewError(w http.ResponseWriter, err error) {
+	markSupportStorageObservation(w, "vault_connect_destination", err)
+	if writeRcloneRemoteError(w, err) {
+		return
+	}
+	var unsupported *kopiaRcloneProviderError
+	if errors.As(err, &unsupported) {
+		markSupportResponseError(w, err, false)
+		writeCodedError(w, http.StatusBadRequest, kopiaRcloneProviderUnsupportedCode, err.Error())
+		return
+	}
+	writeError(w, http.StatusBadRequest, err)
+}
+
 const refreshedCredentialStateFailure = "refreshed credential state could not be safely collected"
-const existingVaultCredentialStateGuidance = "A Replicaro vault exists, but Replicaro could not safely decrypt or validate it. Check the vault password and connection credentials, then try again."
+const existingVaultCredentialStateGuidance = "A Replicaro vault exists, but Replicaro could not safely decrypt or validate it. Check the vault encryption password and the storage connection settings, then try again."
 
 func explainExistingVaultCredentialStateFailure(err error) error {
 	if err == nil || !strings.Contains(err.Error(), refreshedCredentialStateFailure) {
@@ -677,11 +712,21 @@ func deterministicImportVaultUUID(engine, nativeRepositoryID string) string {
 
 func automaticSoleProfileConnector(connector string) bool {
 	// These providers use an attachment-local, opaque rclone authorization that
-	// Replicaro does not coordinate across computers. Each vault therefore has
-	// one transferable profile: reconnect it for the same client, take it over
-	// for a different client, and fail closed if any additional profile exists.
+	// Replicaro does not coordinate across computers. They are also slower,
+	// eventually consistent backends, where several profiles writing to one
+	// vault would not reliably see each other's changes. Each vault therefore
+	// has one transferable profile: reconnect it for the same client, take it
+	// over for a different client, and fail closed if any additional profile
+	// exists. An Any Rclone Remote vault can be on any rclone backend, which
+	// Replicaro can't tell apart, so it takes the same limits.
+	//
+	// WebDAV is deliberately not listed. Restic reaches it through rclone too,
+	// but it is an ordinary server connector like SFTP, with no per-computer
+	// authorization, so it keeps Join and multiple profiles. The same fixed list
+	// is in profilebinding/repair.go and the Normal concurrency cap in
+	// models.NormalizeConcurrencyModeForConnector; keep them in step.
 	switch connector {
-	case "dropbox", "google_drive", "onedrive":
+	case "dropbox", "google_drive", "onedrive", "rclone_remote":
 		return true
 	default:
 		return false
@@ -1130,10 +1175,11 @@ func verifyConnectionProfileBeforeAttachment(ctx context.Context, repo models.Re
 }
 
 func verifyPendingConnectionRoot(ctx context.Context, repo models.Repository, payload connectionIntentPayload, finalRootExpected bool) error {
-	if !engines.IsResticRcloneConnector(repo.Connector) {
-		// This retry check is for rclone-provider connections, whose config may
-		// already be published when the retry runs. Other connectors keep their
-		// existing retry checks.
+	if !engines.IsRcloneNativeLoginProvider(repo.Connector) {
+		// This retry check is for the sign-in providers' connections, whose
+		// private config may already be published when the retry runs. Other
+		// connectors, Any Rclone Remote included, keep their existing retry
+		// checks.
 		return nil
 	}
 	rootMayBePublished := payload.PublishRoot || payload.OwnerTransferFromProfileUUID != ""
@@ -1395,7 +1441,7 @@ func handleExistingVaultRetry(db *sql.DB, auth *rcloneAuthStore) http.HandlerFun
 		finishRcloneAuth := func(engines.RcloneConfigDisposition) error { return nil }
 		configPath := ""
 		options := req.Options
-		if engines.IsResticRcloneConnector(intent.Connector) && strings.TrimSpace(req.RcloneAuthSessionID) == "" {
+		if engines.IsRcloneNativeLoginProvider(intent.Connector) && strings.TrimSpace(req.RcloneAuthSessionID) == "" {
 			// This proves that the saved file is safely bound to the reviewed
 			// vault. Only the later native repository validation can establish
 			// whether its opaque provider credentials still work.
@@ -1411,7 +1457,7 @@ func handleExistingVaultRetry(db *sql.DB, auth *rcloneAuthStore) http.HandlerFun
 				req.RcloneAuthSessionID, intent.Connector, options,
 			)
 			if err != nil {
-				if engines.IsResticRcloneConnector(intent.Connector) {
+				if engines.IsRcloneNativeLoginProvider(intent.Connector) {
 					writeRcloneAuthorizationError(w, http.StatusBadRequest,
 						"native rclone authorization session is unavailable or not ready")
 				} else {
@@ -1419,7 +1465,7 @@ func handleExistingVaultRetry(db *sql.DB, auth *rcloneAuthStore) http.HandlerFun
 				}
 				return
 			}
-			if engines.IsResticRcloneConnector(intent.Connector) {
+			if engines.IsRcloneNativeLoginProvider(intent.Connector) {
 				configPath, err = auth.configPath(req.RcloneAuthSessionID, intent.Connector)
 				if err != nil {
 					_ = finishRcloneAuth(engines.RcloneConfigRetained)
@@ -1437,6 +1483,12 @@ func handleExistingVaultRetry(db *sql.DB, auth *rcloneAuthStore) http.HandlerFun
 		options, err = pendingConnectionRetryOptions(intent, options)
 		if err != nil {
 			writeError(w, http.StatusConflict, err)
+			return
+		}
+		if err := checkRcloneRemoteSettings(r.Context(), intent.Connector, options); err != nil {
+			if !writeRcloneRemoteError(w, err) {
+				writeError(w, http.StatusBadRequest, err)
+			}
 			return
 		}
 		storage, err := normalizedExistingStorage(ExistingVaultStorage{
@@ -1462,13 +1514,15 @@ func handleExistingVaultRetry(db *sql.DB, auth *rcloneAuthStore) http.HandlerFun
 			writeError(w, http.StatusInternalServerError, keyErr)
 			return
 		}
-		unlock, ok, lockErr := vaultlock.YieldLowPriorityAndTryExclusiveContext(r.Context(), vaultUUID)
+		// Connecting is a foreground request, so a busy vault is waited for
+		// rather than refused (the user would otherwise just press Retry until
+		// the other work ends). Everything read before the wait is re-read
+		// below: only the intent's state and error can change, and the
+		// connection may have finished, or been cancelled, by whoever held the
+		// lock. Cancelling the request (closing the page) ends the wait.
+		unlock, lockErr := vaultlock.AcquireExclusiveContext(r.Context(), vaultUUID)
 		if lockErr != nil {
 			writeError(w, http.StatusConflict, lockErr)
-			return
-		}
-		if !ok {
-			writeError(w, http.StatusConflict, fmt.Errorf("the selected vault is busy with another operation"))
 			return
 		}
 		locked := true
@@ -1479,9 +1533,40 @@ func handleExistingVaultRetry(db *sql.DB, auth *rcloneAuthStore) http.HandlerFun
 			}
 		}
 		defer releaseVault()
+		intent, err = reloadConnectionIntentUnderLock(db, intent)
+		if err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				writeError(w, http.StatusNotFound, fmt.Errorf("the selected pending connection no longer exists"))
+			} else {
+				writeError(w, http.StatusInternalServerError, err)
+			}
+			return
+		}
 		reportVaultProgress(r.Context(), "Verifying vault identity and finishing this computer's attachment. This may take a few minutes.")
 		resumeRepositoryConnection(w, r, db, auth, intent, storage, finishRcloneAuth, releaseVault)
 	}
+}
+
+// reloadConnectionIntentUnderLock re-reads a pending connection after its
+// vault lock was waited for. The request that held the lock may have attached
+// the vault (the intent is then gone, sql.ErrNoRows), cancelled it, or moved
+// it to a later state, and resuming from the copy read before the wait would
+// act on that stale state. The reviewed payload is immutable, so the lock key
+// cannot change; it is checked anyway so a mismatch can never slip past the
+// lock that was actually taken.
+func reloadConnectionIntentUnderLock(
+	db *sql.DB, before database.RepositoryConnectionIntent,
+) (database.RepositoryConnectionIntent, error) {
+	fresh, err := database.FindRepositoryConnectionIntentByID(db, before.ID)
+	if err != nil {
+		return database.RepositoryConnectionIntent{}, err
+	}
+	lockedKey, keyErr := connectionIntentVaultUUID(before)
+	freshKey, freshKeyErr := connectionIntentVaultUUID(fresh)
+	if keyErr != nil || freshKeyErr != nil || lockedKey != freshKey {
+		return database.RepositoryConnectionIntent{}, fmt.Errorf("pending connection does not match the reviewed vault selection")
+	}
+	return fresh, nil
 }
 
 func safeConnectionRepository(repo models.Repository) connectionIntentRepository {
@@ -1526,7 +1611,11 @@ var runNewVaultPreflight = preflightNewVault
 
 func preflightNewVault(ctx context.Context, repo models.Repository) error {
 	if repo.Connector == "fs" {
-		entries, err := os.ReadDir(repo.Location)
+		// Creation holds the new vault's lock here. Both reads of the
+		// destination are bounded by the request context, like the creation
+		// handler's later reads of the vault path, so a hung share cannot keep
+		// that lock after the request is cancelled; see engines.ReadWithin.
+		entries, err := engines.ReadWithin(ctx, func() ([]os.DirEntry, error) { return os.ReadDir(repo.Location) })
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
 		}
@@ -1536,8 +1625,14 @@ func preflightNewVault(ctx context.Context, repo models.Repository) error {
 		if len(entries) == 0 {
 			return nil
 		}
-		if _, err := os.Stat(filepath.Join(repo.Location, filepath.FromSlash(vaultprofile.PhysicalPath))); err == nil {
+		_, err = engines.ReadWithin(ctx, func() (os.FileInfo, error) {
+			return os.Stat(filepath.Join(repo.Location, filepath.FromSlash(vaultprofile.PhysicalPath)))
+		})
+		if err == nil {
 			return &destinationPreflightError{kind: "existing"}
+		}
+		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+			return err
 		}
 		for _, entry := range entries {
 			name := strings.ToLower(strings.TrimSpace(entry.Name()))
@@ -1636,6 +1731,23 @@ func normalizedExistingStorageBase(input ExistingVaultStorage, preview bool) (Ex
 	}
 	if err := engines.ValidateStorageOptions(input.Connector, options); err != nil {
 		return input, err
+	}
+	if input.Connector == "webdav" {
+		// Save the canonical address, exactly as creation does, so an
+		// existing-vault connection and a later reconnect compare one spelling.
+		input.Location, options, err = normalizedWebDAVAddress(input.Location, options)
+		if err != nil {
+			return input, err
+		}
+	}
+	if integration.ID == engines.RcloneRemoteConnector {
+		// Save the settings exactly as creation does (for example without a
+		// trailing "/" in the path in remote), so a connection, a reconnect,
+		// and the support report's redaction all see one spelling.
+		options, err = engines.NormalizeConnectorOptions(engines.ResticID, integration, options)
+		if err != nil {
+			return input, err
+		}
 	}
 	input.Options = options
 	return input, nil
@@ -1884,20 +1996,33 @@ func previewExistingVault(ctx context.Context, input ExistingVaultStorage) (Exis
 			// exact-root native signature was found. Keep this guidance about the
 			// selected location; identity mismatch is a later, distinct safeguard
 			// after a repository has been authenticated and identified.
-			return ExistingVaultPreview{}, models.Repository{}, fmt.Errorf("Replicaro could not detect a vault in the selected location. Please double check the bucket and path/prefix to ensure they are correct.")
+			return ExistingVaultPreview{}, models.Repository{}, fmt.Errorf("Replicaro could not detect a vault in the selected location. Check that the location and path are correct.")
 		}
 		if len(candidates) != 1 {
 			return ExistingVaultPreview{}, models.Repository{}, fmt.Errorf("more than one supported vault engine was detected; attachment was stopped")
 		}
 		engineID = candidates[0]
+		// Replicaro never creates a Kopia vault on Google Drive, Dropbox,
+		// OneDrive, or Any Rclone Remote, so a Kopia repository found there
+		// was made outside it.
+		// Kopia does not support these connectors in Replicaro, and the next
+		// step would only fail with the internal connector error. Explain it
+		// here instead, before any native Kopia command runs.
+		if engineID == engines.KopiaID && engines.IsResticRcloneConnector(input.Connector) {
+			return ExistingVaultPreview{}, models.Repository{}, newKopiaRcloneProviderError(input.Connector)
+		}
 	} else {
 		if explained := explainExistingVaultCredentialStateFailure(readErr); explained != nil {
 			return ExistingVaultPreview{}, models.Repository{}, explained
 		}
 		if vaultprofile.IsVaultPasswordDecryptionFailure(readErr) {
-			return ExistingVaultPreview{}, models.Repository{}, errors.New("Replicaro vault exists but the password you entered could not open the vault. Please check to make sure the password was typed correctly. If you forgot your password, there is no way to recover it and you will need to create a new vault instead.")
+			return ExistingVaultPreview{}, models.Repository{}, errors.New("Replicaro vault exists but the vault encryption password you entered could not open the vault. Please check to make sure the vault encryption password was typed correctly. If you forgot your vault encryption password, there is no way to recover it and you will need to create a new vault instead.")
 		}
-		return ExistingVaultPreview{}, models.Repository{}, fmt.Errorf("vault.replicaro exists but could not be decrypted or validated: %w", readErr)
+		// Everything else, such as a rejected WebDAV sign-in, an untrusted
+		// certificate, or an unreachable server, may have stopped before the file
+		// was read at all, so don't claim it exists or blame the vault encryption
+		// password.
+		return ExistingVaultPreview{}, models.Repository{}, fmt.Errorf("vault.replicaro could not be read or validated. Check the location and the storage connection settings, such as the server address and port, the sign-in details for the storage account, and the certificate: %w", readErr)
 	}
 	temporary.Engine = engineID
 	engineRepo, err := recoveryEngineRepositoryWithProvidedOptions(temporary, providedOptions)
@@ -1925,7 +2050,7 @@ func previewExistingVault(ctx context.Context, input ExistingVaultStorage) (Exis
 		validationOutput, err = engines.ValidateRepository(ctx, engine, engineRepo)
 	}
 	if err != nil {
-		return ExistingVaultPreview{}, models.Repository{}, fmt.Errorf("the detected %s vault rejected the password or could not be validated", engineID)
+		return ExistingVaultPreview{}, models.Repository{}, fmt.Errorf(detectedVaultRejectedPasswordFormat, engineID)
 	}
 	if engineVersion == "" {
 		if engine != nil {
@@ -2192,13 +2317,14 @@ func repositoryFingerprint(ctx context.Context, repo models.Repository, validati
 		}
 	}
 	// Keep direct-remote recovery aligned with creation and ordinary admission.
-	// For s3, sftp, azblob, and gcs, Restic binds the authenticated `cat config`
-	// result while Kopia exposes its stable repository ID in native status. Raw
-	// marker bytes read through the sidecar transport are not an interchangeable
-	// representation: hashing them here caused a false mismatch after the exact
-	// repository had already authenticated. Filesystem identity and Restic's
-	// rclone-login fingerprint remain the separate branches above.
-	return engines.RepositoryFingerprint(repo, validationOutput)
+	// For s3, sftp, azblob, gcs, and webdav, Restic binds the authenticated
+	// `cat config` result while Kopia exposes its stable repository ID in
+	// native status. Raw marker bytes read through the sidecar transport are
+	// not an interchangeable representation: hashing them here caused a false
+	// mismatch after the exact repository had already authenticated.
+	// Filesystem identity and Restic's rclone-login fingerprint remain the
+	// separate branches above.
+	return engines.RepositoryFingerprintContext(ctx, repo, validationOutput)
 }
 
 func detectRepositorySignatures(ctx context.Context, repo models.Repository) ([]string, error) {
@@ -2206,7 +2332,7 @@ func detectRepositorySignatures(ctx context.Context, repo models.Repository) ([]
 		if err := requirePersistedRepositoryStorageAvailable(ctx, repo); err != nil {
 			return nil, err
 		}
-		return engines.DetectRepositorySignatures(repo)
+		return engines.DetectRepositorySignatures(ctx, repo)
 	}
 	entries, err := (vaultprofile.Store{Repository: repo}).ListRoot(ctx)
 	if err != nil {
@@ -2356,7 +2482,7 @@ func handleExistingVaultReview(db *sql.DB, auth *rcloneAuthStore, refine bool) h
 			return
 		}
 		var err error
-		savedRcloneReconnect := engines.IsResticRcloneConnector(input.Connector) &&
+		savedRcloneReconnect := engines.IsRcloneNativeLoginProvider(input.Connector) &&
 			strings.TrimSpace(input.ExpectedVaultUUID) != "" && strings.TrimSpace(input.RcloneAuthSessionID) == ""
 		if !savedRcloneReconnect {
 			input.Options, err = auth.mergeOptions(
@@ -2364,7 +2490,7 @@ func handleExistingVaultReview(db *sql.DB, auth *rcloneAuthStore, refine bool) h
 			)
 		}
 		if err != nil {
-			if engines.IsResticRcloneConnector(input.Connector) {
+			if engines.IsRcloneNativeLoginProvider(input.Connector) {
 				writeRcloneAuthorizationError(w, http.StatusBadRequest,
 					"native rclone authorization session is unavailable or not ready")
 			} else {
@@ -2372,7 +2498,7 @@ func handleExistingVaultReview(db *sql.DB, auth *rcloneAuthStore, refine bool) h
 			}
 			return
 		}
-		if engines.IsResticRcloneConnector(input.Connector) {
+		if engines.IsRcloneNativeLoginProvider(input.Connector) {
 			if savedRcloneReconnect {
 				input.RcloneConfigPath, err = engines.RcloneVaultConfigPath(input.ExpectedVaultUUID)
 			} else {
@@ -2385,6 +2511,15 @@ func handleExistingVaultReview(db *sql.DB, auth *rcloneAuthStore, refine bool) h
 					"native rclone authorization session configuration is unavailable")
 				return
 			}
+		}
+		// An Any Rclone Remote vault has no session: its sidecar and repository
+		// are read through the user's own config file, which is checked first,
+		// on a first connection and on a reconnect alike.
+		if err := checkRcloneRemoteSettings(r.Context(), input.Connector, input.Options); err != nil {
+			if !writeRcloneRemoteError(w, err) {
+				writeError(w, http.StatusBadRequest, err)
+			}
+			return
 		}
 		normalized, err := normalizedExistingStorageForPreview(input)
 		if err != nil {
@@ -2421,8 +2556,7 @@ func handleExistingVaultReview(db *sql.DB, auth *rcloneAuthStore, refine bool) h
 		discoveryInput.DiscoverIdentityOnly = true
 		discovery, _, err := previewExistingVault(ctx, discoveryInput)
 		if err != nil {
-			markSupportStorageObservation(w, "vault_connect_destination", err)
-			writeError(w, http.StatusBadRequest, err)
+			writeExistingVaultPreviewError(w, err)
 			return
 		}
 		vaultUUID := discovery.VaultUUID
@@ -2435,8 +2569,7 @@ func handleExistingVaultReview(db *sql.DB, auth *rcloneAuthStore, refine bool) h
 		reportVaultProgress(r.Context(), "Verifying vault identity and recovery profiles under the vault lock...")
 		lockedPreview, lockedRepository, lockedErr := previewExistingVault(ctx, normalized)
 		if lockedErr != nil {
-			markSupportStorageObservation(w, "vault_connect_destination", lockedErr)
-			writeError(w, http.StatusBadRequest, lockedErr)
+			writeExistingVaultPreviewError(w, lockedErr)
 			return
 		}
 		lockedVaultUUID := deterministicImportVaultUUID(lockedRepository.Engine, lockedPreview.NativeFingerprint)
@@ -2483,12 +2616,12 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 		var err error
 		var finishRcloneAuth func(engines.RcloneConfigDisposition) error
 		reusingPublishedRcloneConfig := false
-		if engines.IsResticRcloneConnector(req.Connector) && strings.TrimSpace(req.ExpectedVaultUUID) != "" &&
+		if engines.IsRcloneNativeLoginProvider(req.Connector) && strings.TrimSpace(req.ExpectedVaultUUID) != "" &&
 			strings.TrimSpace(req.RcloneAuthSessionID) == "" {
 			req.RcloneConfigPath, err = engines.RcloneVaultConfigPath(req.ExpectedVaultUUID)
 			finishRcloneAuth = func(engines.RcloneConfigDisposition) error { return nil }
 			reusingPublishedRcloneConfig = true
-		} else if engines.IsResticRcloneConnector(req.Connector) &&
+		} else if engines.IsRcloneNativeLoginProvider(req.Connector) &&
 			strings.TrimSpace(req.RcloneAuthSessionID) == "" &&
 			strings.TrimSpace(req.IntentID) != "" {
 			pending, _, configPath, pendingErr := reusablePersistentRcloneConnection(
@@ -2510,7 +2643,7 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 				req.RcloneAuthSessionID, req.Connector, req.Options,
 			)
 			if err != nil {
-				if engines.IsResticRcloneConnector(req.Connector) {
+				if engines.IsRcloneNativeLoginProvider(req.Connector) {
 					writeRcloneAuthorizationError(w, http.StatusBadRequest,
 						"native rclone authorization session is unavailable or not ready")
 				} else {
@@ -2518,7 +2651,7 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 				}
 				return
 			}
-			if engines.IsResticRcloneConnector(req.Connector) {
+			if engines.IsRcloneNativeLoginProvider(req.Connector) {
 				req.RcloneConfigPath, err = auth.configPath(
 					req.RcloneAuthSessionID, req.Connector,
 				)
@@ -2531,6 +2664,12 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 			}
 		}
 		defer func() { _ = finishRcloneAuth(engines.RcloneConfigRetained) }()
+		if err := checkRcloneRemoteSettings(r.Context(), req.Connector, req.Options); err != nil {
+			if !writeRcloneRemoteError(w, err) {
+				writeError(w, http.StatusBadRequest, err)
+			}
+			return
+		}
 		normalizedStorage, normalizeErr := normalizedExistingStorage(req.ExistingVaultStorage)
 		if normalizeErr != nil {
 			writeError(w, http.StatusBadRequest, normalizeErr)
@@ -2575,18 +2714,26 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 					writeError(w, http.StatusInternalServerError, keyErr)
 					return
 				}
+				// Wait for a busy vault, then resume from the intent as it is
+				// now (see reloadConnectionIntentUnderLock).
 				var lockErr error
-				unlock, lockHeld, lockErr = vaultlock.YieldLowPriorityAndTryExclusiveContext(r.Context(), vaultUUID)
+				unlock, lockErr = vaultlock.AcquireExclusiveContext(r.Context(), vaultUUID)
 				if lockErr != nil {
 					writeError(w, http.StatusConflict, lockErr)
 					return
 				}
-				if !lockHeld {
-					writeError(w, http.StatusConflict, fmt.Errorf("the selected vault is busy with another operation"))
+				lockHeld = true
+				fresh, reloadErr := reloadConnectionIntentUnderLock(db, intent)
+				if errors.Is(reloadErr, sql.ErrNoRows) {
+					writeError(w, http.StatusConflict, fmt.Errorf("the selected pending connection no longer exists; check the vault again"))
+					return
+				}
+				if reloadErr != nil {
+					writeError(w, http.StatusInternalServerError, reloadErr)
 					return
 				}
 				resumeRepositoryConnection(
-					w, r, db, auth, intent, req.ExistingVaultStorage,
+					w, r, db, auth, fresh, req.ExistingVaultStorage,
 					finishRcloneAuth, releaseVault,
 				)
 				return
@@ -2639,12 +2786,15 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 			unlock, lockHeld = releasePreparedIntent, true
 			releasePreparedIntent = nil
 		} else {
+			// Wait for a busy vault. The complete review below runs under the
+			// lock and rejects a vault that changed while this waited.
 			var lockErr error
-			unlock, lockHeld, lockErr = vaultlock.YieldLowPriorityAndTryExclusiveContext(r.Context(), initialVaultUUID)
+			unlock, lockErr = vaultlock.AcquireExclusiveContext(r.Context(), initialVaultUUID)
 			if lockErr != nil {
 				writeError(w, http.StatusConflict, lockErr)
 				return
 			}
+			lockHeld = true
 		}
 		if !lockHeld {
 			writeError(w, http.StatusConflict, fmt.Errorf("the selected vault is busy with another operation"))
@@ -3082,7 +3232,7 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 		}
 		needsConnectionIntent := updatingExisting || strings.TrimSpace(req.ExpectedVaultUUID) == "" || transition.Publish || publishRoot ||
 			repo.Engine == engines.KopiaID ||
-			(engines.IsResticRcloneConnector(repo.Connector) && !reusingPublishedRcloneConfig)
+			(engines.IsRcloneNativeLoginProvider(repo.Connector) && !reusingPublishedRcloneConfig)
 		if !needsConnectionIntent {
 			// An ordinary managed reconnect with no publication, owner transfer,
 			// or native/rclone config activation is one local transaction and does
@@ -3312,10 +3462,10 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 		rcloneOutcome := rcloneApplicationOutcome{
 			Activation: engines.RcloneConfigActivation{Disposition: engines.RcloneConfigRetained},
 		}
-		if engines.IsResticRcloneConnector(repo.Connector) && reusingPublishedRcloneConfig {
+		if engines.IsRcloneNativeLoginProvider(repo.Connector) && reusingPublishedRcloneConfig {
 			rcloneOutcome.Activation.Disposition = engines.RcloneConfigActivated
 		}
-		if engines.IsResticRcloneConnector(repo.Connector) &&
+		if engines.IsRcloneNativeLoginProvider(repo.Connector) &&
 			!reusingPublishedRcloneConfig {
 			if intent.State == "prepared" {
 				if stateErr := database.MarkRepositoryConnectionIntent(db, intent.ID, "publication_started", "Native rclone configuration is being activated; retry this connection."); stateErr != nil {
@@ -3387,7 +3537,7 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 			}
 			return
 		}
-		if engines.IsResticRcloneConnector(repo.Connector) {
+		if engines.IsRcloneNativeLoginProvider(repo.Connector) {
 			rcloneOutcome = attachedUsableRcloneOutcome(rcloneOutcome)
 		}
 		if repo.Engine == engines.KopiaID {
@@ -3406,30 +3556,44 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 		if len(affectedRepositories) > 0 {
 			response["warning"] = "Vault profiles will be synchronized in the background. You can start using Replicaro."
 		}
-		if kopiaCleanupErr != nil {
-			response["warning"] = "The vault update is active, but old Kopia configuration cleanup remains pending."
-		}
-		if engines.IsResticRcloneConnector(repo.Connector) {
-			addRcloneOutcome(response, rcloneOutcome)
-		}
-		if rcloneAuthCleanupErr != nil {
-			if engines.IsResticRcloneConnector(repo.Connector) {
-				writeRcloneApplicationError(w, http.StatusInternalServerError, rcloneOutcome, rcloneAuthCleanupErr)
-				return
-			}
-			writeError(w, http.StatusInternalServerError, fmt.Errorf(
-				"vault was connected, but its temporary authorization session needs cleanup: %w",
-				rcloneAuthCleanupErr,
-			))
-			return
-		}
-		if kopiaCleanupErr != nil {
-			writeJSONStatus(w, http.StatusAccepted, response)
-			return
-		}
-		writeJSONStatus(w, http.StatusCreated, response)
+		writeConnectionAttached(w, response, repo, rcloneOutcome, kopiaCleanupErr, rcloneAuthCleanupErr)
 	}
 }
+
+// writeConnectionAttached answers a connection whose attachment transaction
+// has committed. The vault is connected from here on, so a cleanup that did
+// not finish (old Kopia config after an update, or the temporary cloud
+// sign-in session) makes the connection completed with issues. It is still a
+// 201 with the attached vault: an error status here used to make the page
+// treat a connected vault as a failed connection, and the intent it would
+// retry is already gone.
+func writeConnectionAttached(
+	w http.ResponseWriter,
+	response map[string]any,
+	repo models.Repository,
+	rcloneOutcome rcloneApplicationOutcome,
+	kopiaCleanupErr, rcloneAuthCleanupErr error,
+) {
+	var outcome foregroundOutcome
+	if kopiaCleanupErr != nil {
+		outcome.addIssue("The vault update is active, but old Kopia configuration cleanup remains pending.")
+	}
+	if rcloneAuthCleanupErr != nil {
+		outcome.addIssue("The vault is connected, but its temporary native authorization session still needs cleanup.")
+	}
+	outcome.addTo(response)
+	if engines.IsRcloneNativeLoginProvider(repo.Connector) {
+		addRcloneOutcome(response, rcloneOutcome)
+	}
+	writeJSONStatus(w, http.StatusCreated, response)
+}
+
+// detectedVaultRejectedPasswordFormat is the error for a detected vault that
+// fails native validation, both at the connect Check and when a pending
+// connection resumes. The connect page in frontend/src/pages/Protect.tsx
+// matches the resulting text exactly to offer the rclone sign-in again, so
+// don't change it without updating Protect.tsx.
+const detectedVaultRejectedPasswordFormat = "the detected %s vault rejected the vault encryption password or could not be validated"
 
 func resumeRepositoryConnection(
 	w http.ResponseWriter,
@@ -3467,7 +3631,7 @@ func resumeRepositoryConnection(
 	}
 	storage = authoritativeStorage
 	repo := payload.Repository.repository(storage)
-	if engines.IsResticRcloneConnector(repo.Connector) && storage.RcloneAuthSessionID == "" {
+	if engines.IsRcloneNativeLoginProvider(repo.Connector) && storage.RcloneAuthSessionID == "" {
 		// The retry handler has already validated the saved vault config. Use
 		// its repository-ID binding rather than treating that canonical file
 		// as an authorization-session candidate.
@@ -3514,7 +3678,7 @@ func resumeRepositoryConnection(
 	}
 	validationRepo := nativeRepo
 	if repo.Engine == engines.KopiaID ||
-		(repo.Engine == engines.ResticID && !(engines.IsResticRcloneConnector(repo.Connector) && repo.RcloneConfigPath == "")) {
+		(repo.Engine == engines.ResticID && !(engines.IsRcloneNativeLoginProvider(repo.Connector) && repo.RcloneConfigPath == "")) {
 		// Disposable validation IDs isolate preview engine artifacts. A saved
 		// rclone config is bound to the real vault UUID, so changing that ID
 		// would make native Restic read a nonexistent config. Never schedule
@@ -3529,7 +3693,7 @@ func resumeRepositoryConnection(
 		validationOutput, err = engines.ValidateRepository(r.Context(), engine, validationRepo)
 	}
 	if err != nil {
-		writeError(w, http.StatusBadRequest, fmt.Errorf("the detected %s vault rejected the password or could not be validated", repo.Engine))
+		writeError(w, http.StatusBadRequest, fmt.Errorf(detectedVaultRejectedPasswordFormat, repo.Engine))
 		return
 	}
 	nativeFingerprint, err := fingerprintExistingRepository(r.Context(), validationRepo, validationOutput)
@@ -3723,10 +3887,10 @@ func resumeRepositoryConnection(
 	rcloneOutcome := rcloneApplicationOutcome{
 		Activation: engines.RcloneConfigActivation{Disposition: engines.RcloneConfigRetained},
 	}
-	if engines.IsResticRcloneConnector(repo.Connector) && strings.TrimSpace(storage.RcloneAuthSessionID) == "" {
+	if engines.IsRcloneNativeLoginProvider(repo.Connector) && strings.TrimSpace(storage.RcloneAuthSessionID) == "" {
 		rcloneOutcome.Activation.Disposition = engines.RcloneConfigActivated
 	}
-	if engines.IsResticRcloneConnector(repo.Connector) &&
+	if engines.IsRcloneNativeLoginProvider(repo.Connector) &&
 		strings.TrimSpace(storage.RcloneAuthSessionID) != "" {
 		if intent.State == "prepared" {
 			if stateErr := database.MarkRepositoryConnectionIntent(db, intent.ID, "publication_started", "Native rclone configuration is being activated; retry this connection."); stateErr != nil {
@@ -3806,7 +3970,7 @@ func resumeRepositoryConnection(
 		writeError(w, http.StatusConflict, err)
 		return
 	}
-	if engines.IsResticRcloneConnector(repo.Connector) {
+	if engines.IsRcloneNativeLoginProvider(repo.Connector) {
 		rcloneOutcome = attachedUsableRcloneOutcome(rcloneOutcome)
 	}
 	if repo.Engine == engines.KopiaID {
@@ -3823,28 +3987,7 @@ func resumeRepositoryConnection(
 	if len(affectedRepositories) > 0 {
 		response["warning"] = "Vault profiles will be synchronized in the background. You can start using Replicaro."
 	}
-	if kopiaCleanupErr != nil {
-		response["warning"] = "The vault update is active, but old Kopia configuration cleanup remains pending."
-	}
-	if engines.IsResticRcloneConnector(repo.Connector) {
-		addRcloneOutcome(response, rcloneOutcome)
-	}
-	if rcloneAuthCleanupErr != nil {
-		if engines.IsResticRcloneConnector(repo.Connector) {
-			writeRcloneApplicationError(w, http.StatusInternalServerError, rcloneOutcome, rcloneAuthCleanupErr)
-			return
-		}
-		writeError(w, http.StatusInternalServerError, fmt.Errorf(
-			"vault was connected, but its temporary authorization session needs cleanup: %w",
-			rcloneAuthCleanupErr,
-		))
-		return
-	}
-	if kopiaCleanupErr != nil {
-		writeJSONStatus(w, http.StatusAccepted, response)
-		return
-	}
-	writeJSONStatus(w, http.StatusCreated, response)
+	writeConnectionAttached(w, response, repo, rcloneOutcome, kopiaCleanupErr, rcloneAuthCleanupErr)
 }
 
 func syncProfilesNow(ctx context.Context, db *sql.DB, repositoryIDs []string) error {

@@ -303,6 +303,75 @@ function formatResticBackup(value: unknown) {
     }
 }
 
+// Restic restores run with --json, so their progress, summary, per-file errors
+// and exit record arrive as structured records. These lines repeat Restic's own
+// figures and nothing more: Restic counts files that later failed as restored,
+// so the summary is not a success statement. The per-file error records and
+// the exit record carry the failures, and the operation status (completed with
+// issues or failed) comes from the backend, never from these counts.
+const resticRestoreCountKeys = ["total_files", "files_restored", "files_skipped", "files_deleted", "total_bytes", "bytes_restored", "bytes_skipped"];
+
+function resticRestoreDetails(value: JsonRecord) {
+    const filesRestored = optionalNumber(value, "files_restored");
+    const totalFiles = optionalNumber(value, "total_files");
+    const bytesRestored = optionalNumber(value, "bytes_restored");
+    const totalBytes = optionalNumber(value, "total_bytes");
+    const filesSkipped = optionalNumber(value, "files_skipped");
+    const bytesSkipped = optionalNumber(value, "bytes_skipped");
+    const filesDeleted = optionalNumber(value, "files_deleted");
+    const details: string[] = [];
+    // Restic omits zero counts, so a missing count reads as zero.
+    if (typeof totalFiles === "number") details.push(`${filesRestored ?? 0}/${totalFiles} files`);
+    else if (typeof filesRestored === "number") details.push(plural(filesRestored, "file"));
+    if (typeof totalBytes === "number") details.push(`${readableBytes(bytesRestored ?? 0)} / ${readableBytes(totalBytes)}`);
+    else if (typeof bytesRestored === "number") details.push(readableBytes(bytesRestored));
+    if (typeof filesSkipped === "number" && filesSkipped > 0) {
+        details.push(`${plural(filesSkipped, "file")} skipped${typeof bytesSkipped === "number" ? ` (${readableBytes(bytesSkipped)})` : ""}`);
+    }
+    if (typeof filesDeleted === "number" && filesDeleted > 0) details.push(`${plural(filesDeleted, "file")} deleted`);
+    return details;
+}
+
+function formatResticRestoreStatus(value: JsonRecord) {
+    if (!hasOnlyKeys(value, ["message_type", "seconds_elapsed", "seconds_remaining", "percent_done", ...resticRestoreCountKeys]) ||
+        !validOptionalNumbers(value, ["seconds_elapsed", "seconds_remaining", ...resticRestoreCountKeys]) ||
+        !validOptionalNumbers(value, ["percent_done"], false)) return null;
+    const percent = optionalNumber(value, "percent_done", false);
+    const remaining = optionalNumber(value, "seconds_remaining");
+    const details: string[] = [];
+    if (typeof percent === "number" && percent <= 1) details.push(`${Number((percent * 100).toFixed(1))}%`);
+    else if (percent !== undefined) return null;
+    details.push(...resticRestoreDetails(value));
+    if (typeof remaining === "number" && remaining > 0) details.push(`${readableDuration(remaining)} remaining`);
+    return details.length ? `Restic restore progress: ${details.join(" · ")}` : null;
+}
+
+function formatResticRestoreSummary(value: JsonRecord) {
+    if (!hasOnlyKeys(value, ["message_type", "seconds_elapsed", ...resticRestoreCountKeys]) ||
+        !validOptionalNumbers(value, ["seconds_elapsed", ...resticRestoreCountKeys])) return null;
+    const elapsed = optionalNumber(value, "seconds_elapsed");
+    const details = resticRestoreDetails(value);
+    if (typeof elapsed === "number") details.push(readableDuration(elapsed));
+    return details.length ? `Restic restore summary: ${details.join(" · ")}` : "Restic restore summary";
+}
+
+function formatResticRestore(value: unknown) {
+    const row = record(value);
+    if (!row || typeof row.message_type !== "string") return null;
+    switch (row.message_type) {
+    case "status":
+        return formatResticRestoreStatus(row);
+    case "summary":
+        return formatResticRestoreSummary(row);
+    case "error":
+        return formatResticError(row);
+    case "exit_error":
+        return formatResticExitError(row);
+    default:
+        return null;
+    }
+}
+
 function formatResticRetentionRecord(value: unknown, summaryOnly = false) {
     if (Array.isArray(value)) return formatResticRetention(value, summaryOnly);
     const row = record(value);
@@ -495,6 +564,7 @@ function formatNativeLogLine(engine: NativeEngine | "replicaro", operationKind: 
     const formatted = engine === "restic"
         ? Array.isArray(value) ? formatResticRetentionRecord(value, concise && retentionContext)
             : operationKind === "backup" || operationKind === "live" ? formatResticBackup(value)
+            : operationKind === "restore" ? formatResticRestore(value)
             : record(value) ? formatResticExitError(value as JsonRecord) : null
         : formatKopia(value);
     // Summaries intentionally condense native facts, including rounded sizes.

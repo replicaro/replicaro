@@ -1,24 +1,8 @@
 package api
 
 import (
-	"encoding/json"
-	"errors"
-
 	"github.com/local/replicaro/models"
 )
-
-var errInvalidOperationIDWire = errors.New("operationId must be a string when supplied")
-
-func requestedOperationID(raw json.RawMessage) (*string, error) {
-	if len(raw) == 0 {
-		return nil, nil
-	}
-	var id *string
-	if err := json.Unmarshal(raw, &id); err != nil || id == nil {
-		return nil, errInvalidOperationIDWire
-	}
-	return id, nil
-}
 
 type CreateRepositoryRequest struct {
 	CreationIntentID     string                    `json:"creationIntentId,omitempty"`
@@ -49,8 +33,12 @@ type RepositoryScheduleRequest struct {
 	ProfilePreferencesOnly bool                       `json:"profilePreferencesOnly,omitempty"`
 }
 
+// RestoreRequest and RestoreSelectionRequest deliberately have no operationId
+// field: the server generates the ID and returns it with 202. A client that
+// sends one (an old page, for example) is refused as an unknown field rather
+// than having it silently ignored and then looking up an operation that never
+// existed. Do not add the field back.
 type RestoreRequest struct {
-	OperationID      json.RawMessage          `json:"operationId,omitempty"`
 	RepositoryID     string                   `json:"repositoryId"`
 	SnapshotID       string                   `json:"snapshotId"`
 	Content          *RestoreContentReference `json:"content,omitempty"`
@@ -74,7 +62,6 @@ type RestoreSelectionItem struct {
 }
 
 type RestoreSelectionRequest struct {
-	OperationID  json.RawMessage        `json:"operationId,omitempty"`
 	RepositoryID string                 `json:"repositoryId"`
 	TargetPath   string                 `json:"targetPath"`
 	Items        []RestoreSelectionItem `json:"items"`

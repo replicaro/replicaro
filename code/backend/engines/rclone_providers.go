@@ -45,6 +45,18 @@ var rcloneProviders = []RcloneProviderDefinition{
 		SecretFields:   secretSet("token"),
 		IdentityFields: []string{"region", "drive_id", "drive_type", "root_folder_id", "tenant"},
 	},
+	// The user's own rclone.conf and remote (see rclone_remote.go). It uses the
+	// same Restic-rclone path as the three providers above, but it has no
+	// sign-in, no private config, and no identity fields.
+	{
+		StorageType: RcloneRemoteConnector, Label: "Any Rclone Remote",
+		Fields: []string{
+			RcloneRemoteConfigFileOption, RcloneRemoteEnvironmentOption,
+			RcloneRemoteConfigEncryptedOption, RcloneRemoteConfigPasswordOption,
+			RcloneRemoteNameOption, RcloneRemotePathOption,
+		},
+		SecretFields: secretSet(RcloneRemoteEnvironmentOption, RcloneRemoteConfigPasswordOption),
+	},
 }
 
 func secretSet(values ...string) map[string]bool {
@@ -71,6 +83,10 @@ func RcloneProvider(storageType string) (RcloneProviderDefinition, bool) {
 	return RcloneProviderDefinition{}, false
 }
 
+// IsResticRcloneConnector reports a Restic vault reached through Restic's
+// rclone backend with the Replicaro/<vault name> root: the three sign-in
+// providers and Any Rclone Remote. The sign-in and private-config paths use
+// IsRcloneNativeLoginProvider instead, which leaves Any Rclone Remote out.
 func IsResticRcloneConnector(storageType string) bool {
 	_, ok := RcloneProvider(storageType)
 	return ok
@@ -129,7 +145,10 @@ func validateRcloneProviderOptions(provider RcloneProviderDefinition, values map
 		if !allowed[key] {
 			return fmt.Errorf("unsupported pinned %s field %q", provider.Label, key)
 		}
-		if len(value) > rcloneMaxProviderValueBytes {
+		// The operating system limits the size of environment variables, so
+		// the rclone remote's variables get no bound of their own.
+		if len(value) > rcloneMaxProviderValueBytes &&
+			!(provider.StorageType == RcloneRemoteConnector && key == RcloneRemoteEnvironmentOption) {
 			return fmt.Errorf("pinned %s field %q exceeds its size bound", provider.Label, key)
 		}
 		if strings.ContainsAny(key, "\r\n=[]") || strings.ContainsAny(value, "\x00\r\n") {
@@ -170,6 +189,19 @@ func NormalizeRcloneProviderOptions(storageType string, values map[string]string
 		} else {
 			result[key] = strings.TrimSpace(value)
 		}
+	}
+	if provider.StorageType == RcloneRemoteConnector {
+		// The connector's own rules come first because their errors carry
+		// codes the UI translates. The generic check below then only catches
+		// what the form can't send, such as an unknown field or a line break.
+		normalized, err := normalizeRcloneRemoteOptions(result, true)
+		if err != nil {
+			return nil, err
+		}
+		if err := validateRcloneProviderOptions(provider, normalized); err != nil {
+			return nil, err
+		}
+		return normalized, nil
 	}
 	if err := validateRcloneProviderOptions(provider, result); err != nil {
 		return nil, err

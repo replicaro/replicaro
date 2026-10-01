@@ -310,8 +310,12 @@ func handleJobSourceUpdate(db *sql.DB) http.HandlerFunc {
 			}
 		}
 		if err := database.UpdateJobSourceAlias(db, job, bound, time.Now()); err != nil {
+			if errors.Is(err, database.ErrJobDefinitionBusy) {
+				writeJobBeingDeleted(w)
+				return
+			}
 			if errors.Is(err, database.ErrJobRunActive) || errors.Is(err, database.ErrJobConnectionReserved) ||
-				errors.Is(err, database.ErrJobDefinitionBusy) || errors.Is(err, database.ErrJobSourceChanged) ||
+				errors.Is(err, database.ErrJobSourceChanged) ||
 				errors.Is(err, database.ErrJobSourceUnbound) || errors.Is(err, database.ErrJobSourceImmutable) {
 				writeError(w, http.StatusConflict, err)
 			} else if errors.Is(err, sql.ErrNoRows) {

@@ -17,6 +17,7 @@ import (
 	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultlock"
 	"github.com/local/replicaro/vaultprofile"
+	"github.com/local/replicaro/vaultreconnect"
 )
 
 var (
@@ -33,9 +34,49 @@ type Manager struct {
 	mu       sync.Mutex
 	accept   bool
 	queued   map[string]bool
+	retries  map[string]*policyRetry
 	wg       sync.WaitGroup
 	stopOnce sync.Once
 	stopped  chan struct{}
+}
+
+// policyRetry is one vault's automatic retry after a reconciliation error.
+// The attempt count lives only in memory: startup already turns every saved
+// error back to dirty and reconciles it, so a restart simply starts the
+// backoff over. How long the vault has been failing is kept separately, in
+// the database, by the reconnect clock (package vaultreconnect).
+type policyRetry struct {
+	attempts int
+	// armed identifies the pending timer; stop is nil when none is pending.
+	// A timer that fires after it was replaced or stopped sees a different
+	// armed value and does nothing.
+	armed int
+	stop  func() bool
+}
+
+// The retry delay doubles from one minute up to 30 minutes, the same backoff
+// the profile sync queue uses (database.FailVaultProfileSync).
+func policyRetryDelay(attempts int) time.Duration {
+	delay := time.Minute
+	for i := 1; i < attempts && delay < 30*time.Minute; i++ {
+		delay *= 2
+	}
+	if delay > 30*time.Minute {
+		delay = 30 * time.Minute
+	}
+	return delay
+}
+
+// scheduleRetryAfter arms one timer. Tests replace it to fire retries without
+// waiting and to see the delays.
+var scheduleRetryAfter = func(delay time.Duration, retry func()) (stop func() bool) {
+	return time.AfterFunc(delay, retry).Stop
+}
+
+func SetRetryTimerForTests(next func(time.Duration, func()) func() bool) func() {
+	previous := scheduleRetryAfter
+	scheduleRetryAfter = next
+	return func() { scheduleRetryAfter = previous }
 }
 
 var backgroundReconcile = ReconcileRepository
@@ -80,7 +121,7 @@ func newManager(parent context.Context, db *sql.DB) *Manager {
 	ctx, cancel := context.WithCancel(parent)
 	return &Manager{
 		db: db, ctx: ctx, cancel: cancel, accept: true,
-		queued: map[string]bool{}, stopped: make(chan struct{}),
+		queued: map[string]bool{}, retries: map[string]*policyRetry{}, stopped: make(chan struct{}),
 	}
 }
 
@@ -118,6 +159,12 @@ func (manager *Manager) Stop(ctx context.Context) error {
 	manager.stopOnce.Do(func() {
 		manager.mu.Lock()
 		manager.accept = false
+		for _, retry := range manager.retries {
+			if retry.stop != nil {
+				retry.stop()
+			}
+		}
+		manager.retries = map[string]*policyRetry{}
 		manager.mu.Unlock()
 		manager.cancel()
 		go func() {
@@ -157,11 +204,36 @@ func ReconcileRepositoryUnderLock(ctx context.Context, db *sql.DB, repo models.R
 	return reconcileRepositoryUnderLock(ctx, db, repo, false)
 }
 
-// ReassureRepositoryUnderLock is used only by scheduled maintenance. A
-// pre-mutation read failure with no observed drift may retain the previously
-// verified ready state; the maintenance operation still records the failure.
+// ReassureRepositoryUnderLock runs as the policy step of Kopia repository
+// maintenance, both scheduled and user-requested runs, while the caller holds
+// the vault lock. A pre-mutation read failure with no observed drift may
+// retain the previously verified ready state; the maintenance operation still
+// records the failure.
 func ReassureRepositoryUnderLock(ctx context.Context, db *sql.DB, repo models.Repository) (string, error) {
-	return reconcileRepositoryUnderLock(ctx, db, repo, true)
+	output, err := reconcileRepositoryUnderLock(ctx, db, repo, true)
+	state, stateErr := database.GetKopiaPolicyState(db, repo.ID)
+	switch {
+	case stateErr != nil:
+	case state.State == "ready":
+		// Maintenance did the reconciler's job: the policy is ready. Treat it
+		// as the reconciler's own success, as the background loop in
+		// reconcile() does when it sees "ready": stop and
+		// forget a pending retry (otherwise its backoff carries over into the
+		// next failure) and reset the worker's reconnect clock and any
+		// reconnect state it set. Without this a vault that only recovers
+		// through maintenance keeps a stale "reconnect" message and an old
+		// failing-since time. This runs under the caller's vault lock, so a
+		// reconnect cannot commit between the result and this bookkeeping.
+		managerFor(db).retrySucceeded(repo.ID)
+		vaultreconnect.RecordWorkerSuccess(db, repo.ID, vaultreconnect.WorkerKopiaPolicy)
+	case err != nil && state.State == "error":
+		// A failed reassurance can leave the policy in its error state. The
+		// maintenance operation reports this attempt; the retry timer makes
+		// sure the policy (and so backup admission) is not left stranded until
+		// the next start.
+		managerFor(db).retryLater(repo.ID)
+	}
+	return output, err
 }
 
 func reconcileRepositoryUnderLock(
@@ -410,18 +482,33 @@ func (manager *Manager) reconcile(repositoryID string) {
 		if beforeErr != nil && !errors.Is(beforeErr, sql.ErrNoRows) {
 			return
 		}
-		// Terminal background errors require an explicit trigger to transition
-		// the exact row back to dirty. A coalesced duplicate queue signal alone
-		// must never retry a permanent failure.
+		// An error state is left alone here: a coalesced queue signal does not
+		// retry it. Only the retry timer (retryDue) moves the exact row back to
+		// dirty, so retries keep their backoff however often the vault is
+		// queued. Make sure one is pending, for an error recorded outside this
+		// loop (for example by scheduled maintenance).
 		if beforeErr == nil && before.State == "error" {
+			manager.retryLater(repositoryID)
 			return
 		}
+		// Taken before backgroundReconcile waits for the vault lock; see
+		// RecordWorkerFailure.
+		startedAt := vaultreconnect.Now()
 		_, reconcileErr := backgroundReconcile(manager.ctx, manager.db, repo)
 		if manager.ctx.Err() != nil {
 			return
 		}
 		state, stateErr := database.GetKopiaPolicyState(manager.db, repositoryID)
-		if stateErr != nil || state.State == "ready" || state.State == "error" {
+		if stateErr != nil {
+			return
+		}
+		if state.State == "ready" {
+			manager.retrySucceeded(repositoryID)
+			vaultreconnect.RecordWorkerSuccess(manager.db, repositoryID, vaultreconnect.WorkerKopiaPolicy)
+			return
+		}
+		if state.State == "error" {
+			manager.retryAfterFailure(repositoryID, startedAt, reconcileErr, state.LastError)
 			return
 		}
 		// A relevant job mutation can replace the desired digest while the
@@ -443,11 +530,140 @@ func (manager *Manager) reconcile(repositoryID string) {
 			continue
 		}
 		if reconcileErr != nil && state.State == "dirty" {
-			_ = database.MarkKopiaPolicyReconciliationError(
+			if database.MarkKopiaPolicyReconciliationError(
 				manager.db, repositoryID, state.DesiredDigest, reconcileErr,
-			)
+			) == nil {
+				manager.retryAfterFailure(repositoryID, startedAt, reconcileErr, "")
+			}
 		}
 		return
+	}
+}
+
+// retryAfterFailure records one failed background reconciliation: the
+// reconnect clock sees the failure, and the next retry is armed with a longer
+// delay. Backups to the vault stay blocked meanwhile, because only a
+// successful reconciliation with exact readback makes the policy ready.
+// startedAt is when the failed attempt started.
+func (manager *Manager) retryAfterFailure(repositoryID string, startedAt time.Time, reconcileErr error, lastError string) {
+	cause := reconcileErr
+	if cause == nil {
+		cause = errors.New(lastError)
+	}
+	vaultreconnect.RecordWorkerFailure(manager.db, repositoryID, vaultreconnect.WorkerKopiaPolicy, startedAt, cause)
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if !manager.accept {
+		return
+	}
+	retry := manager.retries[repositoryID]
+	if retry == nil {
+		retry = &policyRetry{}
+		manager.retries[repositoryID] = retry
+	}
+	if retry.stop != nil {
+		retry.stop()
+		retry.stop = nil
+	}
+	retry.attempts++
+	manager.armLocked(repositoryID, retry)
+}
+
+// retryLater makes sure a retry is pending without counting another failed
+// attempt. It is for an error state this manager did not just produce.
+func (manager *Manager) retryLater(repositoryID string) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if !manager.accept {
+		return
+	}
+	retry := manager.retries[repositoryID]
+	if retry != nil && retry.stop != nil {
+		return
+	}
+	if retry == nil {
+		retry = &policyRetry{}
+		manager.retries[repositoryID] = retry
+	}
+	if retry.attempts == 0 {
+		retry.attempts = 1
+	}
+	manager.armLocked(repositoryID, retry)
+}
+
+func (manager *Manager) armLocked(repositoryID string, retry *policyRetry) {
+	retry.armed++
+	armed := retry.armed
+	retry.stop = scheduleRetryAfter(policyRetryDelay(retry.attempts), func() {
+		manager.retryDue(repositoryID, retry, armed)
+	})
+}
+
+// retrySucceeded forgets the backoff once the policy is ready again.
+func (manager *Manager) retrySucceeded(repositoryID string) {
+	manager.mu.Lock()
+	defer manager.mu.Unlock()
+	if retry := manager.retries[repositoryID]; retry != nil {
+		if retry.stop != nil {
+			retry.stop()
+		}
+		delete(manager.retries, repositoryID)
+	}
+}
+
+// retryDue runs when a retry timer fires. It reopens only the exact error
+// state (a job edit or startup may already have moved the row on, and then
+// there is nothing to do) and queues one normal reconciliation.
+func (manager *Manager) retryDue(repositoryID string, retry *policyRetry, armed int) {
+	manager.mu.Lock()
+	if !manager.accept || manager.ctx.Err() != nil || manager.retries[repositoryID] != retry ||
+		retry.armed != armed || retry.stop == nil {
+		manager.mu.Unlock()
+		return
+	}
+	retry.stop = nil
+	// Counted like a worker so Stop waits for this database work before the
+	// application closes the database.
+	manager.wg.Add(1)
+	manager.mu.Unlock()
+	defer manager.wg.Done()
+	err := database.RetryKopiaPolicyForRepository(manager.db, repositoryID)
+	switch {
+	case err == nil:
+		Queue(manager.db, repositoryID)
+	case errors.Is(err, database.ErrKopiaPolicyRetryUnavailable):
+		// Not in the error state any more: a job edit or another trigger
+		// already moved the row on, and its reconciliation reports the result.
+		// When that result is already "ready" (for example scheduled
+		// maintenance reconciled it), this retry has nothing left to do and
+		// counts as the success: forget the backoff and reset the worker's
+		// reconnect clock and state. The retry is only forgotten if it is
+		// still the one that fired; a failure that re-armed it meanwhile keeps
+		// its timer, or the policy would be left in error with no retry.
+		state, stateErr := database.GetKopiaPolicyState(manager.db, repositoryID)
+		if stateErr != nil || state.State != "ready" {
+			return
+		}
+		manager.mu.Lock()
+		current := manager.retries[repositoryID] == retry && retry.armed == armed && retry.stop == nil
+		if current {
+			delete(manager.retries, repositoryID)
+		}
+		manager.mu.Unlock()
+		if current {
+			vaultreconnect.RecordWorkerSuccess(manager.db, repositoryID, vaultreconnect.WorkerKopiaPolicy)
+		}
+	case errors.Is(err, sql.ErrNoRows):
+		// The vault is gone.
+		manager.mu.Lock()
+		if manager.retries[repositoryID] == retry {
+			delete(manager.retries, repositoryID)
+		}
+		manager.mu.Unlock()
+	default:
+		// The row could not be reopened (for example a busy database). Try
+		// again after the next delay rather than leaving backups blocked.
+		manager.retryLater(repositoryID)
 	}
 }
 

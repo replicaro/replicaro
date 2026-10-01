@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"sync"
@@ -120,6 +121,11 @@ type rcloneApplicationOutcome struct {
 	Attached     bool                           `json:"attached"`
 	Usable       *bool                          `json:"usable,omitempty"`
 	FailureStage rcloneApplicationFailureStage  `json:"failureStage,omitempty"`
+	// Only a cloud sign-in apply that saved the new login sets this, when a
+	// cleanup after the save did not finish. Creation and connection copy
+	// just the lifecycle fields above into their own response and report
+	// their issues there.
+	foregroundOutcome
 }
 
 type rcloneApplicationFailureStage string
@@ -1245,12 +1251,10 @@ func registerRcloneAuthHandlers(
 			return
 		}
 		if finishErr != nil {
-			outcome.FailureStage = rcloneFailureArtifactWork
-			writeRcloneApplicationError(w, http.StatusInternalServerError, outcome, fmt.Errorf(
-				"rclone login was saved, but its temporary authorization session needs cleanup: %w",
-				finishErr,
-			))
-			return
+			// The login is saved and in use; only the temporary session is
+			// left. That is completed with issues, not an error the page would
+			// read as "sign-in failed".
+			outcome.addIssue("The rclone login was saved, but its temporary authorization session still needs cleanup.")
 		}
 		writeJSON(w, outcome)
 	})
@@ -1385,8 +1389,19 @@ func applyRcloneAuthorizedCredentials(
 	}
 	outcome.Attached = true
 	outcome.Usable = assessedUsability(true)
+	// The new login is committed above. A quarantined old engine artifact
+	// that cannot be removed is left for manual cleanup and makes the apply
+	// completed with issues; it is not a failure, because nothing should be
+	// retried.
+	//
+	// The issue text is fixed on purpose. The finalize error names the local
+	// app-data quarantine path, and apply responses never carry sensitive
+	// paths (before this was completed with issues, the same case went out
+	// through writeRcloneApplicationError, which also sends a fixed message).
+	// The raw error goes to the local log for whoever does the cleanup.
 	if err := finalizeRepositoryArtifacts(stage); err != nil {
-		return failRcloneApplication(outcome, rcloneFailureArtifactWork, fmt.Errorf("credentials were updated but quarantined old engine artifacts require manual cleanup: %w", err))
+		log.Printf("cloud sign-in apply for vault %s: quarantined old engine artifacts could not be removed: %v", repo.ID, err)
+		outcome.addIssue("credentials were updated but quarantined old engine artifacts require manual cleanup")
 	}
 	_ = database.LogActivity(db, "Repository rclone account reconnected: "+repo.Name)
 	return outcome, nil

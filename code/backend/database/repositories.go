@@ -66,7 +66,9 @@ const repoColumns = `
 	vault_size_bytes, vault_size_measured_at, vault_size_dirty, vault_size_last_attempt_at,
 	check_schedule, next_check, last_check, last_check_status,
 	maintenance_schedule, object_lock_json, next_maintenance, last_maintenance,
-	last_maintenance_status, concurrency_mode, auto_unlock, created_at`
+	last_maintenance_status, concurrency_mode, auto_unlock, created_at,
+	EXISTS (SELECT 1 FROM vault_reconnect_state s
+		WHERE s.repository_id = repositories.id AND s.reconnect_required = 1)`
 
 func scanRepo(scan func(dest ...any) error) (models.Repository, error) {
 
@@ -114,6 +116,7 @@ func scanRepo(scan func(dest ...any) error) (models.Repository, error) {
 		&r.ConcurrencyMode,
 		&r.AutoUnlock,
 		&r.CreatedAt,
+		&r.ReconnectRequired,
 	)
 	if err != nil {
 		return r, err
@@ -160,7 +163,7 @@ func scanRepo(scan func(dest ...any) error) (models.Repository, error) {
 		return r, err
 	}
 	r.HasCredentials = integrations.HasCredentials(r.Connector, r.ConnectorOptions)
-	if engines.IsResticRcloneConnector(r.Connector) {
+	if engines.IsRcloneNativeLoginProvider(r.Connector) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 		r.HasCredentials = engines.RcloneVaultCredentialsReady(ctx, r)
 		cancel()
@@ -172,6 +175,9 @@ func scanRepo(scan func(dest ...any) error) (models.Repository, error) {
 	// every database write. See isNetworkFilesystemLocation.
 	r.IsNetwork = isNetworkFilesystemLocation(r.Connector, r.Location, storedRepositoryFacts(r))
 	r.ConnectorLabel = vaultidentity.ConnectorLabel(r.Connector, r.Location, r.ConnectorOptions)
+	if r.Connector == engines.RcloneRemoteConnector {
+		r.RcloneRemote = rcloneRemoteSettings(r.ConnectorOptions)
+	}
 	if r.Connector == "sftp" {
 		if effective, resolveErr := vaultidentity.ResolveEffectiveAddress(r.Connector, r.Location, r.ConnectorOptions); resolveErr == nil {
 			r.SFTPPathMode = effective.PathMode
@@ -179,6 +185,26 @@ func scanRepo(scan func(dest ...any) error) (models.Repository, error) {
 	}
 
 	return r, err
+}
+
+// rcloneRemoteSettings returns the settings of an Any Rclone Remote vault the
+// UI may see. It never copies the rclone config password or a variable value.
+// Saved variables that can't be read give no names; every run refuses them
+// anyway.
+func rcloneRemoteSettings(options map[string]string) *models.RcloneRemoteSettings {
+	settings := &models.RcloneRemoteSettings{
+		ConfigFile:      options[engines.RcloneRemoteConfigFileOption],
+		ConfigEncrypted: options[engines.RcloneRemoteConfigEncryptedOption] == "true",
+		Remote:          options[engines.RcloneRemoteNameOption],
+		Path:            options[engines.RcloneRemotePathOption],
+		VariableNames:   []string{},
+	}
+	if variables, err := engines.ParseRcloneRemoteEnvironment(options[engines.RcloneRemoteEnvironmentOption]); err == nil {
+		for _, variable := range variables {
+			settings.VariableNames = append(settings.VariableNames, variable.Name)
+		}
+	}
+	return settings
 }
 
 // storedRepositoryFacts returns the storage facts recorded in a filesystem
@@ -238,7 +264,7 @@ func ListRepositories(db *sql.DB) ([]models.Repository, error) {
 }
 
 // TakeStartupStuckResticRepositories returns the Restic vaults whose
-// in-progress work Migrate marked failed during this application start. The
+// in-progress work Migrate marked interrupted during this application start. The
 // list lives only on this connection and is not persisted. Whether the later
 // Restic unlock actually removes anything is decided by Restic itself.
 func TakeStartupStuckResticRepositories(db *sql.DB) ([]models.Repository, error) {
@@ -421,8 +447,12 @@ func deleteRepository(db *sql.DB, id string, discardPendingProfile bool) error {
 	if err := requireRepositoryConnectionUnreserved(tx, id); err != nil {
 		return err
 	}
+	// The removal's own operation record is queued or running for this vault;
+	// every other active operation still blocks the delete, and so does an
+	// active deletion of a job that targets the vault (see
+	// otherActiveVaultWorkQuery).
 	var active int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE repository_id = ? AND status IN ('queued', 'running')`, id).Scan(&active); err != nil {
+	if err := tx.QueryRow(otherActiveVaultWorkQuery, id, id).Scan(&active); err != nil {
 		return err
 	}
 	if active > 0 {
@@ -601,8 +631,9 @@ func CheckRepositoryDeletionEligibility(db *sql.DB, id string) error {
 	if exists == 0 {
 		return sql.ErrNoRows
 	}
+	// As in deleteRepository, the removal's own record is left out.
 	var active int
-	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE repository_id = ? AND status IN ('queued', 'running')`, id).Scan(&active); err != nil {
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE repository_id = ? AND kind <> ? AND status IN ('queued', 'running')`, id, VaultRemovalKind).Scan(&active); err != nil {
 		return err
 	}
 	if active > 0 {

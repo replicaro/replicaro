@@ -84,7 +84,22 @@ func wipeRcloneSessionConfig(path string) error {
 
 // CleanupRcloneSessions removes only recognized private sessions left by an
 // earlier process. Authorization and operation sessions cannot be resumed.
+//
+// The sweep runs at most once per process, shared with the first OAuth sign-in
+// (ensureRcloneSessionsCleaned). It removes every op-* directory, so a second
+// sweep while operations are running would delete the live private directories
+// of Restic WebDAV and OAuth commands. Startup calls this before any operation
+// starts, which uses up the once.
 func CleanupRcloneSessions() error {
+	return ensureRcloneSessionsCleaned()
+}
+
+func ensureRcloneSessionsCleaned() error {
+	rcloneCleanupOnce.Do(func() { rcloneCleanupErr = sweepRcloneSessions() })
+	return rcloneCleanupErr
+}
+
+func sweepRcloneSessions() error {
 	operationParent, err := appdata.RcloneSessionRoot()
 	if err != nil {
 		return err
@@ -103,11 +118,6 @@ func CleanupRcloneSessions() error {
 		cleanupRcloneSessionsSecure(operationParent),
 		cleanupRcloneSessionsSecure(configParent),
 	)
-}
-
-func ensureRcloneSessionsCleaned() error {
-	rcloneCleanupOnce.Do(func() { rcloneCleanupErr = CleanupRcloneSessions() })
-	return rcloneCleanupErr
 }
 
 func validRcloneOperationDirectoryName(name string) bool {

@@ -195,8 +195,10 @@ func openRcloneVaultConfigBindingLocal(repo models.Repository) (*RcloneVaultConf
 	if repo.Engine != ResticID || !IsResticRcloneConnector(repo.Connector) {
 		return nil, fmt.Errorf("%w: repository is not a Restic rclone connector", ErrUnsupported)
 	}
-	if _, ok := RcloneProvider(repo.Connector); !ok {
-		return nil, fmt.Errorf("%w: repository is not a Restic rclone connector", ErrUnsupported)
+	// Only the sign-in providers have a private config. An Any Rclone Remote
+	// vault uses the user's own file and must never get one.
+	if !IsRcloneNativeLoginProvider(repo.Connector) {
+		return nil, fmt.Errorf("%w: repository has no private rclone config", ErrUnsupported)
 	}
 	if _, err := NormalizeRcloneProviderOptions(repo.Connector, repo.ConnectorOptions); err != nil {
 		return nil, reconnectRequired(fmt.Errorf("rclone vault identity is invalid: %w", err))
@@ -264,7 +266,7 @@ func OpenRcloneVaultConfigBinding(
 // secure private rclone config file. Whether the provider is reachable is left
 // to the operation itself.
 func RcloneVaultCredentialsReady(ctx context.Context, repo models.Repository) bool {
-	if repo.Engine != ResticID || !IsResticRcloneConnector(repo.Connector) {
+	if repo.Engine != ResticID || !IsRcloneNativeLoginProvider(repo.Connector) {
 		return false
 	}
 	normalized, err := NormalizeRcloneProviderOptions(
@@ -466,29 +468,44 @@ func NewRclonePreviewSidecarConfig(
 	if err != nil {
 		return "", nil, err
 	}
+	config, _, _, cleanup, err := newTemporaryRcloneConfig(ctx, binary)
+	return config, cleanup, err
+}
+
+// newTemporaryRcloneConfig makes an empty native config with "rclone config
+// touch" inside a fresh private operation directory, and returns it with that
+// directory's cache and temp folders. Cleanup removes the whole directory.
+// The connect preview and Restic's WebDAV transport both define their remotes
+// entirely through RCLONE_CONFIG_* variables on top of this file, so it never
+// holds a setting or credential.
+func newTemporaryRcloneConfig(
+	ctx context.Context, binary string,
+) (config, cache, temporary string, cleanup func() error, err error) {
 	root, cache, temporary, cleanup, err := privateRcloneOperationDirectories()
 	if err != nil {
-		return "", nil, err
+		return "", "", "", nil, err
 	}
-	config := filepath.Join(root, "rclone.conf")
+	config = filepath.Join(root, "rclone.conf")
 	if _, err := runRcloneVaultConfigCommand(
 		ctx, binary,
 		[]string{"config", "touch", "--config", config, "--cache-dir", cache,
 			"--temp-dir", temporary, "--log-level", "ERROR"},
 		nil, "", time.Minute, RcloneComponentID,
 	); err != nil {
-		return "", cleanup, errors.Join(
-			fmt.Errorf("native rclone could not establish preview config"),
+		// Keep the fixed message but the cause too, so a cancelled command is
+		// still reported as interrupted rather than as a setup failure.
+		return "", "", "", cleanup, errors.Join(
+			&privateOutputError{message: "native rclone could not establish temporary rclone config", cause: err},
 			cleanup(),
 		)
 	}
 	if err := hardenNewRcloneConfigFile(config); err != nil {
-		return "", cleanup, errors.Join(err, cleanup())
+		return "", "", "", cleanup, errors.Join(err, cleanup())
 	}
 	if err := validateRcloneVaultFile(config); err != nil {
-		return "", cleanup, errors.Join(err, cleanup())
+		return "", "", "", cleanup, errors.Join(err, cleanup())
 	}
-	return config, cleanup, nil
+	return config, cache, temporary, cleanup, nil
 }
 
 // RemoveRcloneVaultConfig removes only one validated repository-ID directory.

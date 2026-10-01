@@ -29,6 +29,11 @@ const (
 	maximumOutputBytes = 1 << 20
 )
 
+// RefreshFailed is the failure code the status reports after a refresh
+// fails. The UI turns it into translated text, so it is a stable code and not
+// a sentence.
+const RefreshFailed = "vault_size_refresh_failed"
+
 var (
 	materializeRclone = rclone.Materialize
 	runRclone         = command.RunWithInputSecretsPrivateOutput
@@ -245,7 +250,7 @@ func (c *coordinator) run(db *sql.DB, repo models.Repository) {
 	delete(c.pending, repo.ID)
 	delete(c.paused, repo.ID)
 	if err != nil && c.ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		c.failures[repo.ID] = "Vault Size refresh failed."
+		c.failures[repo.ID] = RefreshFailed
 		_ = database.LogWarning(db, "Vault Size refresh failed for vault "+repo.ID)
 	}
 	c.mu.Unlock()
@@ -256,11 +261,26 @@ func Measure(ctx context.Context, repo models.Repository) (result int64, err err
 	if err != nil {
 		return 0, fmt.Errorf("prepare base vault root")
 	}
-	binding, err := engines.OpenExistingRcloneStatisticsConfigBinding(ctx, repo)
-	if err != nil {
-		return 0, fmt.Errorf("open canonical rclone configuration")
+	// An Any Rclone Remote vault reads the user's own config file in place and
+	// has no canonical config binding; its run environment is added after the
+	// base settings below, so none of it is obscured again.
+	var binding *engines.RcloneVaultConfigBinding
+	var configPath string
+	var rcloneRemoteEnv []string
+	if repo.Connector == engines.RcloneRemoteConnector {
+		run, runErr := engines.RcloneRemoteRunForRepository(repo)
+		if runErr != nil {
+			return 0, fmt.Errorf("prepare rclone remote: %w", runErr)
+		}
+		configPath, rcloneRemoteEnv = run.ConfigFile, run.Env
+	} else {
+		binding, err = engines.OpenExistingRcloneStatisticsConfigBinding(ctx, repo)
+		if err != nil {
+			return 0, fmt.Errorf("open canonical rclone configuration")
+		}
+		defer func() { err = errors.Join(err, binding.Close()) }()
+		configPath = binding.NativePath()
 	}
-	defer func() { err = errors.Join(err, binding.Close()) }()
 	binary, err := materializeRclone()
 	if err != nil {
 		return 0, fmt.Errorf("prepare pinned rclone")
@@ -275,16 +295,17 @@ func Measure(ctx context.Context, repo models.Repository) (result int64, err err
 			continue
 		}
 		obscuredOutput, obscureErr := runRclone(ctx, binary,
-			[]string{"obscure", "-", "--config", binding.NativePath()}, nil, raw+"\n", time.Minute, "rclone")
+			[]string{"obscure", "-", "--config", configPath}, nil, raw+"\n", time.Minute, "rclone")
 		if obscureErr != nil {
-			return 0, fmt.Errorf("prepare SFTP credential")
+			return 0, fmt.Errorf("prepare connector credential")
 		}
 		obscured := strings.TrimSpace(obscuredOutput)
 		if obscured == "" || strings.ContainsAny(obscured, "\r\n") {
-			return 0, fmt.Errorf("prepare SFTP credential")
+			return 0, fmt.Errorf("prepare connector credential")
 		}
 		environment[index] = key + "=" + obscured
 	}
+	environment = append(environment, rcloneRemoteEnv...)
 	launchContext := command.ContextWithBeforeProcess(ctx, func(check context.Context) error {
 		if err := binding.Revalidate(check); err != nil {
 			return err
@@ -292,7 +313,7 @@ func Measure(ctx context.Context, repo models.Repository) (result int64, err err
 		return storageavailability.RequireRepositoryAvailable(check, repo)
 	})
 	output, nativeErr := runRclone(launchContext, binary,
-		[]string{"size", base.Root, "--json", "--fast-list", "--config", binding.NativePath(), "--log-level", "ERROR"},
+		[]string{"size", base.Root, "--json", "--fast-list", "--config", configPath, "--log-level", "ERROR"},
 		environment, "", 10*time.Minute, "rclone")
 	postErr := binding.Revalidate(context.WithoutCancel(ctx))
 	if nativeErr != nil || postErr != nil {

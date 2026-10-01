@@ -15,13 +15,19 @@ import (
 	"golang.org/x/sys/windows/registry"
 )
 
+// Windows caches the toast header icon per app ID and did not refresh it for
+// the old "Replicaro" success ID after its IconUri changed, so success toasts
+// use "Replicaro.Success". Do not move success back to "Replicaro". The
+// installer removes all four keys on uninstall; keep
+// code/build/unsigned/replicaro.iss in step with these names.
 const (
-	toastSuccessAppID        = "Replicaro"
+	toastSuccessAppID        = "Replicaro.Success"
 	toastWarningAppID        = "Replicaro.Warning"
 	toastWarningAppKey       = `Software\Classes\AppUserModelId\Replicaro.Warning`
 	toastFailureAppID        = "Replicaro.Failure"
-	toastSuccessAppKey       = `Software\Classes\AppUserModelId\Replicaro`
+	toastSuccessAppKey       = `Software\Classes\AppUserModelId\Replicaro.Success`
 	toastFailureAppKey       = `Software\Classes\AppUserModelId\Replicaro.Failure`
+	toastLegacySuccessAppKey = `Software\Classes\AppUserModelId\Replicaro`
 	toastIconBackgroundColor = "FF0A0C10"
 	roInitMultithread        = 1
 )
@@ -274,6 +280,7 @@ func registerToastApp(status string) error {
 	if toastRegistrationDone[status] {
 		return nil
 	}
+	removeLegacyToastApp()
 	iconPath, err := notificationIconPath(status)
 	if err != nil {
 		return err
@@ -303,6 +310,14 @@ func registerToastApp(status string) error {
 	}
 	toastRegistrationDone[status] = true
 	return nil
+}
+
+// removeLegacyToastApp deletes the old "Replicaro" success registration, which
+// nothing uses anymore. Only that key is deleted, never its parent. It is
+// best-effort: the key is usually already gone, and a failed delete must never
+// block the notification.
+func removeLegacyToastApp() {
+	_ = registry.DeleteKey(registry.CURRENT_USER, toastLegacySuccessAppKey)
 }
 
 func activateToastClass(className string) (unsafe.Pointer, error) {

@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	MetadataURL              = "https://cloud.replicaro.com/updates/check.json"
+	MetadataURL              = "https://replicaro.com/update-check"
 	requestTimeout           = 5 * time.Second
 	maximumResponseSize      = 4096
 	automaticStateRetryDelay = time.Minute
@@ -63,12 +63,11 @@ type Service struct {
 var cacheFallback atomic.Uint64
 
 func New(db *sql.DB) *Service {
-	client := &http.Client{
-		Timeout: requestTimeout,
-		CheckRedirect: func(*http.Request, []*http.Request) error {
-			return fmt.Errorf("application update redirects are not allowed")
-		},
-	}
+	// The check endpoint may redirect to the published metadata object, so the
+	// client follows redirects with Go's default limit. The timeout covers the
+	// whole chain. Whatever answers, only a version string is read from it; the
+	// download page URL is always built locally.
+	client := &http.Client{Timeout: requestTimeout}
 	return &Service{
 		db: db, client: client, endpoint: MetadataURL, now: time.Now,
 		cacheValue: freshCacheValue, automaticWake: make(chan struct{}, 1),

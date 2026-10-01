@@ -6,12 +6,15 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/engines"
+	"github.com/local/replicaro/locale"
 	"github.com/local/replicaro/models"
+	"github.com/local/replicaro/notifications"
 	"github.com/local/replicaro/profilesync"
 	"github.com/local/replicaro/repositoryadmission"
 	"github.com/local/replicaro/storageavailability"
@@ -50,6 +53,17 @@ var assertVaultPasswordChangeAuthority = func(ctx context.Context, store vaultpr
 		operation.OperationUUID, allowUnfenced, requireProfileFence)
 }
 var admitPasswordChangeRecoveryUnderLock = repositoryadmission.AdmitPasswordChangeRecoveryUnderLock
+
+// SetPasswordChangeRecoveryAdmissionForTests replaces the admission a
+// password change Retry runs under the vault lock, with its phase record
+// already saved. Tests of the tracked worker in other packages use it to hold
+// a Retry at exactly that point.
+func SetPasswordChangeRecoveryAdmissionForTests(next func(context.Context, *sql.DB, models.Repository, repositoryadmission.PasswordChangeRecoveryOptions) (models.Repository, error)) func() {
+	previous := admitPasswordChangeRecoveryUnderLock
+	admitPasswordChangeRecoveryUnderLock = next
+	return func() { admitPasswordChangeRecoveryUnderLock = previous }
+}
+
 var abandonConclusivePreMutationPasswordChange = func(db *sql.DB, repo models.Repository, operation database.VaultPasswordChangeOperation) error {
 	if operation.NativeMutationDisposition == string(engines.PasswordMutationRejectedBeforeMutation) {
 		return database.AbandonRejectedBeforeMutationVaultPasswordChange(db, repo.ID)
@@ -165,7 +179,59 @@ func VaultPasswordChangeStatus(db *sql.DB, repositoryID string) (VaultPasswordCh
 	return passwordChangeResult(repo, operation), nil
 }
 
-func ChangeVaultPassword(ctx context.Context, db *sql.DB, repositoryID, candidate string) (VaultPasswordChangeResult, error) {
+// VaultLock takes a vault's exclusive lock for a password change and returns
+// its release. The tracked background operation passes one that waits for a
+// busy vault while its record stays queued, and that closes the operation's
+// cancel once the lock is held: from there the change cannot be stopped.
+// Startup recovery passes TryVaultLock.
+type VaultLock func(ctx context.Context, repositoryID string) (func(), error)
+
+// TryVaultLock refuses a busy vault instead of waiting for it. Startup
+// recovery runs before any worker or request exists, so nothing else should
+// hold the lock, and its bounded attempt must not sit behind one that does.
+func TryVaultLock(ctx context.Context, repositoryID string) (func(), error) {
+	unlock, ok, err := vaultlock.YieldLowPriorityAndTryExclusiveContext(ctx, repositoryID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, fmt.Errorf("vault is busy with another operation")
+	}
+	return unlock, nil
+}
+
+// ValidateVaultPasswordChangeRequest holds the checks a password change
+// request makes before its operation is queued; none of them needs the vault
+// lock. ChangeVaultPassword repeats them in the worker.
+func ValidateVaultPasswordChangeRequest(db *sql.DB, repositoryID, candidate string) error {
+	if err := models.ValidateVaultPassword(candidate); err != nil {
+		return err
+	}
+	repo, err := database.GetRepository(db, repositoryID)
+	if err != nil {
+		return err
+	}
+	if operation, err := database.VaultPasswordChange(db, repositoryID); err == nil {
+		if operation.Phase == "cleanup_pending" || repo.PendingPassphrase == "" || candidate != repo.PendingPassphrase {
+			return errDifferentVaultPasswordChangePending
+		}
+		// Submitting the same pending candidate again resumes that change.
+		return nil
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	if candidate == repo.Passphrase {
+		return errUnchangedVaultPassword
+	}
+	return database.ValidateRepositoryMutationAdmission(db, repositoryID)
+}
+
+var (
+	errDifferentVaultPasswordChangePending = errors.New("a different vault-password change is already pending; use Retry to recover it")
+	errUnchangedVaultPassword              = errors.New("new vault password must differ from the current password")
+)
+
+func ChangeVaultPassword(ctx context.Context, db *sql.DB, repositoryID, candidate string, lock VaultLock) (VaultPasswordChangeResult, error) {
 	if err := models.ValidateVaultPassword(candidate); err != nil {
 		return VaultPasswordChangeResult{}, err
 	}
@@ -175,9 +241,9 @@ func ChangeVaultPassword(ctx context.Context, db *sql.DB, repositoryID, candidat
 			return VaultPasswordChangeResult{}, loadErr
 		}
 		if operation.Phase == "cleanup_pending" || repo.PendingPassphrase == "" || candidate != repo.PendingPassphrase {
-			return passwordChangeResult(repo, operation), fmt.Errorf("a different vault-password change is already pending; use Retry to recover it")
+			return passwordChangeResult(repo, operation), errDifferentVaultPasswordChangePending
 		}
-		return recoverVaultPasswordChange(ctx, db, repositoryID)
+		return recoverVaultPasswordChange(ctx, db, repositoryID, lock)
 	} else if !errors.Is(err, sql.ErrNoRows) {
 		return VaultPasswordChangeResult{}, err
 	}
@@ -186,10 +252,18 @@ func ChangeVaultPassword(ctx context.Context, db *sql.DB, repositoryID, candidat
 		return VaultPasswordChangeResult{}, err
 	}
 	if candidate == repo.Passphrase {
-		return VaultPasswordChangeResult{}, fmt.Errorf("new vault password must differ from the current password")
+		return VaultPasswordChangeResult{}, errUnchangedVaultPassword
 	}
+	unlock, err := lock(ctx, repo.ID)
+	if err != nil {
+		return VaultPasswordChangeResult{}, err
+	}
+	defer unlock()
+	// This installation's own pending profile publication is resolved first,
+	// under the same lock the change then keeps, so nothing can queue another
+	// one in between.
 	if _, err := database.VaultProfileSyncState(db, repositoryID); err == nil {
-		if err := profilesync.SyncRepository(ctx, db, repositoryID); err != nil {
+		if err := profilesync.SyncRepositoryUnderLock(ctx, db, repositoryID); err != nil {
 			return VaultPasswordChangeResult{}, fmt.Errorf("resolve pending local recovery-profile publication before password change: %w", err)
 		}
 	} else if !errors.Is(err, sql.ErrNoRows) {
@@ -200,19 +274,11 @@ func ChangeVaultPassword(ctx context.Context, db *sql.DB, repositoryID, candidat
 		return VaultPasswordChangeResult{}, err
 	}
 	if candidate == repo.Passphrase {
-		return VaultPasswordChangeResult{}, fmt.Errorf("new vault password must differ from the current password")
+		return VaultPasswordChangeResult{}, errUnchangedVaultPassword
 	}
 	if err := database.ValidateRepositoryMutationAdmission(db, repo.ID); err != nil {
 		return VaultPasswordChangeResult{}, err
 	}
-	unlock, ok, lockErr := vaultlock.YieldLowPriorityAndTryExclusiveContext(ctx, repo.ID)
-	if lockErr != nil {
-		return VaultPasswordChangeResult{}, lockErr
-	}
-	if !ok {
-		return VaultPasswordChangeResult{}, fmt.Errorf("vault is busy with another operation")
-	}
-	defer unlock()
 	repo, err = repositoryadmission.AdmitUnderLock(ctx, db, repo)
 	if err != nil {
 		return VaultPasswordChangeResult{}, err
@@ -234,7 +300,20 @@ func ChangeVaultPassword(ctx context.Context, db *sql.DB, repositoryID, candidat
 	return resumeVaultPasswordChangeUnderLock(ctx, db, repo, operation)
 }
 
-func RecoverVaultPasswordChange(ctx context.Context, db *sql.DB, repositoryID string) (VaultPasswordChangeResult, error) {
+func RecoverVaultPasswordChange(ctx context.Context, db *sql.DB, repositoryID string, lock VaultLock) (VaultPasswordChangeResult, error) {
+	if _, err := database.GetRepository(db, repositoryID); err != nil {
+		return VaultPasswordChangeResult{}, err
+	}
+	if _, err := database.VaultPasswordChange(db, repositoryID); err != nil {
+		return VaultPasswordChangeResult{}, err
+	}
+	unlock, err := lock(ctx, repositoryID)
+	if err != nil {
+		return VaultPasswordChangeResult{}, err
+	}
+	defer unlock()
+	// Read both again under the lock: a waiting retry resumes whatever the
+	// phase record says now, not what it said when the request was queued.
 	repo, err := database.GetRepository(db, repositoryID)
 	if err != nil {
 		return VaultPasswordChangeResult{}, err
@@ -243,14 +322,6 @@ func RecoverVaultPasswordChange(ctx context.Context, db *sql.DB, repositoryID st
 	if err != nil {
 		return VaultPasswordChangeResult{}, err
 	}
-	unlock, ok, lockErr := vaultlock.YieldLowPriorityAndTryExclusiveContext(ctx, repo.ID)
-	if lockErr != nil {
-		return passwordChangeResult(repo, operation), lockErr
-	}
-	if !ok {
-		return passwordChangeResult(repo, operation), fmt.Errorf("vault is busy with another operation")
-	}
-	defer unlock()
 	if operation.Phase != "cleanup_pending" {
 		repo, err = admitVaultPasswordRecoveryUnderLock(ctx, db, repo, operation)
 		if err != nil {
@@ -717,18 +788,225 @@ func resumeVaultPasswordChangeUnderLock(ctx context.Context, db *sql.DB, repo mo
 	return passwordChangeResult(repo, operation), fmt.Errorf("vault-password change phase is invalid")
 }
 
+// VaultPasswordChangeOutcome is the status of the tracked operation that ran
+// a password change or its retry. The phase record decides it:
+//
+//   - completed: success, or completed_with_issues when the new password
+//     verified and was committed although the native command did not report
+//     success (the change took effect; the engine's own result stands as
+//     recorded);
+//   - cleanup_pending: completed_with_issues; the new password is committed and
+//     only local staging cleanup is left, which Retry finishes;
+//   - anything else is failed: the change stopped before commit (the vault is
+//     blocked until it is retried), was rolled back because it provably never
+//     started, or was refused before any change.
+func VaultPasswordChangeOutcome(result VaultPasswordChangeResult, err error) string {
+	if err == nil && result.Phase == "completed" {
+		if result.Native.Status == engines.RequestedOperationSucceeded {
+			return "success"
+		}
+		return "completed_with_issues"
+	}
+	if result.Phase == "cleanup_pending" {
+		return "completed_with_issues"
+	}
+	return "failed"
+}
+
+// VaultPasswordChangeSummary is the final output of the password change
+// operation: the error, if any, the result's own explanation, and the native
+// command's result line with its output. It never contains a password.
+//
+// The native line keeps the shape the vault card used when the change still
+// answered in its HTTP response ("Native restic result: failed — <output>").
+// The output is the engine's own stdout/stderr, which was always shown to the
+// user: Restic reads the new password from a file and Kopia from
+// KOPIA_NEW_PASSWORD, and neither prints it. It is already bounded by the
+// command runner's capture, so it is not cut again here. Keep it in this
+// summary: the operation log, the toast and the vault card read only this
+// final output now, and without it a D32 completed-with-issues change or a
+// Restic rejection before mutation would hide what the engine actually said.
+func VaultPasswordChangeSummary(result VaultPasswordChangeResult, err error) string {
+	lines := []string{}
+	if err != nil {
+		lines = append(lines, err.Error())
+	}
+	if result.Message != "" {
+		lines = append(lines, result.Message)
+	}
+	if result.ResticKeyTruth != "" {
+		lines = append(lines, result.ResticKeyTruth)
+	}
+	output := strings.TrimSpace(result.Native.Output)
+	if result.Native.Engine != "" && (result.Native.Status != "" || output != "") {
+		status := string(result.Native.Status)
+		if status == "" {
+			status = "unresolved"
+		}
+		line := fmt.Sprintf("Native %s result: %s", result.Native.Engine, status)
+		if output != "" {
+			line += " — " + output
+		}
+		lines = append(lines, line)
+	}
+	return strings.Join(lines, "\n")
+}
+
+// VaultPasswordChangeBlockingStep is the operation step a failed password
+// change records when it leaves the vault blocked: a change stopped before
+// commit refuses every operation on the vault until it is retried. The
+// dashboard reads this step to say so and to lead to the retry; it is a fact
+// about the moment the operation ended, so a later successful retry does not
+// have to rewrite it.
+const VaultPasswordChangeBlockingStep = "vault_password_blocked"
+
+// VaultPasswordChangeBlockingText is the step's log text. The UI shows its own
+// translated wording for the step.
+const VaultPasswordChangeBlockingText = "An unfinished vault password change is blocking this vault. Retry the password change to continue."
+
+// RecordVaultPasswordChangeBlocking records VaultPasswordChangeBlockingStep on
+// the operation when the vault's password change phase record is still before
+// commit. Errors are only logged: the operation's own status is what matters.
+func RecordVaultPasswordChangeBlocking(db *sql.DB, operationID, repositoryID string) {
+	if !errors.Is(database.RequireNoPrecommitVaultPasswordChange(db, repositoryID), database.ErrVaultPasswordChangeRecoveryRequired) {
+		return
+	}
+	now := time.Now()
+	if err := database.StartOperationStep(db, operationID, "orchestration", VaultPasswordChangeBlockingStep, now); err != nil {
+		log.Printf("record blocked vault for password change operation %s: %v", operationID, err)
+		return
+	}
+	if err := database.FinishOperationStep(db, operationID, VaultPasswordChangeBlockingStep, "failed", VaultPasswordChangeBlockingText, now); err != nil {
+		log.Printf("record blocked vault for password change operation %s: %v", operationID, err)
+	}
+}
+
 // RecoverVaultPasswordChangesOnce performs the one startup attempt required
 // before ordinary workers and HTTP admission begin. It never polls or starts a
 // background retry service.
-func RecoverVaultPasswordChangesOnce(ctx context.Context, db *sql.DB) error {
+//
+// It also finishes the password change operations that were still running
+// when the app stopped. Startup reconciliation leaves those running on
+// purpose, because the phase record, not the operation record, is the
+// recovery authority: each one is finished here with the outcome of the
+// recovery attempt for its vault.
+//
+// A failed or completed-with-issues outcome notifies like any other tracked
+// operation that ends that way (the user was never told how the change they
+// started ended). The notification cannot be sent from here, though: this
+// runs before the desktop integration exists, and a desktop notification sent
+// now would be dropped silently while its step still reported success. So each
+// notification step is registered before its operation is saved as finished,
+// exactly as a worker does, and the returned function sends them. The caller
+// runs it once notifications can be delivered (main.go does that inside
+// desktop.Run's service). If the app stops before that, the step is still
+// running and the next startup's reconciliation marks it failed with "did not
+// complete because the application stopped"; nothing else needs to be saved.
+// An interrupted outcome never notifies, as for every other operation.
+func RecoverVaultPasswordChangesOnce(ctx context.Context, db *sql.DB) (func(), error) {
 	operations, err := database.ListVaultPasswordChanges(db)
 	if err != nil {
-		return err
+		return func() {}, err
 	}
-	for _, operation := range operations {
-		if _, err := RecoverVaultPasswordChange(ctx, db, operation.RepositoryID); err != nil {
-			log.Printf("vault-password recovery %s remains blocked: %v", operation.RepositoryID, err)
+	running, err := database.RunningVaultPasswordChangeOperations(db)
+	if err != nil {
+		return func() {}, err
+	}
+	runningByVault := map[string][]string{}
+	for _, operation := range running {
+		runningByVault[operation.RepositoryID] = append(runningByVault[operation.RepositoryID], operation.OperationID)
+	}
+	var dispatches []func()
+	finish := func(operationID, status, output string) {
+		var dispatch func()
+		if status != "interrupted" {
+			dispatch = prepareStartupPasswordNotification(db, operationID, status)
+		}
+		if err := database.FinishOperation(db, operationID, status, output, time.Now()); err != nil {
+			log.Printf("finish vault-password operation %s after startup recovery: %v", operationID, err)
+			return
+		}
+		if dispatch != nil {
+			dispatches = append(dispatches, dispatch)
 		}
 	}
-	return nil
+	for _, operation := range operations {
+		result, err := RecoverVaultPasswordChange(ctx, db, operation.RepositoryID, TryVaultLock)
+		if err != nil {
+			log.Printf("vault-password recovery %s remains blocked: %v", operation.RepositoryID, err)
+		}
+		status := VaultPasswordChangeOutcome(result, err)
+		if err == nil && result.Phase == "not_started" {
+			// Recovery proved the interrupted change never touched the vault and
+			// rolled its fence back. The restart is what stopped it.
+			status = "interrupted"
+		}
+		for _, operationID := range runningByVault[operation.RepositoryID] {
+			if status == "failed" {
+				RecordVaultPasswordChangeBlocking(db, operationID, operation.RepositoryID)
+			}
+			finish(operationID, status, VaultPasswordChangeSummary(result, err))
+		}
+		delete(runningByVault, operation.RepositoryID)
+	}
+	// A running record whose vault has no phase record: the app stopped before
+	// the change saved its phase (nothing was changed), or after the change
+	// finished but before its record was saved. Those cannot be told apart
+	// now, so the record is interrupted like any other abandoned operation.
+	for _, operationIDs := range runningByVault {
+		for _, operationID := range operationIDs {
+			finish(operationID, "interrupted",
+				"Application stopped before the operation completed; the operation was marked interrupted.")
+		}
+	}
+	return func() {
+		for _, dispatch := range dispatches {
+			dispatch()
+		}
+	}, nil
+}
+
+// prepareStartupPasswordNotification is the startup counterpart of the API's
+// prepareOperationNotification for a password change operation, which the
+// runner cannot import. It registers the notification step and returns the
+// send, or nil when nothing is to be sent. The title prefix is the one the API
+// gives these operations ("Change vault password: <vault>").
+func prepareStartupPasswordNotification(db *sql.DB, operationID, status string) func() {
+	operation, err := database.GetOperation(db, operationID)
+	if err != nil {
+		log.Printf("prepare notification for vault-password operation %s: %v", operationID, err)
+		return nil
+	}
+	settings, err := database.GetSettings(db)
+	if err != nil {
+		_ = database.SkipOperationStep(db, operationID, "application", "notification",
+			"notification settings unavailable: "+err.Error(), time.Now())
+		return nil
+	}
+	nativeEnabled, webhookEnabled := settings.NotificationChannels(status)
+	event := notifications.Event{
+		Event: database.VaultPasswordChangeKind, Status: status, Success: status == "success",
+		Title: operation.Title, OperationID: operationID,
+	}
+	if !notifications.ShouldNotify(event) || !nativeEnabled && !webhookEnabled {
+		return nil
+	}
+	event.Locale = locale.Effective(settings.Language)
+	if name, ok := strings.CutPrefix(operation.Title, "Change vault password: "); ok {
+		event.TaskKey, event.TaskName = "notifications.task.changeVaultPassword", name
+	}
+	if err := database.StartOperationStep(db, operationID, "application", "notification", time.Now()); err != nil {
+		_ = database.LogError(db, "Notification step could not be registered: "+err.Error())
+		return nil
+	}
+	return func() {
+		notifications.Dispatch(settings.WebhookURL, nativeEnabled, webhookEnabled, event, func(err error) {
+			stepStatus, result := "succeeded", "notification delivery completed"
+			if err != nil {
+				stepStatus, result = "warning", err.Error()
+				_ = database.LogError(db, "Notification failed: "+err.Error())
+			}
+			_ = database.FinishOperationStep(db, operationID, "notification", stepStatus, result, time.Now())
+		})
+	}
 }

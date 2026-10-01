@@ -100,6 +100,7 @@ Don't want to search? No problem. You can also explore a vault just like a folde
     <tr><td width="760">Azure Blob Storage</td><td align="center" width="240">✓</td></tr>
     <tr><td width="760">Google Cloud Storage</td><td align="center" width="240">✓</td></tr>
     <tr><td width="760">SFTP/SSH</td><td align="center" width="240">✓</td></tr>
+    <tr><td width="760">WebDAV (Nextcloud, ownCloud, Apache, nginx with the dav-ext module, and other standard WebDAV servers)</td><td align="center" width="240">✓</td></tr>
     <tr><td width="760">Local, external, and mounted storage</td><td align="center" width="240">✓</td></tr>
   </tbody>
 </table>
@@ -166,7 +167,7 @@ Build backup jobs around your data. No need to understand command-line.
 
 - **Backup multiple computers to the same vault.**
 
-  - Use the same vault for up to 256 computers-at the same time! There is no server-client archiecture needed. You do not need to do anything special: just connect each computer to the vault, set up backup jobs on each computer, and Replicaro does its thing. (Note: Multi-computer vaults are not supported on Dropbox, Google Drive, and OneDrive vaults. You can use one Dropbox, Google Drive, or OneDrive account to hold multiple vaults, but each vault can only be used by one computer.)
+  - Use the same vault for up to 256 computers-at the same time! There is no server-client archiecture needed. You do not need to do anything special: just connect each computer to the vault, set up backup jobs on each computer, and Replicaro does its thing. (Note: Multi-computer vaults are not supported on Dropbox, Google Drive, OneDrive, and Any Rclone Remote vaults. You can use one Dropbox, Google Drive, or OneDrive account, or one rclone remote, to hold multiple vaults, but each vault can only be used by one computer.)
 
 - **Bring an existing vault.**
 
@@ -223,7 +224,7 @@ The canonical English interface catalog is at
 Translations are contributed through pull requests and require review before
 they are included in the app. A new catalog is a candidate until a maintainer
 explicitly registers its locale in the frontend catalog registry, backend
-catalog loader, and supported language setting. The v1.0.3 source includes
+catalog loader, and supported language setting. The v1.0.4 source includes
 English, German, French, Arabic, Urdu, Hindi, Spanish, Italian, Simplified
 Chinese (Mandarin), Traditional Chinese (Cantonese), Japanese, Irish, Korean,
 Malay, Indonesian, Turkish, Hebrew, European Portuguese, Brazilian Portuguese,
@@ -254,8 +255,14 @@ in Appearance. Text and formatting both use the selected catalog's locale;
 there is no separate regional-format setting.
 
 The language area always includes **Reset to English**, with that exact English
-label excluded from translation. It saves the English preference immediately;
-other unsaved settings stay in the form until the user saves them separately.
+label excluded from translation. To change the language, pick one in the list
+and press **Change language**, or press **Reset to English**. Replicaro asks for
+confirmation (in English for Reset to English), then saves all settings on the
+System page and reloads it in the chosen language. Pressing **Save settings**
+after picking a new language asks for the same confirmation. If the saved
+language can't be loaded, Replicaro starts in English and says so, with the
+option to reload the page, or to continue in English and, if chosen, not be
+reminded about that language for 30 days in that browser.
 
 Arabic (`ar`) uses Modern Standard Arabic, Persian (`fa`) uses standard Iranian
 Persian, Malay (`ms`) uses Malaysian Malay, and Pidgin (`pcm`) uses Nigerian

@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"time"
 
 	"github.com/local/replicaro/command"
 	"github.com/local/replicaro/database"
@@ -19,7 +18,6 @@ import (
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/operationruntime"
 	"github.com/local/replicaro/storageavailability"
-	"github.com/local/replicaro/vaultlock"
 )
 
 const metadataPageSize = 200
@@ -467,26 +465,6 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 			}
 		}
 	}
-	requestedID, operationIDErr := requestedOperationID(req.OperationID)
-	if operationIDErr != nil {
-		writeError(w, http.StatusBadRequest, operationIDErr)
-		return
-	}
-	if requestedID != nil {
-		if err := database.ValidateOperationID(*requestedID); err != nil {
-			writeError(w, http.StatusBadRequest, err)
-			return
-		}
-		exists, err := database.OperationIDExists(db, *requestedID)
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
-		if exists {
-			writeError(w, http.StatusConflict, database.ErrOperationIDExists)
-			return
-		}
-	}
 	manager, engineErr := resolveEngine(repoModel)
 	if engineErr != nil {
 		writeError(w, http.StatusBadRequest, engineErr)
@@ -503,91 +481,81 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 			return
 		}
 	}
-	releaseMetadataDeferral, yieldErr := deferMetadataSyncForRestore(r.Context(), db, repoModel)
-	if yieldErr != nil {
+	if refuseWhilePasswordChangeUnfinished(w, db, repoModel.ID) {
 		return
 	}
-	unlock, ok, lockErr := vaultlock.YieldLowPriorityAndTryExclusiveContext(r.Context(), repoModel.ID)
-	if lockErr != nil {
-		releaseMetadataDeferral()
-		return
-	}
-	if !ok {
-		releaseMetadataDeferral()
-		writeError(w, http.StatusConflict, fmt.Errorf("vault is busy with another operation"))
-		return
-	}
-	var releaseRestoreRuntime func(bool)
-	terminalPersisted := false
-	defer func() {
-		unlock()
-		releaseMetadataDeferral()
-		if releaseRestoreRuntime != nil {
-			releaseRestoreRuntime(terminalPersisted)
-		}
-	}()
-	repoModel, err = admitPersistedRepository(r.Context(), db, repoModel)
+	title := fmt.Sprintf("Restore %d selected items", len(req.Items))
+	operationID, err := startTrackedOperation(db, runtimeManager, database.QueuedOperation{
+		Kind: "restore", Title: title, RepositoryID: repoModel.ID,
+	}, func(operationID, status string) func() {
+		return prepareOperationNotification(db, operationID, "restore", title, status, len(req.Items))
+	}, func(op *trackedOperation) {
+		restoreSelectionInBackground(op, repoModel, req, normalized)
+	})
 	if err != nil {
-		writeError(w, http.StatusConflict, err)
+		writeTrackedStartError(w, err)
 		return
 	}
-	manager, err = resolveEngine(repoModel)
+	// The response carries only the operation ID. The per-item results are in
+	// the operation's log (read through /api/operations/output) once it
+	// finishes, because the work outlives this request.
+	writeTrackedOperationStarted(w, operationID)
+}
+
+// restoreSelectionInBackground restores each selected item with its own native
+// restore, under one vault lock and one operation record.
+func restoreSelectionInBackground(op *trackedOperation, repoModel models.Repository, req RestoreSelectionRequest, normalized []RestoreSelectionItem) {
+	db := op.db
+	releaseMetadataDeferral, err := deferMetadataSyncForRestore(op.ctx, db, repoModel)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err)
+		op.notStarted(err)
+		return
+	}
+	defer releaseMetadataDeferral()
+	unlock, err := op.waitForVault(repoModel.ID)
+	if err != nil {
+		op.notStarted(err)
+		return
+	}
+	defer unlock()
+	if err := op.activate(); err != nil {
+		op.fail(fmt.Errorf("start restore: %w", err))
+		return
+	}
+	repoModel, err = admitPersistedRepository(op.ctx, db, repoModel)
+	if err != nil {
+		op.fail(err)
+		return
+	}
+	manager, err := resolveEngine(repoModel)
+	if err != nil {
+		op.fail(err)
 		return
 	}
 	snapshotIDs := make([]string, 0, len(normalized))
 	for _, item := range normalized {
 		snapshotIDs = append(snapshotIDs, item.SnapshotID)
 	}
-	authority, authorityErr := database.LoadMetadataReadAuthority(r.Context(), db, repoModel.ID)
+	authority, authorityErr := database.LoadMetadataReadAuthority(op.ctx, db, repoModel.ID)
 	if authorityErr != nil {
-		writeError(w, http.StatusConflict, authorityErr)
+		op.fail(authorityErr)
 		return
 	}
-	visibleSnapshots, visibilityErr := visibleCachedRestoreSnapshots(r.Context(), db, repoModel, authority, snapshotIDs)
+	visibleSnapshots, visibilityErr := visibleCachedRestoreSnapshots(op.ctx, db, repoModel, authority, snapshotIDs)
 	if visibilityErr != nil {
-		writeError(w, http.StatusForbidden, visibilityErr)
+		op.fail(visibilityErr)
 		return
 	}
 	nativeRoots := make(map[string]models.SnapshotSourceRoot, len(normalized))
 	for _, item := range normalized {
 		root, rootErr := exactRestoreNativeRoot(visibleSnapshots[item.SnapshotID], item.NativeRootID, true)
 		if rootErr != nil {
-			writeError(w, http.StatusUnprocessableEntity, rootErr)
+			op.fail(rootErr)
 			return
 		}
 		nativeRoots[item.SnapshotID+"\x00"+item.Path] = root
 	}
-	started := time.Now()
-	operationID, operationErr := database.StartOperationWithID(
-		db,
-		"restore",
-		fmt.Sprintf("Restore %d selected items", len(req.Items)),
-		"",
-		repoModel.ID,
-		requestedID,
-		started,
-	)
-	if operationErr != nil {
-		if errors.Is(operationErr, database.ErrInvalidOperationID) {
-			writeError(w, http.StatusBadRequest, operationErr)
-			return
-		}
-		if errors.Is(operationErr, database.ErrOperationIDExists) {
-			writeError(w, http.StatusConflict, operationErr)
-			return
-		}
-		writeError(w, http.StatusInternalServerError, operationErr)
-		return
-	}
-	operationCtx, closeCancelGate, releaseRuntime, runtimeErr := beginOperationRuntime(r.Context(), runtimeManager, operationID)
-	if runtimeErr != nil {
-		_ = finishOperationDurably(db, operationID, "failed", runtimeErr.Error(), time.Now())
-		writeError(w, http.StatusInternalServerError, runtimeErr)
-		return
-	}
-	releaseRestoreRuntime = releaseRuntime
+	operationCtx, closeCancelGate := op.ctx, op.closeGate
 
 	var kopiaNames *engines.KopiaRestoreFileNames
 	if manager.ID() == engines.KopiaID {
@@ -597,10 +565,13 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 		}
 		kopiaNames = engines.NewKopiaRestoreFileNames(selections)
 	}
-	attempted, restored, failed, notAttempted, orchestrationFailed := 0, 0, 0, 0, 0
+	attempted, restored, failed, notAttempted, orchestrationFailed, completedWithIssues := 0, 0, 0, 0, 0, 0
 	results := make([]RestoreSelectionItemResult, 0, len(normalized))
 	stopReason := ""
 	cancellationInterrupted := false
+	// itemErrors keeps each item's error for the operation's cause (see the
+	// end of this function).
+	var itemErrors []error
 	for itemIndex, item := range normalized {
 		if stopReason != "" || operationCtx.Err() != nil {
 			closeCancelGate()
@@ -638,12 +609,61 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 		if destinationNotice != "" {
 			result.Output = destinationNotice + "\n" + output
 		}
-		if restoreErr != nil {
+		if engines.RestoreReportedErrors(restoreErr) {
+			// The engine finished this item and reported that some of its files
+			// failed. That is neither "restored" nor "failed": the item is
+			// completed with issues, and so is the whole request.
+			//
+			// nativeStatus still says exactly how the engine exited, using the
+			// same values as every other item: Restic ends such a restore with
+			// exit code 1, so it is "failed" with that exit as the native error;
+			// Kopia (run with --ignore-errors) exits 0, so it is "restored". Only
+			// the item status carries the completed-with-issues meaning. Don't
+			// add a separate native value for this case.
+			attempted++
+			completedWithIssues++
+			result.Status = "completed_with_issues"
+			result.Error = restoreErr.Error()
+			if stageKnown && operationStatus == engines.RequestedOperationFailed {
+				result.NativeStatus = "failed"
+				result.NativeError = result.Error
+				if nativeStageErr != nil {
+					result.NativeError = nativeStageErr.Error()
+				}
+			}
+			// A later Replicaro step (for example rclone session cleanup) can
+			// still fail after the engine reported. It is kept as its own fact.
+			if stageKnown && followupErr != nil {
+				orchestrationFailed++
+				result.OrchestrationStatus = "failed"
+				result.OrchestrationError = followupErr.Error()
+			}
+		} else if restoreErr != nil {
+			itemErrors = append(itemErrors, restoreErr)
 			orchestrationErrors := make([]string, 0, 1)
 			if followupErr != nil {
 				orchestrationErrors = append(orchestrationErrors, followupErr.Error())
 			}
 			orchestrationError := strings.Join(orchestrationErrors, "\n")
+			if stageKnown && operationStatus == engines.RequestedOperationSucceeded && engines.RestoreOutcomeIsUnknown(restoreErr) {
+				// Kopia exited 0 but its summary could not be read, so nothing
+				// shows what this item restored. The native status keeps the
+				// exit-0 success, but the item is failed and is not counted as
+				// restored, so it can never lift the request to success or
+				// completed_with_issues on its own (see
+				// engines.RestoreOutcomeUnknown).
+				attempted++
+				failed++
+				orchestrationFailed++
+				result.Domain = "orchestration"
+				result.Status = "failed"
+				result.Error = restoreErr.Error()
+				result.NativeStatus = "restored"
+				result.OrchestrationStatus = "failed"
+				result.OrchestrationError = orchestrationError
+				results = append(results, result)
+				continue
+			}
 			if stageKnown && operationStatus == engines.RequestedOperationSucceeded {
 				attempted++
 				restored++
@@ -729,33 +749,38 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 		}
 		results = append(results, result)
 	}
+	// Every item is its own native restore, so the request as a whole is:
+	//   - success when every item was restored with nothing left over;
+	//   - failed when no item was restored (restored counts items whose native
+	//     restore succeeded, including ones whose follow-up then failed, but not
+	//     a Kopia exit 0 whose summary could not be read);
+	//   - completed_with_issues otherwise: some items restored and some failed or
+	//     were not attempted, an item's engine reported completed with errors,
+	//     or an item was restored but a Replicaro follow-up failed.
+	// Items skipped because of a cancel make the whole request interrupted
+	// below, which takes precedence.
 	status := "success"
-	if failed > 0 || orchestrationFailed > 0 {
+	if restored == 0 && completedWithIssues == 0 {
 		status = "failed"
+	} else if failed > 0 || orchestrationFailed > 0 || notAttempted > 0 || completedWithIssues > 0 {
+		status = "completed_with_issues"
 	}
-	encoded, _ := json.Marshal(map[string]any{"attempted": attempted, "restored": restored, "failed": failed, "orchestrationFailed": orchestrationFailed, "notAttempted": notAttempted, "items": results})
+	encoded, _ := json.Marshal(map[string]any{"attempted": attempted, "restored": restored, "failed": failed, "orchestrationFailed": orchestrationFailed, "notAttempted": notAttempted, "completedWithIssues": completedWithIssues, "items": results})
 	operationOutput := string(encoded)
 	persistedStatus := status
 	if cancellationInterrupted {
 		persistedStatus = "interrupted"
 	}
 	closeCancelGate()
-	var dispatchNotification func()
-	if persistedStatus != "interrupted" {
-		dispatchNotification = prepareOperationNotification(db, operationID, "restore", fmt.Sprintf("Restore %d selected items", len(req.Items)), status, len(req.Items))
+	// A failed request passes its item errors as the cause, like a whole
+	// restore passes its one error, so a conclusive reconnect error found while
+	// preparing the items saves the vault as needing a reconnect
+	// (vaultreconnect.RecordOperationResult). Only a failed request does: in
+	// any other outcome at least one item reached the vault. The joined errors
+	// are only classified there; the saved output above is unchanged.
+	var cause error
+	if persistedStatus == "failed" {
+		cause = errors.Join(itemErrors...)
 	}
-	if finishErr := finishOperationDurably(db, operationID, persistedStatus, operationOutput, time.Now()); finishErr != nil {
-		writeError(w, http.StatusInternalServerError, finishErr)
-		return
-	}
-	terminalPersisted = true
-	if dispatchNotification != nil {
-		dispatchNotification()
-	}
-	response := map[string]any{"status": persistedStatus, "attempted": attempted, "restored": restored, "failed": failed, "orchestrationFailed": orchestrationFailed, "notAttempted": notAttempted, "items": results}
-	if persistedStatus != "success" {
-		writeJSONStatus(w, http.StatusMultiStatus, response)
-		return
-	}
-	writeJSON(w, response)
+	op.finishWithCause(persistedStatus, operationOutput, cause)
 }

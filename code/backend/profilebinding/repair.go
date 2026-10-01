@@ -94,8 +94,17 @@ func repairMissing(ctx context.Context, db *sql.DB, repo models.Repository, nati
 }
 
 func automaticSoleProfileConnector(connector string) bool {
+	// This mirrors automaticSoleProfileConnector in api/repository_recovery.go.
+	// These providers use an attachment-local, opaque rclone authorization that
+	// Replicaro does not coordinate across computers, and they are slower,
+	// eventually consistent backends where several profiles writing to one
+	// vault would not reliably see each other's changes, so each vault keeps
+	// exactly one profile. An Any Rclone Remote vault can be on any rclone
+	// backend, so it takes the same limit. WebDAV is deliberately not listed:
+	// although Restic reaches it through rclone, it is an ordinary server
+	// connector like SFTP and allows multiple profiles.
 	switch connector {
-	case "dropbox", "google_drive", "onedrive":
+	case "dropbox", "google_drive", "onedrive", "rclone_remote":
 		return true
 	default:
 		return false

@@ -137,7 +137,11 @@ func kopiaReconnectBase(target *kopiaEngine, repo models.Repository, config stri
 	return base, env, nil
 }
 
-func validateKopiaReconnectStatus(repo models.Repository, output string) error {
+// validateKopiaReconnectStatus runs under the vault lock (staging also holds
+// the Kopia initialization lock; verifying the active config does not), so the
+// filesystem marker read for the fingerprint is bounded by ctx; a read stuck on
+// a hung share returns ctx's error instead of holding those locks.
+func validateKopiaReconnectStatus(ctx context.Context, repo models.Repository, output string) error {
 	if err := validateKopiaBinding(repo, output); err != nil {
 		return err
 	}
@@ -159,7 +163,7 @@ func validateKopiaReconnectStatus(repo models.Repository, output string) error {
 	if repositoryStatus.ClientOptions.FormatBlobCacheDuration != expectedCacheDuration {
 		return fmt.Errorf("Kopia repository format cache policy did not match the reconnect requirement")
 	}
-	fingerprint, err := RepositoryFingerprint(repo, output)
+	fingerprint, err := RepositoryFingerprintContext(ctx, repo, output)
 	if err != nil {
 		return err
 	}
@@ -246,7 +250,7 @@ func PrepareKopiaFilesystemReconnect(ctx context.Context, engine Engine, repo mo
 	if err != nil {
 		return paths, output, err
 	}
-	if err := validateKopiaReconnectStatus(repo, status); err != nil {
+	if err := validateKopiaReconnectStatus(ctx, repo, status); err != nil {
 		return paths, output, err
 	}
 	return paths, output, nil
@@ -294,7 +298,7 @@ func VerifyActiveKopiaFilesystemReconnect(ctx context.Context, engine Engine, re
 	if err != nil {
 		return paths, status, err
 	}
-	if err := validateKopiaReconnectStatus(repo, status); err != nil {
+	if err := validateKopiaReconnectStatus(ctx, repo, status); err != nil {
 		return paths, status, err
 	}
 	return paths, status, nil

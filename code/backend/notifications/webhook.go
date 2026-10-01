@@ -23,8 +23,8 @@ type Event struct {
 	TaskName   string `json:"-"`
 	TaskTarget string `json:"-"`
 	// MessageKey optionally replaces the generic status message with one
-	// specific catalog message (currently only the 30-day unavailable-storage
-	// notice). MessageValues fills its placeholders.
+	// specific catalog message (the 30-day unavailable-storage notices and the
+	// vault reconnect message). MessageValues fills its placeholders.
 	MessageKey            string            `json:"-"`
 	MessageValues         map[string]string `json:"-"`
 	Event                 string            `json:"event"`

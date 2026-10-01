@@ -482,6 +482,18 @@ pre {
     margin-top: 16px;
 }
 
+/* The "Don't remind me" checkbox sits under Continue in English, the button
+   it applies to. */
+.language-load-failed-actions {
+    align-items: flex-start;
+}
+
+.language-load-failed-continue {
+    display: grid;
+    justify-items: start;
+    gap: 8px;
+}
+
 .topbar {
     position: sticky;
     z-index: 40;
@@ -1241,6 +1253,15 @@ button.protection-ring { cursor: pointer; }
     font-size: 10.5px;
 }
 
+/* The "kind · engine · progress" line wraps instead of ending in an ellipsis.
+   Translated kind names can be long, and cutting the line would hide the
+   status at its end ("Waiting for the vault", "started 2 min ago"). */
+.active-operation span.active-operation-summary {
+    overflow: visible;
+    overflow-wrap: anywhere;
+    white-space: normal;
+}
+
 .operation-detail {
 	display: grid;
 	gap: 16px;
@@ -1271,6 +1292,18 @@ button.protection-ring { cursor: pointer; }
 	padding-bottom: 6px;
 	border-bottom: 1px solid var(--rule-soft);
 }
+
+/* Operation and step statuses use the dashboard timeline's colors. Work that
+   is still running has no outcome yet and keeps the normal text color; a
+   skipped step stays faint because it is neither good nor bad news. The log
+   output below is the engine's own and is never colored. */
+.operation-detail-steps span.running { color: var(--text); }
+.operation-detail-state strong.ok,
+.operation-detail-steps span.ok { color: var(--ok); }
+.operation-detail-state strong.warn,
+.operation-detail-steps span.warn { color: var(--warn); }
+.operation-detail-state strong.danger,
+.operation-detail-steps span.danger { color: var(--danger); }
 
 .operation-live-log {
 	max-height: min(50vh, 440px);
@@ -1692,6 +1725,9 @@ button.protection-ring { cursor: pointer; }
     transition: opacity 0.12s ease, transform 0.12s ease, visibility 0s linear 0.12s;
     visibility: hidden;
     white-space: normal !important;
+    /* A long URL or path has no spaces to wrap at, so let it break anywhere
+       rather than run past the popup and widen the page. */
+    overflow-wrap: anywhere;
 }
 
 .flow-source > .flow-source-path {
@@ -2116,7 +2152,39 @@ button.protection-ring { cursor: pointer; }
 .vault-choice span { display: grid; gap: 4px; }
 .vault-choice small, .recovery-banner span, .recovery-job small, .unowned-source small { color: var(--text-muted); }
 .recovery-banner { display: flex; justify-content: space-between; gap: 12px; padding: 14px; border-radius: 8px; background: color-mix(in srgb, var(--accent) 10%, var(--modal)); }
-.recovery-warning { padding: 10px 12px; border-left: 3px solid var(--warn); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+.recovery-warning { padding: 10px 12px; border-inline-start: 3px solid var(--warn); background: color-mix(in srgb, var(--warn) 8%, transparent); }
+/* The plain HTTP status region sits in the Server URL's wrapper, so the
+   warning supplies the form's usual 16px gap itself. */
+.webdav-plain-http-status > .webdav-plain-http-warning { margin-top: 16px; }
+/* Any Rclone Remote environment variables: one row per variable, with its
+   name, its masked value, and its remove button side by side. The rows and
+   the Add variable button stack under the field's label. */
+.field.rclone-remote-variables { display: grid; gap: 16px; }
+.field.rclone-remote-variables > span { margin-bottom: 0; }
+.field.rclone-remote-variables > small { margin-top: 0; }
+.rclone-remote-variable {
+	display: grid;
+	grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto;
+	align-items: end;
+	gap: 8px;
+}
+.rclone-remote-add-variable { justify-self: start; }
+.rclone-remote-picker { display: grid; gap: 8px; }
+.rclone-remote-picker > small { margin-top: 0; }
+.rclone-remote-picker > .btn { justify-self: start; }
+/* Error text from rclone keeps its own line breaks. */
+.rclone-remote-list-error { white-space: pre-line; overflow-wrap: anywhere; }
+.rclone-remote-address { text-transform: none; }
+.rclone-remote-location-review {
+	min-inline-size: 0;
+	overflow-wrap: anywhere;
+}
+@media (max-width: 520px) {
+	.rclone-remote-variable { grid-template-columns: minmax(0, 1fr); }
+	.rclone-remote-variable > .btn { justify-self: start; }
+	.rclone-remote-dialog-footer { flex-wrap: wrap; }
+	.rclone-remote-dialog-footer > .btn { max-width: 100%; white-space: normal; }
+}
 .recovery-fallback-message { display: grid; gap: 10px; }
 .recovery-fallback-message p { margin: 0; }
 .recovery-jobs, .unowned-snapshots, .recovered-job-form { display: grid; gap: 10px; min-width: 0; padding: 14px; border: 1px solid var(--hairline); border-radius: 8px; }
@@ -2237,6 +2305,16 @@ fieldset.multi-computer-field {
     color: var(--text-faint);
     font-size: 11.5px;
     line-height: 1.5;
+}
+
+/* Example paths in field help are isolated in <bdi> and have no spaces, so a
+   long one such as the Nextcloud path would otherwise overflow a narrow dialog. */
+.field small bdi {
+    overflow-wrap: anywhere;
+}
+
+.webdav-path-examples {
+    white-space: pre-wrap;
 }
 
 input,
@@ -2598,10 +2676,6 @@ select option {
     flex-wrap: wrap;
     gap: 8px;
     margin-top: 16px;
-}
-
-.tool-output {
-    max-height: 180px;
 }
 
 .danger-zone {
@@ -4022,6 +4096,18 @@ select option {
     margin-top: 12px;
 }
 
+/* "Save and reload" is long in some languages (Greek, German, Russian), so on a
+   phone the two buttons wrap onto separate rows, and a label wider than the
+   dialog wraps inside its button, instead of pushing Cancel off the screen. */
+.language-change-actions {
+    flex-wrap: wrap;
+}
+
+.language-change-actions .btn {
+    white-space: normal;
+    text-align: center;
+}
+
 .system-wide-field input.mono {
     font-size: 12px;
 }
@@ -4901,8 +4987,9 @@ input, select, textarea { font-size: 14.5px; }
     gap: 8px;
 }
 
-/* Settings and password requests are synchronous; this card-local layer
-   blocks only its card so the rest of the UI stays usable until they finish. */
+/* A vault password change or settings save runs as a background operation;
+   while it is queued or running this card-local layer shows its progress and
+   blocks only its card, so the rest of the UI stays usable. */
 .protect-page .vault-mutation-overlay {
 	position: absolute;
 	inset: 0;
@@ -4931,11 +5018,6 @@ input, select, textarea { font-size: 14.5px; }
 
 .protect-page .vault-mutation-error {
 	color: var(--danger) !important;
-	overflow-wrap: anywhere;
-}
-
-.protect-page .vault-mutation-uncertain {
-	color: var(--warn) !important;
 	overflow-wrap: anywhere;
 }
 
@@ -4994,6 +5076,17 @@ input, select, textarea { font-size: 14.5px; }
     background: var(--modal);
     font-size: 12px;
 }
+
+/* "Keep this window open" line shown while a vault creation, connection, or
+   ownership takeover request runs. */
+.vault-keep-open {
+    margin: 14px 0 0;
+    font-size: 12.5px;
+    font-weight: 600;
+    line-height: 1.5;
+}
+
+.vault-owner-status .vault-keep-open { margin: 0; }
 
 .vault-work-log-lines {
     height: 14em;
@@ -5114,6 +5207,11 @@ input, select, textarea { font-size: 14.5px; }
 	text-decoration-color: currentColor;
 }
 
+/* The failure notice spans the whole stat row, not the narrow first column. */
+.protect-page .vault-row .vault-size-stat > .recovery-warning {
+	grid-column: 1 / -1;
+}
+
 .protect-page .vault-row .vault-stat > .vault-stats-refreshing {
 	display: flex;
 	grid-column: 1 / -1;
@@ -5191,19 +5289,32 @@ input, select, textarea { font-size: 14.5px; }
     text-overflow: clip;
 }
 
+/* Like .connector-label-text: a Latin vault name or location, such as a URL
+   or path, in a right-to-left page would otherwise be cut at its start.
+   plaintext lays the text out by its own direction; fit-content sizes each
+   block to its text, so it stays at the card's start edge, under the other
+   lines. The boxes stay blocks rather than inline-blocks: an inline-block
+   name would sit in a line as tall as the card's body text and make every
+   card taller. */
+.protect-page .vault-identity > strong,
 .protect-page .vault-location-text {
     display: block;
+    width: fit-content;
     max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+    unicode-bidi: plaintext;
 }
 
+/* The engine and remote label chips share one line. The engine chip is short
+   and never shrinks; only the remote label chip gives way, with an ellipsis
+   and its full text in a tooltip (as .vault-location does). */
 .protect-page .vault-chips {
     display: flex;
 	min-width: 0;
 	flex: 1 1 auto;
-	flex-wrap: wrap;
+	flex-wrap: nowrap;
 	justify-content: flex-end;
     gap: 6px;
 }
@@ -5211,6 +5322,36 @@ input, select, textarea { font-size: 14.5px; }
 .protect-page .vault-chips .connector-chip {
 	min-width: 0;
 	max-width: 100%;
+	white-space: nowrap;
+}
+
+.protect-page .vault-chips .connector-label-chip {
+	flex: 0 1 auto;
+}
+
+.protect-page .vault-chips .connector-label-chip.tooltip-trigger {
+	overflow: visible;
+}
+
+.protect-page .connector-label-text {
+	display: block;
+	min-width: 0;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+	/* Lay out the label by its own text direction. A Latin label such as an S3
+	   endpoint in a right-to-left page would otherwise be cut at its start,
+	   showing only its end. */
+	unicode-bidi: plaintext;
+}
+
+/* A pending creation card has no remote label chip, and its status chip can
+   be long in some languages, so that row keeps wrapping. */
+.protect-page .failed-vault-card .vault-chips {
+	flex-wrap: wrap;
+}
+
+.protect-page .failed-vault-card .vault-chips .connector-chip {
 	overflow-wrap: anywhere;
 	white-space: normal;
 }

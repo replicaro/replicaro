@@ -28,9 +28,9 @@ func ValidTheme(value string) bool {
 // stored; SaveSettingsRequest has no field for either, so a client that echoes
 // them back is rejected by the strict decoder. SystemLocale is the catalog the
 // "system" preference resolves to right now and is sent even when a specific
-// language is saved: System > Appearance previews an unsaved Language choice
-// before Save, and only the backend can read the OS language, so the page
-// needs it to preview "system" while another language is saved.
+// language is saved, since only the backend can read the OS language. The web
+// UI doesn't use it at the moment: a language change is saved first and takes
+// effect when the page reloads, using EffectiveLocale.
 type Settings struct {
 	DefaultEngine                string `json:"defaultEngine"`
 	AutoStart                    bool   `json:"autoStart"`
@@ -54,9 +54,20 @@ type Settings struct {
 	DisableAutomaticUpdateChecks bool `json:"disableAutomaticUpdateChecks"`
 }
 
-func (settings Settings) NotificationChannels(success bool) (native, webhook bool) {
-	if success {
-		return settings.NotifyWindowsOnSuccess || settings.NativeNotificationsOnSuccess, settings.NotifyWebhookOnSuccess
+// NotificationChannels picks the channels for one finished operation status.
+// A completed_with_issues result is part success and part failure, so a
+// channel sends it when either its success or its failure switch is on. The
+// result is still one notification per channel: turning both switches on does
+// not send it twice.
+func (settings Settings) NotificationChannels(status string) (native, webhook bool) {
+	nativeOnSuccess := settings.NotifyWindowsOnSuccess || settings.NativeNotificationsOnSuccess
+	nativeOnFailure := settings.NotifyWindowsOnFailure || settings.NativeNotificationsOnFailure
+	switch status {
+	case "success":
+		return nativeOnSuccess, settings.NotifyWebhookOnSuccess
+	case "completed_with_issues":
+		return nativeOnSuccess || nativeOnFailure, settings.NotifyWebhookOnSuccess || settings.NotifyWebhookOnFailure
+	default:
+		return nativeOnFailure, settings.NotifyWebhookOnFailure
 	}
-	return settings.NotifyWindowsOnFailure || settings.NativeNotificationsOnFailure, settings.NotifyWebhookOnFailure
 }

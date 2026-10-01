@@ -11,6 +11,10 @@ import (
 // RepositoryMissing is the only creation classifier used by the API. It is
 // deliberately conservative: authentication, authorization, credential,
 // network, timeout, and ambiguous failures are never treated as absence.
+//
+// For a filesystem vault it reads the vault path directly and can block
+// indefinitely on a hung share, so code that holds a vault lock or serves a
+// request should call RepositoryMissingContext instead.
 func RepositoryMissing(repo models.Repository, output string) bool {
 	switch repo.Engine {
 	case ResticID:

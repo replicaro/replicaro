@@ -126,6 +126,51 @@ func terminalOperationStatus(_ context.Context, err error) string {
 	return "success"
 }
 
+// terminalStatusAfterNative applies the outcome rule to an operation with one
+// requested native child. A failure is completed_with_issues, not failed, only
+// when there is positive evidence that the main work was done:
+//
+//   - the engine itself reported the task completed but with errors (a restore
+//     carrying engines.RestoreCompletedWithErrors), or
+//   - the native child succeeded and only a later Replicaro step failed, such
+//     as output processing, local cleanup, or persisting a step result.
+//
+// Everything else stays failed, and cancellation stays interrupted. The caller
+// decides nativeCompleted; for restores that is restoreNativeCompleted, which
+// deliberately leaves out a Kopia exit 0 whose summary could not be read even
+// though its native child succeeded (see engines.RestoreOutcomeUnknown). Warning-only
+// application failures (notification delivery, rebuildable cache refresh,
+// dashboard refresh, statistics) never reach err, so they leave the result
+// unchanged. Do not widen nativeCompleted to "the process started" or to
+// anything read from counts: Replicaro never infers a partial success.
+func terminalStatusAfterNative(ctx context.Context, err error, nativeCompleted bool) string {
+	status := terminalOperationStatus(ctx, err)
+	if status == "failed" && nativeCompleted {
+		return "completed_with_issues"
+	}
+	return status
+}
+
+// restoreNativeCompleted reports whether a restore's native child finished its
+// work: the engine reported completed with errors, or the requested command
+// succeeded.
+//
+// The one exception is a restore whose outcome is unknown: Kopia exited 0 (so
+// its native step is succeeded) but the summary that says what was restored
+// could not be read. That output-processing failure would otherwise count as
+// "native success, follow-up failed" and become completed_with_issues, which
+// would claim the restore was done with nothing to show it. It stays failed.
+func restoreNativeCompleted(err error) bool {
+	if engines.RestoreOutcomeIsUnknown(err) {
+		return false
+	}
+	if err == nil || engines.RestoreReportedErrors(err) {
+		return true
+	}
+	status, started, _, _, _, known := engines.RequestedOperationOutcome(err)
+	return known && started && status == engines.RequestedOperationSucceeded
+}
+
 // finishOperationDurably retries ordinary transient failures. If it still
 // fails, the running marker is intentionally preserved for startup recovery.
 func finishOperationDurably(db *sql.DB, operationID, status, output string, finishedAt time.Time) error {

@@ -11,21 +11,19 @@ import { MetadataIndexNotice } from "../components/MetadataIndexNotice";
 import { EmptyState, Icon, Loading, Modal, parseTime, Tooltip, useToast } from "../components/ui";
 import {
 	APIError,
+	getActiveOperations,
 	getEngines,
 	getJobs,
 	getMetadataStatus,
-	getOperation,
 	getRepositories,
 	deleteSnapshot,
 	listCachedSnapshots,
 	listSnapshotFiles,
 	prepareMetadata,
 	refreshRestoreSnapshots,
-	observeSubmittedRestoreOperation,
-	isOperationNotFound,
-	requireExactOperation,
 	restoreSnapshot,
 } from "../services/api";
+import { activeSnapshotDeletions, followTrackedOperation, onTrackedOperationFinished, operationFailureReason } from "../services/trackedOperations";
 import type { MetadataPreparationStatus } from "../services/api";
 import { defaultConflictMode, restoreCapability, restoreConflictModeLabel } from "../restoreCapabilities";
 import type { BackupJob, EngineDescriptor, Repository, Snapshot, SnapshotEntry } from "../types";
@@ -146,8 +144,7 @@ function RestoreRoute() {
     const [conflictMode, setConflictMode] = useState("always");
     const [restoreBusy, setRestoreBusy] = useState(false);
 	const [deleting, setDeleting] = useState<{ readonly repositoryId: string; readonly snapshot: Snapshot; readonly session: number } | null>(null);
-	const deleteReviewOwner = useRef<{ review: NonNullable<typeof deleting>; pending: boolean } | null>(null);
-	const [deleteBusy, setDeleteBusy] = useState(false);
+	const deleteReviewOwner = useRef<{ review: NonNullable<typeof deleting> } | null>(null);
 	const [metadataState, setMetadataState] = useState<MetadataIndexState | null>(null);
 	const [readySnapshotIDs, setReadySnapshotIDs] = useState<Set<string>>(() => new Set());
 	const [metadataBusy, setMetadataBusy] = useState(false);
@@ -157,7 +154,16 @@ function RestoreRoute() {
 	const [forcingMetadata, setForcingMetadata] = useState(false);
 	const restoreReviewSession = useRef(0);
 	const restoreSubmissionGeneration = useRef(0);
-	const restoreSubmissionOwner = useRef<{ session: number; generation: number; requestPending: boolean; handedOff: boolean; observationController: AbortController; controller?: AbortController } | null>(null);
+	const restoreSubmissionOwner = useRef<{ session: number; generation: number } | null>(null);
+	// Snapshots of the selected vault whose deletion is queued or running. They
+	// are hidden from the list. The set is rebuilt from the backend's active
+	// operations, so a reload or another browser hides the same snapshots;
+	// pendingSnapshotDeletions covers a deletion this page sent, from the click
+	// until its operation finishes. It is kept past the 202 on purpose: an
+	// active-operations refresh sent before the backend queued the deletion can
+	// land after the 202 and would otherwise show the snapshot again.
+	const [deletingSnapshots, setDeletingSnapshots] = useState<{ repositoryId: string; ids: Set<string> }>(() => ({ repositoryId: "", ids: new Set() }));
+	const pendingSnapshotDeletions = useRef(new Set<string>());
 
 	const cancelBrowse = useCallback(() => {
 		browseGenerationRef.current += 1;
@@ -182,7 +188,6 @@ function RestoreRoute() {
 		restoreReviewSession.current++;
 		deleteReviewOwner.current = null;
 		restoreSubmissionGeneration.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
 		restoreSubmissionOwner.current = null;
 	}, [cancelSnapshotRequest]);
 
@@ -222,13 +227,11 @@ function RestoreRoute() {
         cancelBrowse();
         restoreReviewSession.current++;
         restoreSubmissionGeneration.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
         restoreSubmissionOwner.current = null;
         setRestoreBusy(false);
         setRestoring(null);
 		deleteReviewOwner.current = null;
 		setDeleting(null);
-		setDeleteBusy(false);
         setBrowsing(null);
         selectedRef.current = nextSelected;
         setSelected(nextSelected);
@@ -397,13 +400,11 @@ function RestoreRoute() {
 		cancelBrowse();
 		restoreReviewSession.current++;
 		restoreSubmissionGeneration.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
 		restoreSubmissionOwner.current = null;
 		setRestoreBusy(false);
 		setRestoring(null);
 		deleteReviewOwner.current = null;
 		setDeleting(null);
-		setDeleteBusy(false);
 		setBrowsing(null);
         selectedRef.current = id;
         setSelected(id);
@@ -425,7 +426,8 @@ function RestoreRoute() {
 		if (selected) void loadSelectedVault(selected, "retry");
 	};
 
-    const displayedSnapshots = snapshotsFor === selected ? snapshots : null;
+	const hiddenSnapshotIDs = deletingSnapshots.repositoryId === selected ? deletingSnapshots.ids : null;
+    const displayedSnapshots = snapshotsFor === selected ? snapshots?.filter((snapshot) => !hiddenSnapshotIDs?.has(snapshot.id)) ?? null : null;
 	const selectedRepository = repos?.find((repository) => repository.id === selected);
 	const selectedEngineLabel = selectedRepository?.engine === "kopia" ? "Kopia" : selectedRepository?.engine === "restic" ? "Restic" : "native";
 	const unmanagedSnapshotsTooltip = t("ui.restore.unmanagedSnapshotsHelp", { engine: selectedEngineLabel });
@@ -520,7 +522,6 @@ function RestoreRoute() {
 	const openRestore = (snapshot: Snapshot, path = "", nativeRootId?: string) => {
         if (!selected) return;
 		restoreReviewSession.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
 		restoreSubmissionOwner.current = null;
 		setRestoreBusy(false);
 		setRestoring({ kind: "snapshot", repositoryId: selected, snapshot, path, nativeRootId });
@@ -531,19 +532,16 @@ function RestoreRoute() {
 	const dismissRestore = () => {
 		if (restoreSubmissionOwner.current?.session === restoreReviewSession.current) return false;
 		restoreReviewSession.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
 		restoreSubmissionOwner.current = null;
 		setRestoreBusy(false);
 		setRestoring(null);
 		return true;
 	};
 
-	const cancelColdRestore = () => {
-		const owner = restoreSubmissionOwner.current;
-		if (!owner?.controller) return;
-		owner.controller.abort();
-	};
-
+	// The restore runs in the background once the backend has queued it. The
+	// dialog closes and the dashboard opens the live log for the returned
+	// operation, where it is followed and, if needed, cancelled (cold storage
+	// included). Closing the browser does not stop it.
     const doRestore = async () => {
         if (!restoring) return;
 		if (restoreSubmissionOwner.current) return;
@@ -554,115 +552,26 @@ function RestoreRoute() {
             toast("error", t("ui.restore.chooseDestination"));
             return;
         }
-		const payload = {
-			operationId: window.crypto.randomUUID(),
-			repositoryId: restoring.repositoryId,
-			snapshotId: restoring.snapshot.id,
-			path: restoring.path,
-			nativeRootId: restoring.nativeRootId,
-			targetPath,
-			conflictMode,
-			originalLocation: false,
-		};
-		const coldStorage = Boolean(repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage);
-		const owner = {
-			session: restoreReviewSession.current,
-			generation: ++restoreSubmissionGeneration.current,
-			requestPending: false,
-			handedOff: false,
-			observationController: new AbortController(),
-			controller: coldStorage ? new AbortController() : undefined,
-		};
+		const owner = { session: restoreReviewSession.current, generation: ++restoreSubmissionGeneration.current };
 		restoreSubmissionOwner.current = owner;
 		const ownsSubmission = () => restoreReviewSession.current === owner.session &&
 			restoreSubmissionGeneration.current === owner.generation && restoreSubmissionOwner.current === owner;
         setRestoreBusy(true);
         try {
-			const preflightTimeout = window.setTimeout(() => owner.observationController.abort(), 5000);
-			let operationAbsent = false;
-			const existing = await getOperation(payload.operationId, owner.observationController.signal)
-				.catch((reason) => {
-					// The lookup reports a missing operation as HTTP 404. Only that
-					// response shows this freshly generated ID is not already in use.
-					if (isOperationNotFound(reason)) {
-						operationAbsent = true;
-						return [];
-					}
-					throw reason;
-				})
-				.finally(() => window.clearTimeout(preflightTimeout));
-			if (!ownsSubmission()) return;
-			if (!operationAbsent) {
-				requireExactOperation(payload.operationId, existing);
-				throw new Error("operation id already exists");
-			}
-			owner.requestPending = true;
-			const request = owner.controller
-				? restoreSnapshot(payload, owner.controller.signal)
-				: restoreSnapshot(payload);
-			const handoff = observeSubmittedRestoreOperation(payload.operationId, () =>
-				ownsSubmission() && owner.requestPending && !owner.handedOff,
-				owner.observationController.signal,
-			).then((operation) => {
-				if (!operation || !ownsSubmission() || owner.handedOff) return false;
-				owner.handedOff = true;
-				owner.requestPending = false;
-				owner.observationController.abort();
-				setRestoring(null);
-				navigate(`/?operation=${encodeURIComponent(payload.operationId)}`);
-				return true;
+			const { operationId } = await restoreSnapshot({
+				repositoryId: restoring.repositoryId,
+				snapshotId: restoring.snapshot.id,
+				path: restoring.path,
+				nativeRootId: restoring.nativeRootId,
+				targetPath,
+				conflictMode,
+				originalLocation: false,
 			});
-			let requestError: unknown;
-			try {
-				await request;
-			} catch (reason) {
-				requestError = reason;
-			}
-			// Native execution can finish and mark the durable row terminal before
-			// the POST reports its HTTP error. Keep ownership of the handoff until the
-			// separately bounded observer settles so the result is not lost.
-			// An HTTP error means the backend handler has returned: a durable row
-			// either already exists or the request was rejected before creating one.
-			// AbortError and transport failures differ because server work may continue.
-			if (!requestError || requestError instanceof APIError) owner.observationController.abort();
-			const handedOff = await handoff;
-			owner.observationController.abort();
-			if (!handedOff && ownsSubmission()) {
-				const finalController = new AbortController();
-				owner.observationController = finalController;
-				const finalTimeout = window.setTimeout(() => finalController.abort(), 5000);
-				let finalAbsent = false;
-				const finalMatches = await getOperation(payload.operationId, finalController.signal)
-					.catch((reason) => {
-						if (isOperationNotFound(reason)) {
-							finalAbsent = true;
-							return [];
-						}
-						throw reason;
-					})
-					.finally(() => window.clearTimeout(finalTimeout));
-				if (!ownsSubmission()) return;
-				if (!finalAbsent) {
-					requireExactOperation(payload.operationId, finalMatches);
-					owner.handedOff = true;
-					finalController.abort();
-					setRestoring(null);
-					navigate(`/?operation=${encodeURIComponent(payload.operationId)}`);
-					return;
-				}
-				if (requestError) throw requestError;
-				owner.requestPending = false;
-				toast("ok", `Restore completed into ${targetPath}`);
-				setRestoring(null);
-			}
+			if (!ownsSubmission()) return;
+			setRestoring(null);
+			navigate(`/?operation=${encodeURIComponent(operationId)}`);
         } catch (reason) {
-			const requestWasPending = owner.requestPending;
-			owner.requestPending = false;
-			owner.observationController.abort();
-			if (ownsSubmission() && !owner.handedOff) {
-				if (requestWasPending && coldStorage && (reason as Error).name === "AbortError") toast("info", "Cold storage restore was interrupted locally. Provider restore requests may continue.");
-				else toast("error", (reason as Error).message);
-			}
+			if (ownsSubmission()) toast("error", (reason as Error).message);
         } finally {
 			if (ownsSubmission()) {
 				restoreSubmissionOwner.current = null;
@@ -674,42 +583,108 @@ function RestoreRoute() {
 	const openDelete = (snapshot: Snapshot) => {
 		if (!selected) return;
 		const review = { repositoryId: selected, snapshot, session: restoreReviewSession.current };
-		deleteReviewOwner.current = { review, pending: false };
+		deleteReviewOwner.current = { review };
 		setDeleting(review);
-		setDeleteBusy(false);
 	};
 	const dismissDelete = () => {
-		if (deleteReviewOwner.current?.pending) return;
 		deleteReviewOwner.current = null;
 		setDeleting(null);
 	};
+	const removeDeletedSnapshot = useCallback((repositoryId: string, snapshotId: string) => {
+		if (selectedRef.current === repositoryId) setSnapshots((current) => current?.filter((snapshot) => snapshot.id !== snapshotId) ?? current);
+		snapshotSessionCacheRef.current.set(repositoryId,
+			(snapshotSessionCacheRef.current.get(repositoryId) ?? []).filter((snapshot) => snapshot.id !== snapshotId));
+	}, []);
+
+	// followSnapshotDeletion reports a queued snapshot deletion once it
+	// finishes: the success toast, or the reason it failed (the snapshot then
+	// shows again because its deletion is no longer active). Completed with
+	// issues means the native deletion itself succeeded, so it reads as deleted;
+	// the dashboard carries the issue.
+	const followSnapshotDeletion = useCallback((operationId: string) => {
+		followTrackedOperation(operationId, async (operation) => {
+			// Before anything awaits: the finished listeners run right after this
+			// and recompute the hidden snapshots from the active operations.
+			pendingSnapshotDeletions.current.delete(`${operation.repositoryId}\u0000${operation.title.replace(/^Delete snapshot: /, "")}`);
+			if (operation.status === "success" || operation.status === "completed_with_issues") {
+				toast("ok", t("ui.restore.snapshotDeleted"));
+			} else {
+				toast("error", await operationFailureReason(operation));
+			}
+		});
+	}, [toast]);
+
+	const refreshSnapshotDeletions = useCallback(async (repositoryId: string) => {
+		if (!repositoryId) return;
+		try {
+			const operations = await getActiveOperations();
+			if (selectedRef.current !== repositoryId) return;
+			const active = activeSnapshotDeletions(operations, repositoryId);
+			const pending = [...pendingSnapshotDeletions.current]
+				.filter((key) => key.startsWith(`${repositoryId}\u0000`))
+				.map((key) => key.slice(repositoryId.length + 1));
+			setDeletingSnapshots({ repositoryId, ids: new Set([...active, ...pending]) });
+			for (const operation of operations) {
+				if (operation.kind === "delete" && operation.repositoryId === repositoryId &&
+					(operation.status === "queued" || operation.status === "running")) followSnapshotDeletion(operation.id);
+			}
+		} catch {
+			// Keep what is hidden now; the next refresh or finished operation corrects it.
+		}
+	}, [followSnapshotDeletion]);
+
+	useEffect(() => {
+		void refreshSnapshotDeletions(selected);
+	}, [refreshSnapshotDeletions, selected]);
+
+	useEffect(() => onTrackedOperationFinished((operation) => {
+		if (operation.kind !== "delete") return;
+		if (operation.status === "success" || operation.status === "completed_with_issues") {
+			removeDeletedSnapshot(operation.repositoryId, operation.title.replace(/^Delete snapshot: /, ""));
+		}
+		void refreshSnapshotDeletions(selectedRef.current);
+	}), [refreshSnapshotDeletions, removeDeletedSnapshot]);
+
+	// Confirming closes the dialog at once and hides the snapshot. The deletion
+	// itself waits for a busy vault in the background; a refused request shows
+	// the snapshot again with the reason, unless the refusal is that a deletion
+	// of it is already active.
 	const confirmDelete = async () => {
 		const owner = deleteReviewOwner.current;
-		if (!owner || owner.pending) return;
+		if (!owner) return;
 		const review = owner.review;
-		// A copied vault can share snapshot IDs. Bind confirmation and completion
-		// to this reviewed vault and view session, including browser-history moves
-		// away and back. Navigation cannot undo a native deletion already started.
-		const ownsReview = () => deleteReviewOwner.current === owner &&
-			restoreReviewSession.current === review.session && selectedRef.current === review.repositoryId;
-		if (!ownsReview()) return;
-		owner.pending = true;
-		setDeleteBusy(true);
+		if (deleteReviewOwner.current !== owner || restoreReviewSession.current !== review.session ||
+			selectedRef.current !== review.repositoryId) return;
+		deleteReviewOwner.current = null;
+		setDeleting(null);
+		const key = `${review.repositoryId}\u0000${review.snapshot.id}`;
+		pendingSnapshotDeletions.current.add(key);
+		setDeletingSnapshots((current) => ({
+			repositoryId: review.repositoryId,
+			ids: new Set(current.repositoryId === review.repositoryId ? current.ids : []).add(review.snapshot.id),
+		}));
+		toast("info", t("ui.restore.snapshotBeingSentForDeletion"));
 		try {
-			await deleteSnapshot(review.repositoryId, review.snapshot.id);
-			if (!ownsReview()) return;
-			setSnapshots((current) => current?.filter((snapshot) => snapshot.id !== review.snapshot.id) ?? current);
-			snapshotSessionCacheRef.current.set(review.repositoryId,
-				(snapshotSessionCacheRef.current.get(review.repositoryId) ?? []).filter((snapshot) => snapshot.id !== review.snapshot.id));
-			setDeleting(null);
-			toast("ok", "Snapshot deleted. Physical space is reclaimed only by later vault maintenance.");
+			const { operationId } = await deleteSnapshot(review.repositoryId, review.snapshot.id);
+			// The snapshot stays in pendingSnapshotDeletions until this operation finishes.
+			followSnapshotDeletion(operationId);
 		} catch (reason) {
-			if (ownsReview()) toast("error", (reason as Error).message);
-		} finally {
-			if (ownsReview()) {
-				owner.pending = false;
-				setDeleteBusy(false);
+			pendingSnapshotDeletions.current.delete(key);
+			// A deletion of this snapshot is already queued or running (another tab
+			// or a stale page). Keep it hidden and follow that deletion by reading
+			// the active deletions again, rather than showing the snapshot.
+			if (reason instanceof APIError && reason.status === 409 && reason.code === "snapshot_deletion_active") {
+				toast("error", reason.message);
+				void refreshSnapshotDeletions(review.repositoryId);
+				return;
 			}
+			setDeletingSnapshots((current) => {
+				if (current.repositoryId !== review.repositoryId) return current;
+				const ids = new Set(current.ids);
+				ids.delete(review.snapshot.id);
+				return { repositoryId: current.repositoryId, ids };
+			});
+			toast("error", (reason as Error).message);
 		}
 	};
 	// Whole file-root Kopia restore addresses the target itself. The native root
@@ -879,7 +854,7 @@ function RestoreRoute() {
 			{deleting && <Modal title={t("ui.pages.restore.delete.snapshot")} onClose={dismissDelete}>
 				<p>{t("ui.pages.restore.delete.this.snapshot.from.the.vault.deletion.cannot.be.undone")}</p>
 				<p>{t("ui.pages.restore.physical.space.is.reclaimed.only.by.later.vault.maintenance")}</p>
-				<div className="modal-footer"><button className="btn" disabled={deleteBusy} onClick={dismissDelete}>{t("ui.pages.restore.cancel")}</button><button className="btn danger" disabled={deleteBusy} onClick={() => void confirmDelete()}>{deleteBusy && <span className="spinner" />}{t("ui.pages.restore.delete")}</button></div>
+				<div className="modal-footer"><button className="btn" onClick={dismissDelete}>{t("ui.pages.restore.cancel")}</button><button className="btn danger" onClick={() => void confirmDelete()}>{t("ui.pages.restore.delete")}</button></div>
 			</Modal>}
 
             {browsing && (
@@ -936,9 +911,8 @@ function RestoreRoute() {
                     </label>
                     {(restoreCapability(repos?.find((repo) => repo.id === restoring.repositoryId), engines)?.conflictModes.length ?? 0) > 1 &&
 						<label className="field restore-conflict-field"><span>{t("ui.pages.restore.should.existing.files.in.destination.be.overwritten")}</span><select value={conflictMode} onChange={(event) => setConflictMode(event.target.value)}>{restoreCapability(repos?.find((repo) => repo.id === restoring.repositoryId), engines)?.conflictModes.map((mode) => <option key={mode.id} value={mode.id}>{restoreConflictModeLabel(mode)}</option>)}</select></label>}
-					{restoreBusy && repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage && <p className="recovery-warning">{t("ui.pages.restore.cold.storage.retrieval.can.take.hours.or.days.replicaro.is.waiting.for")}</p>}
 					</fieldset>
-					<div className="modal-footer"><button className="btn" disabled={restoreBusy && !repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage} onClick={restoreBusy && repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage ? cancelColdRestore : dismissRestore}>{restoreBusy && repos?.find((repo) => repo.id === restoring.repositoryId)?.coldStorage ? t("ui.pages.restore.cancel.restore") : t("ui.pages.restore.cancel")}</button><button className="btn primary" disabled={restoreBusy || !restoreTarget} onClick={() => void doRestore()}>{restoreBusy && <span className="spinner" />}<Icon name="restore" size={14} />{t("ui.pages.restore.restore")}</button></div>
+					<div className="modal-footer"><button className="btn" disabled={restoreBusy} onClick={dismissRestore}>{t("ui.pages.restore.cancel")}</button><button className="btn primary" disabled={restoreBusy || !restoreTarget} onClick={() => void doRestore()}>{restoreBusy && <span className="spinner" />}<Icon name="restore" size={14} />{t("ui.pages.restore.restore")}</button></div>
                 </Modal>
             )}
         </div>

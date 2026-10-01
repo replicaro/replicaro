@@ -194,7 +194,13 @@ func ProbeRepositoryPassword(ctx context.Context, repo models.Repository, passwo
 	if err != nil {
 		return err
 	}
-	fingerprint, err := RepositoryFingerprint(candidate, output)
+	// Callers hold the vault lock, so the filesystem marker read is bounded by
+	// ctx. A read abandoned at the deadline or on cancellation reports ctx's
+	// error rather than a mismatch it never observed.
+	fingerprint, err := RepositoryFingerprintContext(ctx, candidate, output)
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		return err
+	}
 	if err != nil || fingerprint != repo.NativeRepositoryID {
 		return fmt.Errorf("credential probe reached a different native repository")
 	}
@@ -550,7 +556,10 @@ func (e *publicEngine) Restore(ctx context.Context, repo models.Repository, snap
 		return "", resticPreparationFailure(err)
 	}
 	output, err := e.Engine.Restore(ctx, repo, snapshotID, options)
-	if repo.Engine == ResticID {
+	// resticRequestedOperationError would unwrap the engine's "completed with
+	// errors" report down to the bare exit-1 failure, the same way it would
+	// lose a backup source-read qualification.
+	if repo.Engine == ResticID && !RestoreReportedErrors(err) {
 		err = resticRequestedOperationError(err)
 	}
 	return output, err
@@ -586,12 +595,12 @@ func (e *publicEngine) DeleteSnapshots(ctx context.Context, repo models.Reposito
 	return e.DeleteSnapshot(ctx, repo, snapshotIDs[0])
 }
 
-func (e *publicEngine) Check(ctx context.Context, repo models.Repository, snapshotID string) (string, error) {
+func (e *publicEngine) Check(ctx context.Context, repo models.Repository) (string, error) {
 	ctx = repositoryProcessContext(ctx, repo, e.availabilityCheck)
 	if err := e.autoUnlockRestic(ctx, repo); err != nil {
 		return "", resticPreparationFailure(err)
 	}
-	output, err := e.Engine.Check(ctx, repo, snapshotID)
+	output, err := e.Engine.Check(ctx, repo)
 	if repo.Engine == ResticID {
 		err = resticRequestedOperationError(err)
 	}

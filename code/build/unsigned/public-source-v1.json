@@ -42,6 +42,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/api/foreground_outcome.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/api/job_request.go",
       "mode": "100644"
     },
@@ -67,6 +71,10 @@
     },
     {
       "path": "code/backend/api/rclone_auth_relay.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/rclone_remote.go",
       "mode": "100644"
     },
     {
@@ -99,6 +107,18 @@
     },
     {
       "path": "code/backend/api/support_report.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/tracked_operation.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/tracked_workers.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/api/vault_admin_operations.go",
       "mode": "100644"
     },
     {
@@ -414,6 +434,14 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/database/vault_operations.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/vault_reconnect.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/desktop/assets/godbus-LICENSE.txt",
       "mode": "100644"
     },
@@ -588,6 +616,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/engines/bounded_read.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/engines/concurrency.go",
       "mode": "100644"
     },
@@ -696,6 +728,26 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/engines/rclone_remote.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_remote_namespace.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_remote_namespace_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_remote_namespace_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/rclone_remote_namespace_windows.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/engines/rclone_session_case.go",
       "mode": "100644"
     },
@@ -765,6 +817,10 @@
     },
     {
       "path": "code/backend/engines/restore.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/restore_result.go",
       "mode": "100644"
     },
     {
@@ -1257,6 +1313,14 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/vaultidentity/rclone_remote.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultidentity/webdav.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/vaultlock/lock.go",
       "mode": "100644"
     },
@@ -1290,6 +1354,10 @@
     },
     {
       "path": "code/backend/vaultprofile/timing.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/vaultreconnect/vaultreconnect.go",
       "mode": "100644"
     },
     {
@@ -1741,6 +1809,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/frontend/src/reloadPage.ts",
+      "mode": "100644"
+    },
+    {
       "path": "code/frontend/src/restoreCapabilities.ts",
       "mode": "100644"
     },
@@ -1750,6 +1822,22 @@
     },
     {
       "path": "code/frontend/src/services/backupJobs.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/services/leavePagePrompt.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/services/rcloneRemote.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/services/storageConnectors.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/services/trackedOperations.ts",
       "mode": "100644"
     },
     {

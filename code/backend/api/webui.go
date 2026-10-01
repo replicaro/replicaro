@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"database/sql"
 	"fmt"
+	"io"
 	"io/fs"
+	"mime"
 	"net/http"
 	"os"
 	"path"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -145,7 +148,12 @@ func firstWebUIDirectory(candidates []string) string {
 
 func serveWebUI(webUI fs.FS, w http.ResponseWriter, r *http.Request) {
 	requested := strings.TrimPrefix(path.Clean("/"+r.URL.Path), "/")
-	if requested != "" && requested != "." && fs.ValidPath(requested) && !strings.Contains(requested, `\`) {
+	// The .gz files next to the assets are an alternative encoding of those
+	// assets, chosen by Accept-Encoding in serveWebUIFile. They are not URLs
+	// of their own, so a request naming one gets the app shell like any other
+	// unknown path instead of a raw gzip body.
+	if requested != "" && requested != "." && fs.ValidPath(requested) && !strings.Contains(requested, `\`) &&
+		!strings.HasSuffix(requested, gzipSuffix) {
 		if info, err := fs.Stat(webUI, requested); err == nil && !info.IsDir() {
 			serveWebUIFile(webUI, w, r, requested)
 			return
@@ -180,10 +188,108 @@ func serveWebUIFile(webUI fs.FS, w http.ResponseWriter, r *http.Request, filenam
 		w.Header().Set("Pragma", "no-cache")
 		w.Header().Set("Expires", "0")
 		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		// Never compressed: the shell carries the installation UUID, and
+		// compressing a secret in the same response as request-influenced
+		// content is what BREACH-style attacks measure. It is tiny anyway.
 		http.ServeContent(w, r, "index.html", time.Time{}, bytes.NewReader(data))
 		return
+	}
+	if strings.HasPrefix(filename, "locales/") {
+		// Catalogs keep the same names in every release (the UI fetches
+		// /locales/<locale>.json), so an immutable year-long cache would keep
+		// last version's text after an upgrade. no-cache makes the browser
+		// check back each time; the embedded files carry no modification time
+		// or ETag, so that means a fresh download of one small catalog per
+		// page load.
+		w.Header().Set("Cache-Control", "no-cache")
 	} else {
+		// Everything else is a Vite output whose name changes with its
+		// content, or a fixed image that is always referenced with a ?cb=
+		// content token.
 		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 	}
+	if info, err := fs.Stat(webUI, filename+gzipSuffix); err == nil && info.Mode().IsRegular() {
+		// Both encodings are cacheable under one URL, so shared caches must
+		// key on Accept-Encoding for the plain response as well.
+		w.Header().Add("Vary", "Accept-Encoding")
+		if r.Header.Get("Range") == "" && acceptsGzip(r.Header.Values("Accept-Encoding")) && serveGzipCopy(webUI, w, r, filename) {
+			return
+		}
+	}
 	http.ServeFileFS(w, r, webUI, filename)
+}
+
+// gzipSuffix names the build-time compressed copy that tools/webuiembed writes
+// next to each JavaScript, CSS, and locale catalog file. The copy is made from
+// the exact bytes embedded as the plain file, in the same build step, so the
+// two can't drift apart; the plain file stays embedded for clients that don't
+// accept gzip and for locale.LoadFS, which reads the plain catalogs.
+const gzipSuffix = ".gz"
+
+// serveGzipCopy sends the precompressed copy of filename. It reports false,
+// having written nothing, when the copy can't be used, so the caller falls
+// back to the plain file. Range requests never reach it: they get the plain
+// file, which keeps byte ranges meaningful and avoids ranges over gzip data.
+func serveGzipCopy(webUI fs.FS, w http.ResponseWriter, r *http.Request, filename string) bool {
+	// Same type the plain file is served with. Without a known type we'd
+	// have to sniff, which needs the plain bytes, so just serve those.
+	contentType := mime.TypeByExtension(path.Ext(filename))
+	if contentType == "" {
+		return false
+	}
+	file, err := webUI.Open(filename + gzipSuffix)
+	if err != nil {
+		return false
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return false
+	}
+	header := w.Header()
+	header.Set("Content-Type", contentType)
+	header.Set("Content-Encoding", "gzip")
+	header.Set("Content-Length", strconv.FormatInt(info.Size(), 10))
+	w.WriteHeader(http.StatusOK)
+	if r.Method != http.MethodHead {
+		_, _ = io.Copy(w, file)
+	}
+	return true
+}
+
+// acceptsGzip applies the Accept-Encoding rules that matter here: an explicit
+// gzip entry decides, otherwise a * entry does, and a q value of 0 means "not
+// acceptable". A missing header or a malformed q value means no gzip.
+func acceptsGzip(values []string) bool {
+	gzipQuality, wildcardQuality := -1.0, -1.0
+	for _, value := range values {
+		for _, entry := range strings.Split(value, ",") {
+			parts := strings.Split(entry, ";")
+			coding := strings.ToLower(strings.TrimSpace(parts[0]))
+			if coding != "gzip" && coding != "*" {
+				continue
+			}
+			quality := 1.0
+			for _, parameter := range parts[1:] {
+				name, number, found := strings.Cut(strings.TrimSpace(parameter), "=")
+				if !found || !strings.EqualFold(strings.TrimSpace(name), "q") {
+					continue
+				}
+				parsed, err := strconv.ParseFloat(strings.TrimSpace(number), 64)
+				if err != nil || parsed < 0 || parsed > 1 {
+					parsed = 0
+				}
+				quality = parsed
+			}
+			if coding == "gzip" {
+				gzipQuality = max(gzipQuality, quality)
+			} else {
+				wildcardQuality = max(wildcardQuality, quality)
+			}
+		}
+	}
+	if gzipQuality >= 0 {
+		return gzipQuality > 0
+	}
+	return wildcardQuality > 0
 }

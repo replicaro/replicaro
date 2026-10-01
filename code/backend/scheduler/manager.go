@@ -15,7 +15,7 @@ const repositoryTaskConcurrency = 2
 
 var schedulerInterval = time.Minute
 var runRepositoryTask = func(ctx context.Context, db *sql.DB, repo models.Repository, operation string) (string, error) {
-	return runRepositoryTaskWithRuntime(ctx, db, repo, operation, operationruntime.FromContext(ctx), true)
+	return runScheduledRepositoryTask(ctx, db, repo, operation, operationruntime.FromContext(ctx))
 }
 
 type repositoryTaskCoordinator struct {

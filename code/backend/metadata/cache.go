@@ -651,8 +651,11 @@ func DeferRepositorySyncForBackup(db *sql.DB, repo models.Repository) func() {
 }
 
 // DeferRepositorySyncForRestore cancels and drains same-repository rebuildable
-// metadata work before restore performs its one nonblocking exclusive lock try.
-// The returned release must run after the restore releases that lock.
+// metadata work before a restore or snapshot deletion waits for the exclusive
+// vault lock. The restore or deletion runs in a background worker that may
+// wait a long time for a busy vault; metadata sync stays deferred for the whole
+// wait, as it does for a queued backup. The returned release must run after the worker
+// releases that lock, which is after its final status is saved.
 func DeferRepositorySyncForRestore(
 	ctx context.Context,
 	db *sql.DB,

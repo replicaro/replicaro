@@ -10,19 +10,14 @@ import { fileHistorySourceJob, jobSourceTooltip, pathWithinJob } from "../jobSou
 import { MetadataIndexNotice } from "../components/MetadataIndexNotice";
 import { EmptyState, Icon, Loading, Modal, parseTime, Tooltip, useToast } from "../components/ui";
 import {
-	APIError,
 	browseFiles,
 	getFileHistory,
 	getJobs,
 	getMetadataStatus,
-	getOperation,
     getEngines,
     getRepositories,
     listSnapshots,
 	prepareMetadata,
-	observeSubmittedRestoreOperation,
-	isOperationNotFound,
-	requireExactOperation,
 	restoreSelection,
     searchFiles,
 } from "../services/api";
@@ -531,7 +526,7 @@ function VaultFileHistory({
 	const handledForceRefreshSequence = useRef(0);
 	const restoreReviewSession = useRef(0);
 	const restoreSubmissionGeneration = useRef(0);
-	const restoreSubmissionOwner = useRef<{ session: number; generation: number; requestPending: boolean; handedOff: boolean; observationController: AbortController; controller?: AbortController } | null>(null);
+	const restoreSubmissionOwner = useRef<{ session: number; generation: number } | null>(null);
 	const preparationAction = useRef<"access" | "retry" | "force">("access");
 	const preparationRun = useRef(0);
 	const preparationScheduledOrActive = useRef(false);
@@ -691,7 +686,6 @@ function VaultFileHistory({
 		generation.current++;
 		restoreReviewSession.current++;
 		restoreSubmissionGeneration.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
 		restoreSubmissionOwner.current = null;
         snapshotRequest.current?.abort();
 		searchRequest.current?.abort();
@@ -1018,130 +1012,37 @@ function VaultFileHistory({
 	const dismissReviewedRestore = () => {
 		if (restoreSubmissionOwner.current?.session === restoreReviewSession.current) return false;
 		restoreReviewSession.current++;
-		restoreSubmissionOwner.current?.observationController.abort();
 		restoreSubmissionOwner.current = null;
 		setRestoring(false);
 		setReviewedRestore(null);
 		return true;
 	};
 
-	const cancelColdRestore = () => {
-		restoreSubmissionOwner.current?.controller?.abort();
-	};
-
+	// The restore of the selected items runs in the background once the backend
+	// has queued it. The review closes and the dashboard opens the live log for
+	// the returned operation, where the per-item results appear when it ends
+	// and where it can be cancelled (cold storage included).
     const doRestore = async () => {
 		if (!reviewedRestore) return;
 		if (restoreSubmissionOwner.current) return;
 		const reviewed = reviewedRestore;
-		const payload = {
-			operationId: window.crypto.randomUUID(),
-			repositoryId: reviewed.repositoryId,
-			targetPath: reviewed.targetPath,
-			items: reviewed.items.map((item) => ({ ...item })),
-			conflictMode: reviewed.conflictMode,
-		};
-		const coldStorage = Boolean(selectedRepository?.coldStorage);
-		const owner = {
-			session: restoreReviewSession.current,
-			generation: ++restoreSubmissionGeneration.current,
-			requestPending: false,
-			handedOff: false,
-			observationController: new AbortController(),
-			controller: coldStorage ? new AbortController() : undefined,
-		};
+		const owner = { session: restoreReviewSession.current, generation: ++restoreSubmissionGeneration.current };
 		restoreSubmissionOwner.current = owner;
 		const ownsSubmission = () => restoreReviewSession.current === owner.session &&
 			restoreSubmissionGeneration.current === owner.generation && restoreSubmissionOwner.current === owner;
         setRestoring(true);
         try {
-			const preflightTimeout = window.setTimeout(() => owner.observationController.abort(), 5000);
-			let operationAbsent = false;
-			const existing = await getOperation(payload.operationId, owner.observationController.signal)
-				.catch((reason) => {
-					// The lookup reports a missing operation as HTTP 404. Only that
-					// response shows this freshly generated ID is not already in use.
-					if (isOperationNotFound(reason)) {
-						operationAbsent = true;
-						return [];
-					}
-					throw reason;
-				})
-				.finally(() => window.clearTimeout(preflightTimeout));
-			if (!ownsSubmission()) return;
-			if (!operationAbsent) {
-				requireExactOperation(payload.operationId, existing);
-				throw new Error("operation id already exists");
-			}
-			owner.requestPending = true;
-			const request = owner.controller
-				? restoreSelection(payload, owner.controller.signal)
-				: restoreSelection(payload);
-			const handoff = observeSubmittedRestoreOperation(payload.operationId, () =>
-				ownsSubmission() && owner.requestPending && !owner.handedOff,
-				owner.observationController.signal,
-			).then((operation) => {
-				if (!operation || !ownsSubmission() || owner.handedOff) return false;
-				owner.handedOff = true;
-				owner.requestPending = false;
-				owner.observationController.abort();
-				setReviewedRestore(null);
-				navigate(`/?operation=${encodeURIComponent(payload.operationId)}`);
-				return true;
+			const { operationId } = await restoreSelection({
+				repositoryId: reviewed.repositoryId,
+				targetPath: reviewed.targetPath,
+				items: reviewed.items.map((item) => ({ ...item })),
+				conflictMode: reviewed.conflictMode,
 			});
-			let outcome: Awaited<ReturnType<typeof restoreSelection>> | undefined;
-			let requestError: unknown;
-			try {
-				outcome = await request;
-			} catch (reason) {
-				requestError = reason;
-			}
-			// Native execution can finish and mark the durable row terminal before
-			// the POST reports its HTTP error. Keep ownership of the handoff until the
-			// separately bounded observer settles so the result is not lost.
-			// An HTTP error means the backend handler has returned: a durable row
-			// either already exists or the request was rejected before creating one.
-			// AbortError and transport failures differ because server work may continue.
-			if (!requestError || requestError instanceof APIError) owner.observationController.abort();
-			const handedOff = await handoff;
-			owner.observationController.abort();
-			if (!handedOff && ownsSubmission()) {
-				const finalController = new AbortController();
-				owner.observationController = finalController;
-				const finalTimeout = window.setTimeout(() => finalController.abort(), 5000);
-				let finalAbsent = false;
-				const finalMatches = await getOperation(payload.operationId, finalController.signal)
-					.catch((reason) => {
-						if (isOperationNotFound(reason)) {
-							finalAbsent = true;
-							return [];
-						}
-						throw reason;
-					})
-					.finally(() => window.clearTimeout(finalTimeout));
-				if (!ownsSubmission()) return;
-				if (!finalAbsent) {
-					requireExactOperation(payload.operationId, finalMatches);
-					owner.handedOff = true;
-					finalController.abort();
-					setReviewedRestore(null);
-					navigate(`/?operation=${encodeURIComponent(payload.operationId)}`);
-					return;
-				}
-				if (requestError) throw requestError;
-				if (!outcome) return;
-				owner.requestPending = false;
-				if (outcome.status === "success") toast("ok", `Restored ${outcome.restored} selected item${outcome.restored === 1 ? "" : "s"}.`);
-				else toast("error", `Restore was ${outcome.status}: ${outcome.restored} restored, ${outcome.failed} failed, ${outcome.notAttempted} not attempted.`);
-				setReviewedRestore(null);
-			}
+			if (!ownsSubmission()) return;
+			setReviewedRestore(null);
+			navigate(`/?operation=${encodeURIComponent(operationId)}`);
         } catch (reason) {
-			const requestWasPending = owner.requestPending;
-			owner.requestPending = false;
-			owner.observationController.abort();
-			if (ownsSubmission() && !owner.handedOff) {
-				if (requestWasPending && coldStorage && (reason as Error).name === "AbortError") toast("info", "Cold storage restore was interrupted locally. Provider restore requests may continue.");
-				else toast("error", (reason as Error).message);
-			}
+			if (ownsSubmission()) toast("error", (reason as Error).message);
         } finally {
 			if (ownsSubmission()) {
 				restoreSubmissionOwner.current = null;
@@ -1267,9 +1168,8 @@ function VaultFileHistory({
 				{(restoreCapability(selectedRepository, engines)?.conflictModes.length ?? 0) <= 1
 					? <p className="muted">{restoreCapability(selectedRepository, engines)?.conflictModes[0]?.description}</p>
 					: <label className="field"><span>{t("ui.pages.findfile.should.existing.files.be.overwritten")}</span><select value={reviewedRestore.conflictMode} onChange={(event) => setReviewedRestore((current) => current ? { ...current, conflictMode: event.target.value } : current)}>{restoreCapability(selectedRepository, engines)?.conflictModes.map((mode) => <option key={mode.id} value={mode.id}>{restoreConflictModeLabel(mode)}</option>)}</select></label>}
-				{restoring && selectedRepository?.coldStorage && <p className="recovery-warning">{t("ui.pages.findfile.cold.storage.retrieval.can.take.hours.or.days.replicaro.is.waiting.for")}</p>}
 				</fieldset>
-				<div className="modal-footer"><button className="btn" disabled={restoring && !selectedRepository?.coldStorage} onClick={restoring && selectedRepository?.coldStorage ? cancelColdRestore : dismissReviewedRestore}>{restoring && selectedRepository?.coldStorage ? t("ui.pages.findfile.cancel.restore") : t("ui.findFile.back")}</button><button className="btn primary" disabled={restoring} onClick={() => void doRestore()}>{restoring && <span className="spinner" />}<Icon name="restore" size={14} />{t("ui.pages.findfile.restore.selected")}</button></div>
+				<div className="modal-footer"><button className="btn" disabled={restoring} onClick={dismissReviewedRestore}>{t("ui.findFile.back")}</button><button className="btn primary" disabled={restoring} onClick={() => void doRestore()}>{restoring && <span className="spinner" />}<Icon name="restore" size={14} />{t("ui.pages.findfile.restore.selected")}</button></div>
 			</Modal>}
 
 		</>

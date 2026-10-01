@@ -139,23 +139,28 @@ func admitUnderLock(
 	filesystemIdentityProven := false
 	controlPlaneProven := false
 	if repo.Connector == "fs" {
-		// One deadline covers the work below that runs in another process and
-		// honors the context: the storage probe (storage helper), the
-		// protected root and attachment reads, and native validation. It is
-		// kept on purpose so a share that answers the probe and then hangs in
-		// one of those cannot hold the vault lock indefinitely. Expiry maps to
-		// observation_timeout, which pauses a scheduled backup rather than
-		// failing it. Backup/restore payload work gets its ordinary deadline
-		// after admission returns.
+		// One deadline covers the rest of admission, including every vault
+		// observation in it: the work that runs in another process and honors
+		// the context (the storage probe, the protected root and attachment
+		// reads, and native validation, including the password-recovery
+		// probe's) and the in-process reads of the vault path (the identity
+		// marker checks, the marker reads for the fingerprint, the rechecks of
+		// the vault root, and the missing-repository check after a failed
+		// validation). It is kept on purpose so a share that answers the probe
+		// and then hangs cannot hold the vault lock indefinitely. Expiry maps
+		// to observation_timeout, which pauses a scheduled backup rather than
+		// failing it, except inside the password-recovery selector, whose
+		// error is returned as it is. Backup/restore payload work gets its
+		// ordinary deadline after admission returns.
 		//
-		// Known limitation, not a bug to "fix" by assuming the deadline
-		// applies: the in-process reads here (the marker os.Stat calls in
-		// nativeIdentityMarkerPresent, the marker read in
-		// engines.RepositoryFingerprint, and the os.Stat rechecks of the
-		// vault root) are plain filesystem calls that no context can
-		// interrupt. A share that hangs inside one of them still blocks this
-		// admission until the OS call returns. Moving them behind the storage
-		// helper is separate work.
+		// A plain stat or open cannot be interrupted, so the in-process reads
+		// go through engines.ReadWithin: admission stops waiting when the
+		// deadline passes and returns, which releases the caller's vault lock,
+		// while the stuck OS call finishes later in its own goroutine and its
+		// result is dropped. Each admission starts its own reads after taking
+		// the lock; do not replace them with direct calls (a hang would hold
+		// the lock again) or with a read shared across admissions (its result
+		// could predate a swapped or remounted folder).
 		resolutionContext, cancel := context.WithTimeout(ctx, time.Minute)
 		defer cancel()
 		ctx = resolutionContext
@@ -176,15 +181,22 @@ func admitUnderLock(
 			legacyFacts = &check.Observed
 		}
 		canProveAttachment := strings.TrimSpace(repo.ProfileUUID) != "" && repo.AttachmentGeneration > 0
-		present, markerErr := nativeIdentityMarkerPresent(repo)
+		present, markerErr := engines.ReadWithin(ctx, func() (bool, error) { return nativeIdentityMarkerPresent(repo) })
 		if markerErr != nil {
+			if readAbandoned(markerErr) {
+				return models.Repository{}, classifyKnownUnavailable(markerErr)
+			}
 			if markerInspectionFailed(markerErr) {
 				return models.Repository{}, &storageavailability.RepositoryStorageUnavailableError{ReasonCode: database.AvailabilityReasonStorageMissing}
 			}
 			return models.Repository{}, markerErr
 		}
 		identityMismatch := func() error {
-			if _, statErr := os.Stat(repo.Location); os.IsNotExist(statErr) {
+			_, statErr := engines.ReadWithin(ctx, func() (os.FileInfo, error) { return statVaultPath(repo.Location) })
+			if readAbandoned(statErr) {
+				return classifyKnownUnavailable(statErr)
+			}
+			if os.IsNotExist(statErr) {
 				return &storageavailability.RepositoryStorageUnavailableError{ReasonCode: database.AvailabilityReasonStorageMissing}
 			}
 			return fmt.Errorf("the native repository identity does not match this saved vault")
@@ -192,8 +204,11 @@ func admitUnderLock(
 		if !present {
 			return models.Repository{}, identityMismatch()
 		}
-		fingerprint, fingerprintErr := engines.RepositoryFingerprint(repo, "")
+		fingerprint, fingerprintErr := engines.RepositoryFingerprintContext(ctx, repo, "")
 		if fingerprintErr != nil {
+			if readAbandoned(fingerprintErr) {
+				return models.Repository{}, classifyKnownUnavailable(fingerprintErr)
+			}
 			// Only raw local marker read errors mean "unavailable". Parse and
 			// authority failures from the native or protected records are still
 			// reported as real errors.
@@ -271,6 +286,8 @@ func admitUnderLock(
 	if passwordRecovery != nil {
 		selected, selectErr := passwordRecovery.SelectPassword(ctx, repo)
 		if selectErr != nil {
+			// The selector's error is returned as it is. The runner's selector
+			// reports a probe that ran out of time as a failed attempt.
 			return models.Repository{}, selectErr
 		}
 		if err := models.ValidateVaultPassword(selected); err != nil {
@@ -303,12 +320,23 @@ func admitUnderLock(
 			if errors.Is(validationErr, context.DeadlineExceeded) {
 				return &storageavailability.RepositoryStorageUnavailableError{ReasonCode: database.AvailabilityReasonObservationTimeout}
 			}
-			if engines.RepositoryMissing(repo, validationOutput) {
+			// For a filesystem vault the missing check stats and lists the vault
+			// folder, so it is bounded like the other reads above.
+			missing, missingErr := engines.RepositoryMissingContext(ctx, repo, validationOutput)
+			if missingErr != nil {
+				// The deadline passed (or admission was cancelled) before the
+				// folder could be checked. Pause as for any other timeout, but
+				// keep the native error so the failure that led here is still
+				// reported.
+				return errors.Join(classifyKnownUnavailable(missingErr),
+					fmt.Errorf("validate exact native repository: %w", validationErr))
+			}
+			if missing {
 				return &storageavailability.RepositoryStorageUnavailableError{ReasonCode: database.AvailabilityReasonStorageMissing}
 			}
 			return fmt.Errorf("validate exact native repository: %w", validationErr)
 		}
-		fingerprint, fingerprintErr := engines.RepositoryFingerprint(repo, validationOutput)
+		fingerprint, fingerprintErr := engines.RepositoryFingerprintContext(ctx, repo, validationOutput)
 		if repo.Engine == engines.ResticID && engines.IsResticRcloneConnector(repo.Connector) {
 			// Restic's public config result preserves its native missing/error
 			// classification above. The private read hashes the exact raw config
@@ -319,9 +347,16 @@ func admitUnderLock(
 			if errors.Is(callerContext.Err(), context.Canceled) || errors.Is(fingerprintErr, context.Canceled) {
 				return context.Canceled
 			}
-			// Synchronous filesystem reads can finish after the outer deadline with a
-			// valid identity result. Only a timeout from the fingerprint itself counts
-			// as unavailable; an expired deadline must not hide a mismatch or corruption.
+			// Only a timeout from the fingerprint itself counts as unavailable. A
+			// marker read that finished before the deadline keeps its result, so
+			// a mismatch or corruption it found is reported as such, unless the
+			// filesystem root recheck that follows it below cannot run or finish
+			// before the deadline, in which case this attempt pauses (the next
+			// attempt reports it). Once the deadline has passed no read is started (and
+			// a read still stuck at that moment is dropped), so admission pauses
+			// without that evidence. A mismatch that appears just before the
+			// deadline can therefore be reported as a pause for this attempt;
+			// the next attempt reads the marker again and reports it.
 			if errors.Is(fingerprintErr, context.DeadlineExceeded) {
 				return errors.Join(&storageavailability.RepositoryStorageUnavailableError{
 					ReasonCode: database.AvailabilityReasonObservationTimeout,
@@ -331,7 +366,11 @@ func admitUnderLock(
 				// Fingerprinting can lose the marker's ENOENT when it falls back to
 				// validation output. Check only the exact selected root so disappearance
 				// remains retryable without treating marker corruption as unplugged media.
-				if _, rootErr := os.Stat(repo.Location); os.IsNotExist(rootErr) {
+				_, rootErr := engines.ReadWithin(ctx, func() (os.FileInfo, error) { return statVaultPath(repo.Location) })
+				if readAbandoned(rootErr) {
+					return errors.Join(classifyKnownUnavailable(rootErr), fingerprintErr)
+				}
+				if os.IsNotExist(rootErr) {
 					return errors.Join(&storageavailability.RepositoryStorageUnavailableError{
 						ReasonCode: database.AvailabilityReasonStorageMissing,
 					}, fingerprintErr, rootErr)
@@ -426,13 +465,25 @@ func markerInspectionFailed(err error) bool {
 	return errors.Is(err, fs.ErrNotExist) || errors.As(err, &errno)
 }
 
+// readAbandoned reports whether admission stopped waiting for a bounded vault
+// read because its context ended (the deadline or a cancellation) rather than
+// getting the read's own result. A plain filesystem call never returns a
+// context error itself.
+func readAbandoned(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled)
+}
+
+// statVaultPath is the stat used for the vault path and its identity markers;
+// tests replace it to simulate a share that hangs.
+var statVaultPath = os.Stat
+
 func nativeIdentityMarkerPresent(repo models.Repository) (bool, error) {
 	markers := []string{"config", "CONFIG"}
 	if repo.Engine == engines.KopiaID {
 		markers = []string{"kopia.repository.f", "kopia.blobcfg.f"}
 	}
 	for _, marker := range markers {
-		info, err := os.Stat(filepath.Join(repo.Location, marker))
+		info, err := statVaultPath(filepath.Join(repo.Location, marker))
 		if err == nil {
 			// An identity marker that exists but has the wrong file type means
 			// the repository is malformed, unlike a path we couldn't inspect.

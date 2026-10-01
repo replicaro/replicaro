@@ -20,6 +20,7 @@ import (
 	"github.com/local/replicaro/models"
 	"github.com/local/replicaro/profilesync"
 	"github.com/local/replicaro/storageavailability"
+	"github.com/local/replicaro/vaultidentity"
 	"github.com/local/replicaro/vaultlock"
 	"github.com/local/replicaro/vaultprofile"
 )
@@ -75,6 +76,28 @@ func normalizeResticRcloneCreateRequest(req *CreateRepositoryRequest) error {
 	return nil
 }
 
+// normalizedWebDAVAddress stores a WebDAV vault in its one canonical spelling:
+// the https/http scheme instead of a dav alias, a lowercase host, the path with
+// its trailing slash dropped, and the port option only when it is not the
+// scheme's default. Creation and connection both save what this returns, so a
+// pending retry, duplicate matching, and the saved card all compare the same
+// value no matter how the address was typed.
+func normalizedWebDAVAddress(location string, options map[string]string) (string, map[string]string, error) {
+	canonical, port, err := vaultidentity.NormalizeWebDAVAddress(location, options["port"])
+	if err != nil {
+		return "", nil, err
+	}
+	normalized := make(map[string]string, len(options))
+	for key, value := range options {
+		normalized[key] = value
+	}
+	delete(normalized, "port")
+	if port != "" {
+		normalized["port"] = port
+	}
+	return canonical, normalized, nil
+}
+
 func pendingCreationValidationFailure(output string, validationErr error) (int, string) {
 	if engines.RepositoryAccessRejected(output) {
 		return http.StatusBadRequest, "The supplied keys/credentials are either wrong or lack the correct permissions at the storage provider. Correct them and retry this action."
@@ -97,7 +120,9 @@ func creationNativeRepositoryIdentity(ctx context.Context, repo models.Repositor
 			return "", err
 		}
 	}
-	return engines.RepositoryFingerprint(repo, validationOutput)
+	// Creation still holds the new vault's lock here, so the filesystem marker
+	// read is bounded by the request context like the preflight reads.
+	return engines.RepositoryFingerprintContext(ctx, repo, validationOutput)
 }
 
 func creationMaintenanceMutationContext(
@@ -133,24 +158,25 @@ func writeRepositoryCreationSuccess(
 	rcloneOutcome rcloneApplicationOutcome,
 	finishAuthorization func(engines.RcloneConfigDisposition) error,
 ) {
-	if engines.IsResticRcloneConnector(repo.Connector) {
+	if engines.IsRcloneNativeLoginProvider(repo.Connector) {
 		rcloneOutcome = attachedUsableRcloneOutcome(rcloneOutcome)
 	}
-	cleanupWarnings := []string{}
+	// The vault is attached at this point, so a cleanup that does not finish
+	// makes the creation completed with issues, never failed: the intent is
+	// already gone and a retry has nothing left to create.
+	var outcome foregroundOutcome
 	// The fence was shown inactive earlier in this request, so this normally
 	// passes at once. The cleanup absorbs a momentary inherited holder and
 	// refuses a fence that stays held.
 	if cleanupErr := cleanupCreationNativeFence(db, fencePath); cleanupErr != nil {
-		cleanupWarnings = append(cleanupWarnings, "The vault is attached, but its inactive local creation fence still needs cleanup.")
+		outcome.addIssue("The vault is attached, but its inactive local creation fence still needs cleanup.")
 	}
 	if authCleanupErr := finishAuthorization(rcloneOutcome.Activation.Disposition); authCleanupErr != nil {
-		cleanupWarnings = append(cleanupWarnings, "The vault is attached, but its temporary native authorization session still needs cleanup.")
+		outcome.addIssue("The vault is attached, but its temporary native authorization session still needs cleanup.")
 	}
 	response := map[string]any{"id": id, "created": created}
-	if len(cleanupWarnings) > 0 {
-		response["warning"] = strings.Join(cleanupWarnings, " ")
-	}
-	if engines.IsResticRcloneConnector(repo.Connector) {
+	outcome.addTo(response)
+	if engines.IsRcloneNativeLoginProvider(repo.Connector) {
 		addRcloneOutcome(response, rcloneOutcome)
 	}
 	writeJSONStatus(w, http.StatusCreated, response)
@@ -167,7 +193,7 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		return
 	}
 	if req.Password != req.PasswordConfirmation {
-		badRequest(w, "the passwords do not match")
+		badRequest(w, "the vault encryption passwords do not match")
 		return
 	}
 	req.CreationIntentID = strings.TrimSpace(req.CreationIntentID)
@@ -218,7 +244,9 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 	rcloneConfigPath := ""
 	var finishRcloneAuth func(engines.RcloneConfigDisposition) error
 	reusingPublishedRcloneConfig := false
-	if engines.IsResticRcloneConnector(req.Connector) && req.RcloneAuthSessionID == "" {
+	// Only the three sign-in providers have an authorization session and a
+	// private config; an Any Rclone Remote vault is checked below instead.
+	if engines.IsRcloneNativeLoginProvider(req.Connector) && req.RcloneAuthSessionID == "" {
 		if req.CreationIntentID == "" {
 			badRequest(w, "native rclone authorization is required for a new vault")
 			return
@@ -244,7 +272,7 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 			req.RcloneAuthSessionID, req.Connector, req.Options,
 		)
 		if err != nil {
-			if engines.IsResticRcloneConnector(req.Connector) {
+			if engines.IsRcloneNativeLoginProvider(req.Connector) {
 				writeRcloneAuthorizationError(w, http.StatusBadRequest,
 					"native rclone authorization session is unavailable or not ready")
 			} else {
@@ -252,7 +280,7 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 			}
 			return
 		}
-		if engines.IsResticRcloneConnector(req.Connector) {
+		if engines.IsRcloneNativeLoginProvider(req.Connector) {
 			rcloneConfigPath, err = rcloneAuth.configPath(req.RcloneAuthSessionID, req.Connector)
 			if err != nil {
 				_ = finishRcloneAuth(engines.RcloneConfigRetained)
@@ -275,7 +303,19 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 
 	options, err := engines.NormalizeConnectorOptions(req.Engine, integration, req.Options)
 	if err != nil {
-		badRequest(w, err.Error())
+		if !writeRcloneRemoteError(w, err) {
+			badRequest(w, err.Error())
+		}
+		return
+	}
+	// A first attempt and every retry check the user's rclone config file and
+	// remote before anything is saved or reserved. The saved settings live
+	// only in this request: a retry sends them again, as for every connector
+	// with secret settings.
+	if err := checkRcloneRemoteSettings(r.Context(), req.Connector, options); err != nil {
+		if !writeRcloneRemoteError(w, err) {
+			writeError(w, http.StatusBadRequest, err)
+		}
 		return
 	}
 	if req.Connector == "azblob" && options["connection_string"] == "" &&
@@ -286,6 +326,13 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 	if req.Connector == "gcs" && options["credentials_file"] != "" && options["credentials_json"] != "" {
 		badRequest(w, "Google Cloud Storage accepts either a credentials file or credentials JSON, not both")
 		return
+	}
+	if req.Connector == "webdav" {
+		req.Location, options, err = normalizedWebDAVAddress(req.Location, options)
+		if err != nil {
+			badRequest(w, err.Error())
+			return
+		}
 	}
 	if err := engines.ValidateConnectorAddress(req.Engine, req.Connector, req.Location, options); err != nil {
 		badRequest(w, err.Error())
@@ -518,7 +565,10 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 	}
 	validationOutput, validationErr := engines.ValidateRepository(r.Context(), engine, repoModel)
 	if validationErr != nil {
-		if engines.RepositoryMissing(repoModel, validationOutput) {
+		// Bounded by the request for a filesystem vault. If the request ends
+		// before the folder is checked, nothing is known about it, so the
+		// validation failure below is reported instead of "not found".
+		if missing, missingErr := engines.RepositoryMissingContext(r.Context(), repoModel, validationOutput); missingErr == nil && missing {
 			message := "The native creation process is inactive, but no native repository was found. Forget this pending creation before starting a new attempt."
 			_ = database.MarkRepositoryCreationError(db, intent.ID, message)
 			writeError(w, http.StatusConflict, errors.New(message))
@@ -622,7 +672,7 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 	rcloneOutcome := rcloneApplicationOutcome{
 		Activation: engines.RcloneConfigActivation{Disposition: engines.RcloneConfigRetained},
 	}
-	if engines.IsResticRcloneConnector(completedRepo.Connector) {
+	if engines.IsRcloneNativeLoginProvider(completedRepo.Connector) {
 		if reusingPublishedRcloneConfig {
 			rcloneOutcome.Activation.Disposition = engines.RcloneConfigActivated
 		} else {
@@ -647,7 +697,7 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		_ = database.MarkRepositoryCreationError(db, intent.ID,
 			"The native vault and protected recovery metadata exist, but local attachment is pending. Retry this exact creation.")
 		var authorizationCleanupErr error
-		if engines.IsResticRcloneConnector(completedRepo.Connector) {
+		if engines.IsRcloneNativeLoginProvider(completedRepo.Connector) {
 			authorizationCleanupErr = finishAuthorization(rcloneOutcome.Activation.Disposition)
 		}
 		if rcloneOutcome.Activation.ConsumesAuthorization() {

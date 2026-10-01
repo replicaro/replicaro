@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -10,6 +12,7 @@ import (
 	"io/fs"
 	"net/url"
 	"os"
+	"path"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -111,6 +114,9 @@ func run(arguments []string) error {
 	}
 	frontend, err := validateFrontend(distRoot)
 	if err != nil {
+		return err
+	}
+	if err := writeCompressedCopies(distRoot, &frontend); err != nil {
 		return err
 	}
 	if err := addFrontendFiles(&overlay, distRoot, virtual, frontend); err != nil {
@@ -422,6 +428,22 @@ func validateFrontend(distRoot string) (frontendInventory, error) {
 	if err != nil {
 		return frontendInventory{}, err
 	}
+	// Vite never writes .gz files; they come from writeCompressedCopies. One
+	// left beside its original by an earlier run of this tool is accepted here
+	// and then rewritten from the current original, so it is never embedded
+	// as-is. A .gz without a compressible original next to it would be served
+	// for nothing (or, for index.html, would be a compressed shell), so it
+	// fails the build instead.
+	for name := range inventory.files {
+		original, compressed := strings.CutSuffix(name, gzipSuffix)
+		if !compressed {
+			continue
+		}
+		if _, ok := inventory.files[original]; !ok || !compressibleAsset(original) {
+			return frontendInventory{}, fmt.Errorf("frontend output contains a stray compressed file: %s", name)
+		}
+		delete(inventory.files, name)
+	}
 	index, err := os.ReadFile(filepath.Join(distRoot, "index.html"))
 	if err != nil {
 		return frontendInventory{}, errors.New("frontend output must contain index.html")
@@ -510,6 +532,90 @@ func validateFrontendReferences(distRoot, document string, inventory frontendInv
 		return frontendInventory{}, errors.New("frontend JavaScript does not reference the cache-busted fixed wordmark")
 	}
 	return inventory, nil
+}
+
+// gzipSuffix must match the suffix api/webui.go looks for when choosing the
+// gzip encoding of an asset.
+const gzipSuffix = ".gz"
+
+// compressibleAsset lists what gets a .gz copy: the JavaScript and CSS bundles
+// and the locale catalogs the UI fetches at runtime. index.html is left out on
+// purpose because the server inserts the installation UUID into it and never
+// compresses it. Fonts (woff2) and images (png, ico) are already compressed.
+func compressibleAsset(name string) bool {
+	switch path.Ext(name) {
+	case ".js", ".css":
+		return true
+	case ".json":
+		return path.Dir(name) == "locales"
+	}
+	return false
+}
+
+// writeCompressedCopies writes name.gz next to every compressible file in the
+// validated inventory and adds each copy to the inventory. Each copy is made
+// from bytes that still match the digest recorded during validation, and
+// addFrontendFiles checks the originals and the copies against those digests
+// again before they go into the overlay, so the embedded .gz is always the
+// compressed form of the embedded original from this same run. Doing this
+// here rather than in Vite keeps it out of the npm dependency tree, and the
+// output only depends on the Go toolchain's compress/gzip.
+func writeCompressedCopies(distRoot string, inventory *frontendInventory) error {
+	names := make([]string, 0, len(inventory.files))
+	for name := range inventory.files {
+		if compressibleAsset(name) {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		physical := filepath.Join(distRoot, filepath.FromSlash(name))
+		content, err := os.ReadFile(physical)
+		if err != nil {
+			return err
+		}
+		if sha256.Sum256(content) != inventory.files[name] {
+			return fmt.Errorf("frontend file changed before compression: %s", name)
+		}
+		var buffer bytes.Buffer
+		writer, err := gzip.NewWriterLevel(&buffer, gzip.BestCompression)
+		if err != nil {
+			return err
+		}
+		if _, err := writer.Write(content); err != nil {
+			return err
+		}
+		if err := writer.Close(); err != nil {
+			return err
+		}
+		compressed := buffer.Bytes()
+		if err := replaceFile(physical+gzipSuffix, compressed); err != nil {
+			return fmt.Errorf("write compressed copy of %s: %w", name, err)
+		}
+		inventory.files[name+gzipSuffix] = sha256.Sum256(compressed)
+	}
+	return nil
+}
+
+// replaceFile writes data to a temporary file in the same directory and
+// renames it over target, so a failed write never leaves a partial .gz behind
+// under the real name. The temporary name starts with a dot, which the
+// frontend validation rejects, so an interrupted run can't be embedded either.
+func replaceFile(target string, data []byte) error {
+	temporary, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+".*.tmp")
+	if err != nil {
+		return err
+	}
+	temporaryPath := temporary.Name()
+	defer os.Remove(temporaryPath)
+	if _, err := temporary.Write(data); err != nil {
+		_ = temporary.Close()
+		return err
+	}
+	if err := temporary.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temporaryPath, target)
 }
 
 func addFrontendFiles(overlay *overlayFile, distRoot, virtualRoot string, inventory frontendInventory) error {

@@ -264,7 +264,7 @@ func (s Store) writePasswordRotationObject(ctx context.Context, session *storeSe
 	// failure must not turn a completed remote publication into false failure;
 	// final stage cleanup will retain cleanup_pending until the file is gone.
 	defer func() { _ = removePasswordRotationFile(localPath) }()
-	if _, err := session.run(ctx, "copyto", localPath, "crypt:"+pending, "--ignore-times"); err != nil {
+	if _, err := session.run(ctx, "copyto", localPath, sidecarRemote+pending, "--ignore-times"); err != nil {
 		return fmt.Errorf("upload password-change pending object: %w", err)
 	}
 	verified, err := scoped.readObjectBounded(ctx, session, pending)
@@ -289,7 +289,7 @@ func (s Store) writePasswordRotationObject(ctx context.Context, session *storeSe
 			return fmt.Errorf("protected object %s changed before password publication", target)
 		}
 	}
-	if _, err := session.run(ctx, "copyto", "crypt:"+pending, "crypt:"+target, "--ignore-times"); err != nil {
+	if _, err := session.run(ctx, "copyto", sidecarRemote+pending, sidecarRemote+target, "--ignore-times"); err != nil {
 		return err
 	}
 	verified, err = scoped.readObjectBounded(ctx, session, target)
@@ -446,7 +446,7 @@ func (s Store) deletePasswordChangePending(ctx context.Context, inventory Passwo
 		if !validPendingRotationName(name) {
 			return fmt.Errorf("invalid pending protected object")
 		}
-		before, exists, statErr := statObject(ctx, session, "crypt:"+name)
+		before, exists, statErr := statObject(ctx, session, sidecarRemote+name)
 		if statErr != nil {
 			return statErr
 		}
@@ -461,7 +461,7 @@ func (s Store) deletePasswordChangePending(ctx context.Context, inventory Passwo
 		if readErr != nil {
 			return fmt.Errorf("revalidate pending protected object before cleanup: %w", readErr)
 		}
-		after, exists, statErr := statObject(ctx, session, "crypt:"+name)
+		after, exists, statErr := statObject(ctx, session, sidecarRemote+name)
 		if statErr != nil || !exists || before.Size != after.Size || before.Path != after.Path {
 			return fmt.Errorf("pending protected object changed before cleanup")
 		}
@@ -469,10 +469,10 @@ func (s Store) deletePasswordChangePending(ctx context.Context, inventory Passwo
 		if readErr != nil || !bytesEqual(beforeData, afterData) {
 			return fmt.Errorf("pending protected object changed before cleanup")
 		}
-		if _, err := session.run(ctx, "deletefile", "crypt:"+name); err != nil {
+		if _, err := session.run(ctx, "deletefile", sidecarRemote+name); err != nil {
 			return err
 		}
-		if _, exists, err := statObject(ctx, session, "crypt:"+name); err != nil || exists {
+		if _, exists, err := statObject(ctx, session, sidecarRemote+name); err != nil || exists {
 			return fmt.Errorf("verify pending protected-object cleanup")
 		}
 	}

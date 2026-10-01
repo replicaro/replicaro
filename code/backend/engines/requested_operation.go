@@ -3,6 +3,7 @@ package engines
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"strings"
 
 	"github.com/local/replicaro/command"
@@ -165,6 +166,20 @@ func addRequestedOperationFollowup(engine string, operationErr, followupErr erro
 	return errors.Join(operationErr, followupErr)
 }
 
+// requestedNativeExit reports whether err is the requested native child's own
+// failure with exactly this exit code: the process started and exited with
+// code, rather than failing preparation, being interrupted, or succeeding. It
+// also returns whatever wrapper follow-up failed next to that exit (output
+// capture, local cleanup), because backups and restores judge that
+// differently; see backupExit and resticRestoreCompletedWithErrors.
+func requestedNativeExit(err error, code int) (followupErr error, exited bool) {
+	status, started, _, nativeErr, followupErr, known := RequestedOperationOutcome(err)
+	var exit *exec.ExitError
+	exited = known && started && status == RequestedOperationFailed &&
+		errors.As(nativeErr, &exit) && exit.ExitCode() == code
+	return followupErr, exited
+}
+
 // RequestedOperationOutcome extracts the requested native command's result
 // from a backup-engine error. For ResticOperationFailure, output-processing and
 // cleanup errors are returned as the follow-up error, so they never change the
@@ -176,6 +191,14 @@ func RequestedOperationOutcome(err error) (
 	known bool,
 ) {
 	if err == nil {
+		return RequestedOperationSucceeded, true, nil, nil, nil, true
+	}
+	// A restore the engine reported as completed with errors keeps its own
+	// exit result. Restic's exit-1 failure is found through Unwrap below; a
+	// Kopia restore run with --ignore-errors exited 0, so its requested child
+	// succeeded even though the engine reported failed items.
+	var reported *RestoreCompletedWithErrors
+	if errors.As(err, &reported) && reported.NativeErr == nil {
 		return RequestedOperationSucceeded, true, nil, nil, nil, true
 	}
 	var failure *RequestedOperationFailure

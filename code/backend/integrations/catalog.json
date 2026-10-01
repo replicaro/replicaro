@@ -6,7 +6,7 @@
       "reviewedAt": "2026-07-18",
       "label": "Local Folder or Network Directory",
       "description": "A local path, mounted share, mapped drive, or network path. External, portable, and flash drives are supported.",
-      "placeholder": "D:\\Backups\\vault, \\\\server\\share\\vault, or /var/backups",
+      "placeholder": "D:\\Backups\\vault · \\\\server\\share\\vault · /var/backups",
       "capabilities": [
         "storage",
         "source",
@@ -218,6 +218,36 @@
       ]
     },
     {
+      "id": "webdav",
+      "reviewedAt": "2026-09-29",
+      "label": "WebDAV",
+      "description": "Supports any server that offers standard WebDAV with a WebDAV username and WebDAV account password, such as Nextcloud, ownCloud, or a WebDAV share on Apache or on nginx with the dav-ext module. SharePoint is not supported. The vault folder must already exist on the server.",
+      "placeholder": "https://cloud.example.com",
+      "capabilities": [
+        "storage"
+      ],
+      "options": [
+        {
+          "key": "port",
+          "label": "Port (optional)",
+          "help": "Leave empty to use 443 for https:// or 80 for http://."
+        },
+        {
+          "key": "username",
+          "label": "WebDAV username",
+          "required": true,
+          "credential": true
+        },
+        {
+          "key": "password",
+          "label": "WebDAV account password",
+          "required": true,
+          "secret": true,
+          "credential": true
+        }
+      ]
+    },
+    {
       "id": "google_drive",
       "reviewedAt": "2026-07-29",
       "label": "Google Drive",
@@ -313,6 +343,55 @@
           "key": "tenant",
           "label": "Tenant",
           "advanced": true
+        }
+      ]
+    },
+    {
+      "id": "rclone_remote",
+      "reviewedAt": "2026-09-29",
+      "label": "Any Rclone Remote",
+      "description": "For advanced rclone users: a remote you set up yourself in your own rclone.conf. Restic only.",
+      "placeholder": "Vault folder name",
+      "capabilities": [
+        "storage"
+      ],
+      "options": [
+        {
+          "key": "config_file",
+          "label": "rclone config file",
+          "help": "The full path to your rclone.conf. By default rclone keeps it at %APPDATA%\\rclone\\rclone.conf on Windows and ~/.config/rclone/rclone.conf on macOS and Linux; the command rclone config file prints it. It is recommended that the rclone.conf be exclusive to Replicaro, but that is not required.",
+          "required": true
+        },
+        {
+          "key": "environment",
+          "label": "Environment variables (optional)",
+          "help": "Variables here are given to rclone for this vault, for example AWS_ACCESS_KEY_ID for an S3 remote that uses env_auth.",
+          "kind": "environment",
+          "secret": true,
+          "credential": true
+        },
+        {
+          "key": "config_encrypted",
+          "label": "Did you encrypt your rclone.conf with a password?",
+          "kind": "boolean",
+          "default": "false"
+        },
+        {
+          "key": "config_password",
+          "label": "Rclone config file password",
+          "secret": true,
+          "credential": true
+        },
+        {
+          "key": "remote",
+          "label": "Remote name",
+          "required": true
+        },
+        {
+          "key": "path",
+          "label": "Path in remote",
+          "help": "This is the bucket or path for rclone where Replicaro should save backups, like `remote:<bucket>/` or `remote:<path>/`.",
+          "required": true
         }
       ]
     }

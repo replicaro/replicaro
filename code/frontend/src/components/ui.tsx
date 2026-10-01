@@ -181,7 +181,9 @@ export function Tooltip({
     content,
     children,
 }: {
-    content: string;
+    // Content that isn't plain text (such as a <bdi> around a path) needs an
+    // aria-label on the child, because it can't name the control itself.
+    content: ReactNode;
     children: ReactElement;
 }) {
     const id = useId();
@@ -221,7 +223,7 @@ export function Tooltip({
             fitTooltip(event.currentTarget);
         },
         "aria-describedby": describedBy,
-        "aria-label": props["aria-label"] ?? content,
+        "aria-label": props["aria-label"] ?? (typeof content === "string" ? content : undefined),
         children: (
             <>
                 {props.children}
@@ -272,12 +274,24 @@ export function Modal({
     children,
     wide,
 	topAction,
+	lang,
+	dir,
+	describedBy,
+	closeLabel,
 }: {
     title: string;
     onClose: () => void;
     children: ReactNode;
     wide?: boolean;
 	topAction?: ReactNode;
+	// For a dialog whose text is in another language than the page, such as
+	// an English-only dialog on a translated page. closeLabel replaces the
+	// translated Close label so the whole dialog is in that language.
+	lang?: string;
+	dir?: "ltr" | "rtl";
+	// id of the element that describes the dialog, read out after its title.
+	describedBy?: string;
+	closeLabel?: string;
 }) {
 	const dialogRef = useRef<HTMLDivElement>(null);
 	const onCloseRef = useRef(onClose);
@@ -337,6 +351,9 @@ export function Modal({
                 role="dialog"
 				aria-modal="true"
 				aria-label={title}
+				aria-describedby={describedBy}
+				lang={lang}
+				dir={dir}
 				tabIndex={-1}
             >
 				{/* Optional actions precede the title and body so callers can keep a
@@ -344,8 +361,8 @@ export function Modal({
 				{topAction && <div className="modal-top-action">{topAction}</div>}
                 <div className="row spread" style={{ marginBottom: 4 }}>
                     <h3 style={{ margin: 0 }}>{title}</h3>
-                    <button className="modal-close" onClick={onClose} aria-label={t("ui.components.ui.close")}>
-                        {t("ui.components.ui.close")} <Icon name="x" size={13} />
+                    <button className="modal-close" onClick={onClose} aria-label={closeLabel ?? t("ui.components.ui.close")}>
+                        {closeLabel ?? t("ui.components.ui.close")} <Icon name="x" size={13} />
                     </button>
                 </div>
                 <div style={{ marginTop: 12 }}>{children}</div>

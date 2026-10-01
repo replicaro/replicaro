@@ -20,6 +20,7 @@ import (
 	"github.com/local/replicaro/storageavailability"
 	"github.com/local/replicaro/vaultlock"
 	"github.com/local/replicaro/vaultprofile"
+	"github.com/local/replicaro/vaultreconnect"
 )
 
 func publishProfileDefault(ctx context.Context, repo models.Repository, data []byte, options vaultprofile.PublishOptions) error {
@@ -219,128 +220,90 @@ func BuildInitialProfile(repo models.Repository, jobs []models.BackupJob, dorman
 	return profileBytes(repo, jobs, dormant, 1, time.Time{})
 }
 
+// SyncRepository is one profile sync attempt for a vault that takes the vault
+// lock itself: the queue worker's, and the same sync run right after another
+// vault's connection. Its result also drives the vault's saved reconnect
+// state (package vaultreconnect), recorded while the vault lock is still held
+// so that a reconnect cannot commit between this attempt and its
+// bookkeeping. Callers that publish under a lock they already hold
+// (creation, connection, removal, password change) use
+// SyncRepositoryUnderLock; they report their own failures, which do not count
+// toward the reconnect clock, but their successes are recorded like the
+// worker's own (see SyncRepositoryUnderLock).
 func SyncRepository(ctx context.Context, db *sql.DB, repositoryID string) error {
-	// Registered first so it is released last, after the vault lock: a caller
-	// that just failed to take the lock must still see who held it.
-	holding, release := trackSync(repositoryID)
-	defer release()
+	return syncRepositoryAttempt(ctx, db, repositoryID, vaultreconnect.Now())
+}
+
+// syncRepositoryAttempt is SyncRepository for an attempt that started at
+// startedAt. The start is taken before waiting for the vault lock (and, in a
+// queue pass, before waiting for a free slot): the reconnect clock measures
+// the gap between failures to it, and a long backup holding the lock must not
+// look like the app not retrying.
+func syncRepositoryAttempt(ctx context.Context, db *sql.DB, repositoryID string, startedAt time.Time) error {
 	unlock, err := vaultlock.AcquireExclusiveContext(ctx, repositoryID)
 	if err != nil {
 		return fmt.Errorf("wait for vault profile publication lock: %w", err)
 	}
 	defer unlock()
-	holding()
-	return syncRepositoryUnderLock(ctx, db, repositoryID)
-}
-
-// activeSyncs is in-memory bookkeeping of SyncRepository calls (the
-// background queue and settings saves) per vault: how many are running, and
-// how many of those hold the vault lock. Vault removal uses it to tell a
-// short wait for a profile update apart from a real conflict with another
-// operation, and to know when that update has finished. It is not a lock or a
-// queue and records nothing durable; vault_profile_sync remains the only
-// record of pending work.
-var activeSyncs = struct {
-	sync.Mutex
-	running map[string]int
-	holding map[string]int
-}{running: map[string]int{}, holding: map[string]int{}}
-
-func trackSync(repositoryID string) (holding func(), release func()) {
-	activeSyncs.Lock()
-	activeSyncs.running[repositoryID]++
-	activeSyncs.Unlock()
-	held := false
-	holding = func() {
-		activeSyncs.Lock()
-		activeSyncs.holding[repositoryID]++
-		held = true
-		activeSyncs.Unlock()
+	// Only an Any Rclone Remote vault gets a note from this check: the result
+	// of checking its rclone settings once after the failure. When the attempt
+	// saves its failure, the note is saved with it, in the same write, so it
+	// replaces the previous attempt's note and never lands on a newer
+	// revision. A failure that returns before anything is saved (admission,
+	// for example) only gets the note in its returned error.
+	checked := false
+	checkAfterFailure := func() string {
+		checked = true
+		return vaultreconnect.CheckRcloneRemoteAfterFailure(db, repositoryID, vaultreconnect.WorkerProfileSync)
 	}
-	release = func() {
-		activeSyncs.Lock()
-		defer activeSyncs.Unlock()
-		if held {
-			if activeSyncs.holding[repositoryID]--; activeSyncs.holding[repositoryID] <= 0 {
-				delete(activeSyncs.holding, repositoryID)
+	err = syncRepositoryUnderLock(ctx, db, repositoryID, checkAfterFailure)
+	switch {
+	case err == nil:
+		vaultreconnect.RecordWorkerSuccess(db, repositoryID, vaultreconnect.WorkerProfileSync)
+	case errors.Is(err, database.ErrVaultProfilePending):
+		// A local change overtook this attempt before anything was published.
+		// That is neither a success nor a failure of the vault; the queue
+		// simply picks up the newer revision.
+	case errors.Is(err, context.Canceled):
+		// Shutdown or the worker being stopped, not a failure of the vault.
+		// RecordWorkerFailure ignores it as well.
+	default:
+		if !checked {
+			if note := checkAfterFailure(); note != "" {
+				err = fmt.Errorf("%w\n%s", err, note)
 			}
 		}
-		if activeSyncs.running[repositoryID]--; activeSyncs.running[repositoryID] <= 0 {
-			delete(activeSyncs.running, repositoryID)
-		}
+		vaultreconnect.RecordWorkerFailure(db, repositoryID, vaultreconnect.WorkerProfileSync, startedAt, err)
 	}
-	return holding, release
-}
-
-// PublishingUnderLock reports whether a profile update currently holds this
-// vault's lock.
-func PublishingUnderLock(repositoryID string) bool {
-	activeSyncs.Lock()
-	defer activeSyncs.Unlock()
-	return activeSyncs.holding[repositoryID] > 0
-}
-
-// pendingUpdatePollInterval is how often WaitForPendingUpdate rechecks. A
-// poll keeps the wait inside the caller's request without adding a
-// notification path to the queue; a variable only so tests can shorten it.
-var pendingUpdatePollInterval = 250 * time.Millisecond
-
-// WaitForPendingUpdate waits up to timeout until no profile update for the
-// vault is running and none is due. It returns true once the durable row is
-// gone, or when the last attempt failed and is backing off (the queue will not
-// retry it within the wait, so the caller's own publication is the next
-// attempt and reports that failure). It returns false at the timeout. It never
-// starts, cancels, or discards an update; callers wake the queue first.
-func WaitForPendingUpdate(ctx context.Context, db *sql.DB, repositoryID string, timeout time.Duration) (bool, error) {
-	deadline := time.NewTimer(timeout)
-	defer deadline.Stop()
-	for {
-		settled, err := pendingUpdateSettled(db, repositoryID)
-		if err != nil || settled {
-			return settled, err
-		}
-		poll := time.NewTimer(pendingUpdatePollInterval)
-		select {
-		case <-ctx.Done():
-			poll.Stop()
-			return false, ctx.Err()
-		case <-deadline.C:
-			poll.Stop()
-			return false, nil
-		case <-poll.C:
-		}
-	}
-}
-
-func pendingUpdateSettled(db *sql.DB, repositoryID string) (bool, error) {
-	activeSyncs.Lock()
-	running := activeSyncs.running[repositoryID] > 0
-	activeSyncs.Unlock()
-	if running {
-		return false, nil
-	}
-	state, err := database.VaultProfileSyncState(db, repositoryID)
-	if errors.Is(err, sql.ErrNoRows) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if state.NextAttemptAt == "" {
-		return false, nil
-	}
-	next, err := time.Parse(time.RFC3339Nano, state.NextAttemptAt)
-	return err == nil && next.After(time.Now()), nil
+	return err
 }
 
 // SyncRepositoryUnderLock publishes while the caller holds this repository's
 // exclusive managed vault UUID lock. Creation and connection transactions use it
 // to avoid re-entering the process-wide vault lock.
+//
+// A successful publication here is the same fact as a successful queue
+// attempt: the pending profile reached the vault. It is recorded as a profile
+// sync success so the worker's failure clock and any reconnect state the
+// worker set are cleared. Otherwise a vault password change that publishes
+// the pending profile would leave the queue with nothing to retry, the clock
+// would keep its old failing-since time, and the next run of failures would be
+// measured from it and could escalate early. The caller still holds the vault
+// lock, so this is recorded before a reconnect could commit. Failures are not
+// recorded: the caller reports them as its own result.
 func SyncRepositoryUnderLock(ctx context.Context, db *sql.DB, repositoryID string) error {
-	return syncRepositoryUnderLock(ctx, db, repositoryID)
+	err := syncRepositoryUnderLock(ctx, db, repositoryID, nil)
+	if err == nil {
+		vaultreconnect.RecordWorkerSuccess(db, repositoryID, vaultreconnect.WorkerProfileSync)
+	}
+	return err
 }
 
-func syncRepositoryUnderLock(ctx context.Context, db *sql.DB, repositoryID string) error {
+// syncRepositoryUnderLock publishes the pending profile. When it saves a
+// failure, the line checkAfterFailure returns, if any, is saved with it and
+// added to the returned error. Callers that report their own failures pass
+// nil.
+func syncRepositoryUnderLock(ctx context.Context, db *sql.DB, repositoryID string, checkAfterFailure func() string) error {
 	ctx = vaultprofile.WithTimingReporter(ctx, func(label string, elapsed time.Duration) {
 		log.Printf("vault profile sync %s: %s: %s", repositoryID, label, elapsed.Round(time.Microsecond))
 	})
@@ -386,9 +349,16 @@ func syncRepositoryUnderLock(ctx context.Context, db *sql.DB, repositoryID strin
 		if fmt.Sprintf("%x", hash[:]) != state.ProfileSHA256 {
 			err = fmt.Errorf("pending vault profile checksum is invalid")
 		}
-		if profile, parseErr := vaultprofile.Parse(data); parseErr != nil || profile.ProfileUUID != repo.ProfileUUID ||
-			profile.Attachment.ClientUUID != repo.ClientUUID || profile.Attachment.Generation != repo.AttachmentGeneration {
+		if profile, parseErr := vaultprofile.Parse(data); parseErr != nil {
 			err = fmt.Errorf("pending vault profile is invalid")
+		} else if profile.ProfileUUID != repo.ProfileUUID ||
+			profile.Attachment.ClientUUID != repo.ClientUUID || profile.Attachment.Generation != repo.AttachmentGeneration {
+			// The saved vault now belongs to a different attachment than the
+			// profile prepared for it. A reconnect moves the vault to a new
+			// attachment and resets the pending profile in the same commit, so
+			// this is not something a retry can fix: it is conclusive, like the
+			// profile store's own attachment checks.
+			err = vaultprofile.MarkReconnectRequired(fmt.Errorf("pending vault profile is invalid"))
 		}
 		options = vaultprofile.PublishOptions{OperationID: state.OperationID, CreateOnly: state.CreateOnly,
 			ExpectedCurrentSHA256: state.ExpectedCurrentSHA256}
@@ -410,7 +380,11 @@ func syncRepositoryUnderLock(ctx context.Context, db *sql.DB, repositoryID strin
 					err = parseErr
 				} else if current.ProfileUUID != repo.ProfileUUID || current.Attachment.ClientUUID != repo.ClientUUID ||
 					current.Attachment.Generation != repo.AttachmentGeneration {
-					err = fmt.Errorf("this installation is no longer attached to the vault profile; reconnect to review it")
+					// Another installation, or another attachment of this one, now
+					// owns the profile. Conclusive, like the profile store's own
+					// attachment check (vaultprofile.ValidateAttachmentResult).
+					err = vaultprofile.MarkReconnectRequired(
+						fmt.Errorf("this installation is no longer attached to the vault profile; reconnect to review it"))
 				} else {
 					currentProfile = &current
 					revision = current.Revision + 1
@@ -429,6 +403,17 @@ func syncRepositoryUnderLock(ctx context.Context, db *sql.DB, repositoryID strin
 				if stateErr == nil {
 					err = database.PrepareVaultProfileSync(db, repositoryID, state.Revision, options.OperationID,
 						fmt.Sprintf("%x", hash[:]), string(data), expectedSHA, createOnly)
+					if errors.Is(err, sql.ErrNoRows) {
+						// No row matched the revision read above: a profile-relevant
+						// change committed meanwhile and bumped it (another vault's
+						// removal rewriting a shared job, a job edit). The profile
+						// built here is already stale, so nothing is published. Report
+						// it as ErrVaultProfilePending, the same signal the removal's
+						// delete transaction gives for a change that lands after the
+						// publication, so a removal retries it once instead of failing
+						// at once. The queue worker just picks up the new revision.
+						err = fmt.Errorf("prepare vault recovery profile revision %d: %w", state.Revision, database.ErrVaultProfilePending)
+					}
 				}
 			}
 		}
@@ -445,7 +430,14 @@ func syncRepositoryUnderLock(ctx context.Context, db *sql.DB, repositoryID strin
 	}
 	if err != nil {
 		if stateErr == nil {
-			_ = database.FailVaultProfileSync(db, repositoryID, state.Revision, err.Error())
+			saved := err.Error()
+			if checkAfterFailure != nil && !errors.Is(err, context.Canceled) && !errors.Is(err, database.ErrVaultProfilePending) {
+				if note := checkAfterFailure(); note != "" {
+					saved += "\n" + note
+					err = fmt.Errorf("%w\n%s", err, note)
+				}
+			}
+			_ = database.FailVaultProfileSync(db, repositoryID, state.Revision, saved)
 		}
 		return fmt.Errorf("vault settings were saved locally; vault recovery profile update is pending: %w", err)
 	}
@@ -456,6 +448,7 @@ func syncRepositoryUnderLock(ctx context.Context, db *sql.DB, repositoryID strin
 }
 
 func SyncPending(ctx context.Context, db *sql.DB) {
+	startedAt := vaultreconnect.Now()
 	states, err := database.ListPendingVaultProfiles(db)
 	if err != nil {
 		log.Printf("vault profile queue: %v", err)
@@ -474,7 +467,7 @@ func SyncPending(ctx context.Context, db *sql.DB) {
 		go func(repositoryID string) {
 			defer pending.Done()
 			defer func() { <-semaphore }()
-			if err := SyncRepository(ctx, db, repositoryID); err != nil {
+			if err := syncRepositoryAttempt(ctx, db, repositoryID, startedAt); err != nil {
 				log.Printf("vault profile sync %s: %v", repositoryID, err)
 			}
 		}(state.RepositoryID)

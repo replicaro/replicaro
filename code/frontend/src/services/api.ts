@@ -26,6 +26,9 @@ import type {
 	SupportReport,
 	ObjectLockSettings,
 } from "../types";
+import { t } from "../i18n";
+import { holdLeavePagePrompt } from "./leavePagePrompt";
+import { rcloneRemoteErrorMessage } from "./rcloneRemote";
 
 // Packaged builds are served by the bound backend and must stay same-origin.
 // Vite development is the only fixed-port client.
@@ -41,9 +44,8 @@ export class APIError extends Error {
 	readonly attached?: boolean;
 	readonly usable?: boolean;
 	readonly failureStage?: RcloneApplicationFailureStage;
-	readonly passwordChangeResult?: VaultPasswordChangeResult;
 
-	constructor(message: string, status: number, code?: string, lifecycle?: RcloneLifecycleOutcome, passwordChangeResult?: VaultPasswordChangeResult) {
+	constructor(message: string, status: number, code?: string, lifecycle?: RcloneLifecycleOutcome) {
 		super(message);
 		this.name = "APIError";
 		this.status = status;
@@ -52,7 +54,6 @@ export class APIError extends Error {
 		this.attached = lifecycle?.attached;
 		this.usable = lifecycle?.usable;
 		this.failureStage = lifecycle?.failureStage;
-		this.passwordChangeResult = passwordChangeResult;
 	}
 }
 
@@ -86,7 +87,6 @@ async function request<T>(
         let message = `Request failed (${response.status})`;
 		let code: string | undefined;
 		let lifecycle: RcloneLifecycleOutcome | undefined;
-		let passwordChangeResult: VaultPasswordChangeResult | undefined;
 
         try {
             const body = await response.json();
@@ -94,6 +94,16 @@ async function request<T>(
                 message = body.error;
             }
 			if (body && typeof body.code === "string") code = body.code;
+			// Any work on a job whose deletion is queued or running is refused with
+			// this code; the backend's English text is replaced by the catalog's.
+			if (code === "job_being_deleted") message = t("ui.protect.jobBeingDeleted");
+			// New work for a vault whose removal is pending, and a second password
+			// change, settings save or removal of a vault, are refused the same way.
+			if (code === "vault_being_removed") message = t("ui.protect.vaultBeingRemoved");
+			if (code === "vault_change_active") message = t("ui.protect.vaultChangeActive");
+			// An Any Rclone Remote setting or check refused with a code gets the
+			// catalog's text, filled in from the values sent next to the code.
+			message = rcloneRemoteErrorMessage(code, body) ?? message;
 			if (body && body.activation && typeof body.activation.disposition === "string") {
 				lifecycle = {
 					activation: body.activation,
@@ -102,14 +112,11 @@ async function request<T>(
 					...(typeof body.failureStage === "string" ? { failureStage: body.failureStage as RcloneApplicationFailureStage } : {}),
 				};
 			}
-			if (body && body.result && typeof body.result.repositoryId === "string" && typeof body.result.phase === "string") {
-				passwordChangeResult = body.result as VaultPasswordChangeResult;
-			}
         } catch {
             /* non-JSON error body */
         }
 
-		throw new APIError(message, response.status, code, lifecycle, passwordChangeResult);
+		throw new APIError(message, response.status, code, lifecycle);
     }
 
     if (response.status === 204) {
@@ -127,6 +134,33 @@ function post<T = void>(path: string, body?: unknown, method = "POST"): Promise<
         headers: { "Content-Type": "application/json" },
         body: body === undefined ? undefined : JSON.stringify(body),
     });
+}
+
+// Foreground actions (vault creation and connection, the existing-vault
+// Check, ownership takeover, credential and cloud sign-in changes, job and
+// app settings saves, and the pending-intent and dormant-job actions) run
+// inside their HTTP request, so closing or reloading the page while one is in
+// flight can stop it partway. Each one holds the browser's leave-page prompt
+// for exactly as long as its request runs. Background operations (restore,
+// check, maintenance, deletions, and the vault card changes) must not use
+// this: their request only queues the work.
+let foregroundRequestCount = 0;
+
+async function foreground<T>(send: () => Promise<T>): Promise<T> {
+	const release = holdLeavePagePrompt(`foreground-request-${++foregroundRequestCount}`);
+	try {
+		return await send();
+	} finally {
+		release();
+	}
+}
+
+// A foreground action whose change committed but left a cleanup step
+// unfinished answers with status "completed_with_issues" and the issue text;
+// a clean success carries neither field.
+export interface ForegroundOutcome {
+	status?: "completed_with_issues";
+	issues?: string[];
 }
 
 export interface VaultProgressRecord {
@@ -198,8 +232,9 @@ async function postWithVaultProgress<T>(path: string, body: unknown, onProgress?
 
 function vaultProgressError(status: number, payload: unknown): APIError {
 	const body = payload && typeof payload === "object" ? payload as Record<string, unknown> : {};
-	const message = typeof body.error === "string" ? body.error : `Request failed (${status})`;
-	return new APIError(message, status, typeof body.code === "string" ? body.code : undefined,
+	const code = typeof body.code === "string" ? body.code : undefined;
+	const message = rcloneRemoteErrorMessage(code, body) ?? (typeof body.error === "string" ? body.error : `Request failed (${status})`);
+	return new APIError(message, status, code,
 		body.activation && typeof body.activation === "object" ? {
 			activation: body.activation as RcloneConfigActivation,
 			attached: Boolean(body.attached),
@@ -236,63 +271,6 @@ export function requireExactOperation(operationId: string, operations: Operation
 	const exact = operations.find((operation) => operation.id === operationId);
 	if (!exact) throw new Error("Exact operation lookup returned an unexpected response.");
 	return exact;
-}
-
-const RESTORE_OPERATION_OBSERVATION_ATTEMPTS = 50;
-const RESTORE_OPERATION_OBSERVATION_DELAY_MS = 100;
-const RESTORE_OPERATION_OBSERVATION_WINDOW_MS = 5000;
-const RESTORE_OPERATION_LOOKUP_TIMEOUT_MS = 500;
-
-function abortableDelay(delay: number, signal?: AbortSignal) {
-	return new Promise<void>((resolve) => {
-		if (signal?.aborted) {
-			resolve();
-			return;
-		}
-		const timer = window.setTimeout(done, delay);
-		function done() {
-			window.clearTimeout(timer);
-			signal?.removeEventListener("abort", done);
-			resolve();
-		}
-		signal?.addEventListener("abort", done, { once: true });
-	});
-}
-
-export async function observeSubmittedRestoreOperation(
-	operationId: string,
-	isCurrent: () => boolean,
-	signal?: AbortSignal,
-) {
-	const deadline = Date.now() + RESTORE_OPERATION_OBSERVATION_WINDOW_MS;
-	for (let attempt = 0; attempt < RESTORE_OPERATION_OBSERVATION_ATTEMPTS && isCurrent() && !signal?.aborted; attempt++) {
-		const remaining = deadline - Date.now();
-		if (remaining <= 0) break;
-		const lookupController = new AbortController();
-		const abortLookup = () => lookupController.abort();
-		signal?.addEventListener("abort", abortLookup, { once: true });
-		const timeout = window.setTimeout(abortLookup, Math.min(remaining, RESTORE_OPERATION_LOOKUP_TIMEOUT_MS));
-		try {
-			const operations = await getOperation(operationId, lookupController.signal);
-			// Handoff is identity-sensitive: never infer the submitted restore from
-			// recency, title, vault, or another row returned by a stale response.
-			const exact = operations.find((operation) => operation.id === operationId);
-			if (exact && isCurrent()) {
-				window.clearTimeout(timeout);
-				signal?.removeEventListener("abort", abortLookup);
-				return exact;
-			}
-		} catch {
-			// The row is inserted during request admission, so an early exact lookup
-			// may legitimately observe 404. The bounded run-local loop owns no state.
-		}
-		window.clearTimeout(timeout);
-		signal?.removeEventListener("abort", abortLookup);
-		if (attempt + 1 < RESTORE_OPERATION_OBSERVATION_ATTEMPTS && isCurrent() && !signal?.aborted) {
-			await abortableDelay(Math.min(RESTORE_OPERATION_OBSERVATION_DELAY_MS, Math.max(0, deadline - Date.now())), signal);
-		}
-	}
-	return null;
 }
 
 export const getActiveOperations = () =>
@@ -368,7 +346,7 @@ export interface JobEnabledResult extends ProfileMutationResult {
 	changed: boolean;
 }
 
-export interface RepositoryMutationResult extends ProfileMutationResult {
+export interface RepositoryMutationResult extends ProfileMutationResult, ForegroundOutcome {
 	id: string;
 	name?: string;
 	created?: boolean;
@@ -420,11 +398,15 @@ export interface RepositoryCreationIntent {
 export const getVaultProfileSyncStatuses = () =>
 	request<VaultProfileSyncStatus[]>("/api/vault-profile-sync");
 
+// Retry only queues the pending recovery-profile update (202). The profile
+// queue publishes it in the background, and getVaultProfileSyncStatuses keeps
+// reporting it as pending until that finishes, so there is no sync result or
+// warning to show from this call.
 export const retryVaultProfileSync = (repositoryId: string) =>
-	post<ProfileMutationResult>("/api/vault-profile-sync", { repositoryId });
+	post<{ profilePending: true }>("/api/vault-profile-sync", { repositoryId });
 
 export const createRepository = (input: CreateRepositoryInput, onProgress?: (record: VaultProgressRecord) => void) =>
-	postWithVaultProgress<RepositoryMutationResult>("/api/repositories", input, onProgress);
+	foreground(() => postWithVaultProgress<RepositoryMutationResult>("/api/repositories", input, onProgress));
 
 export interface ExistingVaultStorageInput {
 	connector: string;
@@ -467,7 +449,7 @@ export interface RcloneConfigActivation {
 	disposition: "retained" | "activated" | "indeterminate";
 }
 
-export interface RcloneLifecycleOutcome {
+export interface RcloneLifecycleOutcome extends ForegroundOutcome {
 	activation: RcloneConfigActivation;
 	attached: boolean;
 	usable?: boolean;
@@ -484,10 +466,10 @@ export type RcloneApplicationFailureStage =
 	| "database_credential_update";
 
 export const startRcloneAuthorization = (provider: string) =>
-	post<RcloneAuthStatus>("/api/rclone/auth/start", { provider });
+	foreground(() => post<RcloneAuthStatus>("/api/rclone/auth/start", { provider }));
 
 export const continueRcloneAuthorization = (sessionId: string, answer: string) =>
-	post<RcloneAuthStatus>("/api/rclone/auth/continue", { sessionId, answer });
+	foreground(() => post<RcloneAuthStatus>("/api/rclone/auth/continue", { sessionId, answer }));
 
 export const statusRcloneAuthorization = (sessionId: string) =>
 	post<RcloneAuthStatus>("/api/rclone/auth/status", { sessionId });
@@ -496,44 +478,63 @@ export const closeRcloneAuthorization = (sessionId: string) =>
 	post<void>(`/api/rclone/auth/session?id=${encodeURIComponent(sessionId)}`, undefined, "DELETE");
 
 export const applyRcloneAuthorization = (sessionId: string, repositoryId: string) =>
-	post<RcloneLifecycleOutcome>("/api/rclone/auth/apply", { sessionId, repositoryId });
+	foreground(() => post<RcloneLifecycleOutcome>("/api/rclone/auth/apply", { sessionId, repositoryId }));
 
 export const previewExistingVault = (input: ExistingVaultStorageInput, signal?: AbortSignal, onProgress?: (record: VaultProgressRecord) => void) =>
-	onProgress ? postWithVaultProgress<ExistingVaultPreview>("/api/vaults/connect/preview", input, onProgress, signal) : request<ExistingVaultPreview>("/api/vaults/connect/preview", {
+	foreground(() => onProgress ? postWithVaultProgress<ExistingVaultPreview>("/api/vaults/connect/preview", input, onProgress, signal) : request<ExistingVaultPreview>("/api/vaults/connect/preview", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify(input),
 		signal,
-	});
+	}));
 
 export const selectExistingVaultProfile = (input: ExistingVaultStorageInput, baseline: ExistingVaultPreview["baseline"], signal?: AbortSignal, onProgress?: (record: VaultProgressRecord) => void) =>
-	onProgress ? postWithVaultProgress<ExistingVaultPreview>("/api/vaults/connect/profile", { ...input, baseline }, onProgress, signal) : request<ExistingVaultPreview>("/api/vaults/connect/profile", {
+	foreground(() => onProgress ? postWithVaultProgress<ExistingVaultPreview>("/api/vaults/connect/profile", { ...input, baseline }, onProgress, signal) : request<ExistingVaultPreview>("/api/vaults/connect/profile", {
 		method: "POST",
 		headers: { "Content-Type": "application/json" },
 		body: JSON.stringify({ ...input, baseline }),
 		signal,
-	});
+	}));
 
 export const connectExistingVault = (input: ExistingVaultStorageInput & Record<string, unknown>, onProgress?: (record: VaultProgressRecord) => void) =>
-	postWithVaultProgress<RepositoryMutationResult>("/api/vaults/connect", input, onProgress);
+	foreground(() => postWithVaultProgress<RepositoryMutationResult>("/api/vaults/connect", input, onProgress));
 
 export const retryExistingVaultConnection = (input: {
 	intentId: string;
 	password: string;
 	options: Record<string, string>;
 	 rcloneAuthSessionId?: string;
-}, onProgress?: (record: VaultProgressRecord) => void) => postWithVaultProgress<RepositoryMutationResult>("/api/vaults/connect/retry", input, onProgress);
+}, onProgress?: (record: VaultProgressRecord) => void) => foreground(() => postWithVaultProgress<RepositoryMutationResult>("/api/vaults/connect/retry", input, onProgress));
 
 export const getRepositoryConnectionIntents = () => request<RepositoryConnectionIntent[]>("/api/repository-connection-intents");
 export const getRepositoryReconnectFields = (id: string) =>
 	request<RepositoryReconnectFields>(`/api/repository?id=${encodeURIComponent(id)}&reconnect=true`);
-export const cancelRepositoryConnectionIntent = (id: string) => post<void>(`/api/repository-connection-intents?id=${encodeURIComponent(id)}`, undefined, "DELETE");
+export const cancelRepositoryConnectionIntent = (id: string) => foreground(() => post<void>(`/api/repository-connection-intents?id=${encodeURIComponent(id)}`, undefined, "DELETE"));
 export const getRepositoryCreationIntents = () => request<RepositoryCreationIntent[]>("/api/repository-creation-intents");
-export const deleteRepositoryCreationIntent = (id: string) => post<ProfileMutationResult | undefined>(`/api/repository-creation-intents?id=${encodeURIComponent(id)}`, undefined, "DELETE");
+export const deleteRepositoryCreationIntent = (id: string) => foreground(() => post<ProfileMutationResult | undefined>(`/api/repository-creation-intents?id=${encodeURIComponent(id)}`, undefined, "DELETE"));
 export const getDormantRecoveryJobs = (repositoryId: string) => request<DormantRecoveryJob[]>(`/api/dormant-recovery-jobs?repositoryId=${encodeURIComponent(repositoryId)}`);
-export const restoreDormantRecoveryJob = (repositoryId: string, jobId: string) => post<ProfileMutationResult>(`/api/dormant-recovery-jobs?repositoryId=${encodeURIComponent(repositoryId)}`, { jobId });
-export const discardDormantRecoveryJob = (repositoryId: string, jobId: string) => post<ProfileMutationResult>(`/api/dormant-recovery-jobs?repositoryId=${encodeURIComponent(repositoryId)}&jobId=${encodeURIComponent(jobId)}`, undefined, "DELETE");
-export const updateRepositoryCredentials = (repositoryId: string, options: Record<string, string>) => post<void>("/api/repository/credentials", { repositoryId, options }, "PUT");
+export const restoreDormantRecoveryJob = (repositoryId: string, jobId: string) => foreground(() => post<ProfileMutationResult>(`/api/dormant-recovery-jobs?repositoryId=${encodeURIComponent(repositoryId)}`, { jobId }));
+export const discardDormantRecoveryJob = (repositoryId: string, jobId: string) => foreground(() => post<ProfileMutationResult>(`/api/dormant-recovery-jobs?repositoryId=${encodeURIComponent(repositoryId)}&jobId=${encodeURIComponent(jobId)}`, undefined, "DELETE"));
+// No body on a clean success (204); a ForegroundOutcome when the new
+// credentials were saved but a cleanup after that did not finish.
+export const updateRepositoryCredentials = (repositoryId: string, options: Record<string, string>) => foreground(() => post<ForegroundOutcome | undefined>("/api/repository/credentials", { repositoryId, options }, "PUT"));
+
+export interface RcloneRemoteEntry {
+	name: string;
+	type: string;
+}
+
+// Lists the remotes in the user's rclone.conf for the Any Rclone Remote form.
+// Only the settings that decide which remotes rclone sees are sent; the rclone
+// config password and the environment variables travel only in this body.
+// Each call runs rclone and briefly writes a check file next to rclone.conf.
+export const listRcloneRemotes = (options: Record<string, string>, signal?: AbortSignal) =>
+	request<{ remotes: RcloneRemoteEntry[] }>("/api/vaults/rclone-remote/remotes", {
+		method: "POST",
+		headers: { "Content-Type": "application/json" },
+		body: JSON.stringify({ options }),
+		signal,
+	});
 
 export const getIntegrations = () =>
     request<IntegrationCatalog>("/api/integrations");
@@ -547,17 +548,11 @@ export const browseDirectories = (path = "", signal?: AbortSignal) =>
         { signal }
     );
 
-// awaitProfileUpdate asks the backend to wait (bounded) for this vault's
-// pending recovery-profile update and then retry the removal once. Send it
-// only after a "vault_profile_update_pending" answer.
-export const deleteRepository = (id: string, discardRecoveryProfile = false, awaitProfileUpdate = false) =>
-	post<ProfileMutationResult | undefined>(`/api/repositories?id=${encodeURIComponent(id)}${discardRecoveryProfile ? "&discardRecoveryProfile=true" : ""}${awaitProfileUpdate ? "&awaitProfileUpdate=true" : ""}`, undefined, "DELETE");
-
-export const getRepositoryInfo = (id: string, snapshotId = "") =>
-    request<{ output: string }>(
-        `/api/repository/info?id=${encodeURIComponent(id)}` +
-            (snapshotId ? `&snapshotId=${encodeURIComponent(snapshotId)}` : "")
-    );
+// Vault removal runs in the background: the answer is the queued operation.
+// discardRecoveryProfile is the explicit Remove anyway after a removal failed
+// because the vault's recovery profile could not be updated.
+export const deleteRepository = (id: string, discardRecoveryProfile = false) =>
+	post<TrackedOperationStart>(`/api/repositories?id=${encodeURIComponent(id)}${discardRecoveryProfile ? "&discardRecoveryProfile=true" : ""}`, undefined, "DELETE");
 
 export const getVaultSizeStatus = (repositoryId: string) =>
     request<import("../types").VaultSizeStatus>(`/api/repository/vault-size?id=${encodeURIComponent(repositoryId)}`);
@@ -565,17 +560,21 @@ export const getVaultSizeStatus = (repositoryId: string) =>
 export const prepareVaultSize = (repositoryId: string, force = false) =>
     post<import("../types").VaultSizeStatus>(`/api/repository/vault-size/prepare?id=${encodeURIComponent(repositoryId)}&force=${force}`, {});
 
-export const checkRepository = (id: string, snapshotId = "") =>
-	post<{ output: string }>(
-        `/api/repository/check?id=${encodeURIComponent(id)}` +
-            (snapshotId ? `&snapshotId=${encodeURIComponent(snapshotId)}` : "")
-    );
+// Restore, restore of selected items, manual check and maintenance, and
+// snapshot and job deletion run in the background. Their request only queues
+// the operation and answers with its ID; progress, cancel and the result are
+// read from the operation (dashboard live log, /api/operations).
+export interface TrackedOperationStart {
+	operationId: string;
+}
 
-export const runMaintenance = (id: string, signal?: AbortSignal) =>
-	request<{ output: string }>(
-		`/api/repository/maintenance?id=${encodeURIComponent(id)}`,
-		{ method: "POST", headers: { "Content-Type": "application/json" }, signal }
-	);
+// Always a whole-vault check. The backend no longer offers a snapshot-scoped
+// check and refuses a snapshotId parameter.
+export const checkRepository = (id: string) =>
+	post<TrackedOperationStart>(`/api/repository/check?id=${encodeURIComponent(id)}`);
+
+export const runMaintenance = (id: string) =>
+	post<TrackedOperationStart>(`/api/repository/maintenance?id=${encodeURIComponent(id)}`);
 
 export interface VaultOwnershipStatus {
 	isOwner: boolean;
@@ -588,14 +587,19 @@ export interface VaultOwnershipStatus {
 	objectLock: ObjectLockSettings;
 	message: string;
 	takeoverExplanation: string;
+	// "unfinished": this computer started a takeover that did not complete.
+	// Finish takeover sends forceVaultOwnershipTakeover again, which resumes
+	// it. Another computer's unfinished takeover is not a status: the request
+	// fails with the code "owner_transfer_elsewhere".
+	ownerTransfer?: "unfinished";
 }
 
 export const getVaultOwnership = (id: string) =>
 	request<VaultOwnershipStatus>(`/api/repository/ownership?id=${encodeURIComponent(id)}`, { cache: "no-store" });
 
 export const forceVaultOwnershipTakeover = (id: string, reviewedOwnerProfileUUID: string) =>
-	post<VaultOwnershipStatus>(`/api/repository/ownership?id=${encodeURIComponent(id)}`,
-		{ reviewedOwnerProfileUUID, confirmed: true });
+	foreground(() => post<VaultOwnershipStatus>(`/api/repository/ownership?id=${encodeURIComponent(id)}`,
+		{ reviewedOwnerProfileUUID, confirmed: true }));
 
 export interface VaultPasswordChangeResult {
 	repositoryId: string;
@@ -608,8 +612,10 @@ export interface VaultPasswordChangeResult {
 	resticKeyTruth?: string;
 }
 
+// The password change and its retry run in the background; the saved phase
+// record, read with getVaultPasswordChangeStatus, stays the recovery authority.
 export const changeVaultPassword = (repositoryId: string, newPassword: string, passwordConfirmation: string) =>
-	post<VaultPasswordChangeResult>("/api/repository/password", {
+	post<TrackedOperationStart>("/api/repository/password", {
 		repositoryId, newPassword, passwordConfirmation,
 	});
 
@@ -617,7 +623,7 @@ export const getVaultPasswordChangeStatus = (repositoryId: string) =>
 	request<VaultPasswordChangeResult>(`/api/repository/password?id=${encodeURIComponent(repositoryId)}`);
 
 export const retryVaultPasswordChange = (repositoryId: string) =>
-	post<VaultPasswordChangeResult>("/api/repository/password/retry", { repositoryId });
+	post<TrackedOperationStart>("/api/repository/password/retry", { repositoryId });
 
 export const updateRepositorySchedules = (input: {
     repositoryId: string;
@@ -627,7 +633,7 @@ export const updateRepositorySchedules = (input: {
 	autoUnlock: boolean;
 	objectLock: ObjectLockSettings;
 	profilePreferencesOnly?: boolean;
-}) => post<ProfileMutationResult | undefined>("/api/repository/schedules", input, "PUT");
+}) => post<TrackedOperationStart>("/api/repository/schedules", input, "PUT");
 
 /* ------------------------------------------------------------------ */
 /* Snapshots                                                           */
@@ -667,7 +673,7 @@ export const listSnapshotFiles = (
     );
 
 export const deleteSnapshot = (repositoryId: string, snapshotId: string) =>
-    post(
+    post<TrackedOperationStart>(
         `/api/snapshot?id=${encodeURIComponent(repositoryId)}` +
             `&snapshotId=${encodeURIComponent(snapshotId)}`,
         undefined,
@@ -675,7 +681,6 @@ export const deleteSnapshot = (repositoryId: string, snapshotId: string) =>
     );
 
 export const restoreSnapshot = (input: {
-	operationId?: string;
     repositoryId: string;
     snapshotId: string;
     path: string;
@@ -683,12 +688,7 @@ export const restoreSnapshot = (input: {
     targetPath: string;
     conflictMode: string;
     originalLocation?: boolean;
-}, signal?: AbortSignal) => request("/api/restore", {
-	method: "POST",
-	headers: { "Content-Type": "application/json" },
-	body: JSON.stringify(input),
-	signal,
-});
+}) => post<TrackedOperationStart>("/api/restore", input);
 
 export interface IndexedResult<T> {
     items: T[];
@@ -763,7 +763,6 @@ export const getFileHistory = (
     );
 
 export const restoreSelection = (input: {
-	operationId?: string;
     repositoryId: string;
     targetPath: string;
 	items: Array<{
@@ -772,12 +771,7 @@ export const restoreSelection = (input: {
 		nativeRootId: string;
 	}>;
     conflictMode: string;
-}, signal?: AbortSignal) => request<{ status: "success" | "failed"; attempted: number; restored: number; failed: number; orchestrationFailed?: number; notAttempted: number; items: Array<{ snapshotId: string; path: string; destinationRelative?: string; domain?: "native" | "orchestration"; status: string; output?: string; error?: string; nativeStatus?: string; nativeOutput?: string; nativeError?: string; orchestrationStatus?: string; orchestrationError?: string }> }>("/api/restore-selection", {
-	method: "POST",
-	headers: { "Content-Type": "application/json" },
-	body: JSON.stringify(input),
-	signal,
-});
+}) => post<TrackedOperationStart>("/api/restore-selection", input);
 
 export const backupNow = (
     repositoryId: string,
@@ -812,13 +806,13 @@ export interface JobInput {
 	    enabled?: boolean;
 }
 
-export const createJob = (input: JobInput) => post<JobSaveResult>("/api/jobs", input);
+export const createJob = (input: JobInput) => foreground(() => post<JobSaveResult>("/api/jobs", input));
 
 export const updateJob = (input: JobInput) =>
-	post<JobSaveResult>("/api/jobs", input, "PUT");
+	foreground(() => post<JobSaveResult>("/api/jobs", input, "PUT"));
 
 export const deleteJob = (id: string) =>
-	post<ProfileMutationResult | undefined>(`/api/jobs?id=${encodeURIComponent(id)}`, undefined, "DELETE");
+	post<TrackedOperationStart>(`/api/jobs?id=${encodeURIComponent(id)}`, undefined, "DELETE");
 
 export interface ManualTargetAdmissionResult {
     repositoryId: string;
@@ -837,20 +831,17 @@ export const runJob = (id: string, repositoryId?: string) =>
     post<ManualJobRunResult>(`/api/jobs/run?id=${encodeURIComponent(id)}${repositoryId ? `&repositoryId=${encodeURIComponent(repositoryId)}` : ""}`);
 
 export const setJobEnabled = (id: string, enabled: boolean) =>
-	post<JobEnabledResult>(`/api/jobs/enabled?id=${encodeURIComponent(id)}`, { enabled }, "PUT");
+	foreground(() => post<JobEnabledResult>(`/api/jobs/enabled?id=${encodeURIComponent(id)}`, { enabled }, "PUT"));
 
 // "Update job source": the chosen folder becomes the job's alias. The backend
 // never replaces the immutable source. Without `confirmed` the backend may
 // return a folder check instead of saving; the caller shows it and resubmits
 // with `confirmed: true` only when the user chooses to continue.
 export const updateJobSource = (id: string, path: string, confirmed = false) =>
-	post<JobSourceUpdateResult>("/api/jobs/source", { id, path, confirmed });
+	foreground(() => post<JobSourceUpdateResult>("/api/jobs/source", { id, path, confirmed }));
 
 export const getJobStatus = () =>
     request<{ running: Record<string, string>; targets: Array<{ jobId: string; repositoryId: string; repositoryName: string; operationId: string; status: string }> }>("/api/jobs/status");
-
-export const retryKopiaPolicy = (jobId: string, repositoryId: string) =>
-	post<{ status: "pending" }>("/api/jobs/policy/retry", { jobId, repositoryId });
 
 /* ------------------------------------------------------------------ */
 /* Engine, logs, settings                                              */
@@ -872,7 +863,7 @@ export const saveSettings = (settings: Settings) => {
     const writable = { ...settings };
     delete writable.effectiveLocale;
     delete writable.systemLocale;
-    return post("/api/settings", writable);
+    return foreground(() => post("/api/settings", writable));
 };
 
 export const getAppUpdateStatus = () => request<AppUpdateStatus>("/api/app-update/status");

@@ -689,6 +689,10 @@ func CoordinateScheduledAdmission(db *sql.DB, request ScheduledAdmissionRequest)
 	results := make([]TargetAdmissionResult, 0, len(resultTargets))
 	admitted := false
 	groupID := ""
+	// A vault whose removal is queued or running counts as busy: the pair keeps
+	// its pending occurrence and nothing is queued, reported or notified, as for
+	// any busy pair. Once the removal commits, the target is gone with it; if
+	// the removal fails, the next tick admits the pending occurrence.
 	pairBusy := func(repositoryID string) (bool, error) {
 		var active int
 		if err := tx.QueryRow(`SELECT COUNT(*) FROM operations
@@ -696,7 +700,10 @@ func CoordinateScheduledAdmission(db *sql.DB, request ScheduledAdmissionRequest)
 			request.JobID, repositoryID).Scan(&active); err != nil {
 			return false, err
 		}
-		return active != 0, nil
+		if active != 0 {
+			return true, nil
+		}
+		return vaultRemovalPending(tx, repositoryID)
 	}
 	sourceOutage := request.Source.State != StorageAvailable && !request.Source.ConclusiveFailure
 	// A source outage is reported once per job, carried by the first idle
@@ -1239,6 +1246,7 @@ func AdmitManualBackupTargets(db *sql.DB, request ManualAdmissionRequest) ([]Tar
 		ids = append(ids, repositoryID)
 	}
 	sort.Strings(ids)
+	removingTargets := 0
 	for _, repositoryID := range ids {
 		target, ok := byID[repositoryID]
 		if !ok {
@@ -1263,6 +1271,23 @@ func AdmitManualBackupTargets(db *sql.DB, request ManualAdmissionRequest) ([]Tar
 		if observation.State != StorageAvailable && !request.Source.ConclusiveFailure && !observation.ConclusiveFailure {
 			result.Status = AdmissionStorageUnavailable
 			result.ReasonCode = observation.ReasonCode
+			results = append(results, result)
+			continue
+		}
+		// A vault whose removal is pending takes no new backup. In a run of
+		// several vaults that target alone is reported busy (with the
+		// vault_being_removed reason) and the other vaults still start, the way
+		// scheduled admission holds back that pair; rolling the whole run back
+		// would stop backups to vaults that have nothing to do with the
+		// removal. Only a run in which every selected vault is being removed is
+		// refused outright, below, so a single-vault run keeps its "This vault
+		// is being removed." answer.
+		if removing, err := vaultRemovalPending(tx, repositoryID); err != nil {
+			return nil, err
+		} else if removing {
+			removingTargets++
+			result.Status = AdmissionBusy
+			result.ReasonCode = vaultBeingRemovedReason
 			results = append(results, result)
 			continue
 		}
@@ -1300,6 +1325,9 @@ func AdmitManualBackupTargets(db *sql.DB, request ManualAdmissionRequest) ([]Tar
 			result.ReasonCode = observation.ReasonCode
 		}
 		results = append(results, result)
+	}
+	if removingTargets == len(ids) {
+		return nil, ErrVaultBeingRemoved
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err

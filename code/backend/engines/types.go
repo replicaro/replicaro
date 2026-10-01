@@ -149,7 +149,7 @@ func capabilitiesFor(id string) Capabilities {
 			{ID: "always", Label: "Always overwrite", Description: "Restic passes its native --overwrite always mode.", Default: true},
 			{ID: "never", Label: "Never overwrite", Description: "Restic passes its native --overwrite never mode.", Default: false},
 		}, DestinationScope: "Restic writes directly below the selected native target. Replicaro exposes Restic's native always and never overwrite modes."}
-		base.Verification = NativeOperationCapability{Supported: true, Label: "Restic repository verification", Scope: "Native check --read-data content verification, optionally filtered to one snapshot."}
+		base.Verification = NativeOperationCapability{Supported: true, Label: "Restic repository verification", Scope: "Native check --read-data content verification of the whole repository."}
 	case KopiaID:
 		base.Restore = RestoreCapability{FullSnapshot: true, SinglePath: true, ConflictModes: []RestoreConflictMode{
 			{ID: "overwrite", Label: "Overwrite", Description: "Kopia applies its native overwrite behavior.", Default: true},
@@ -278,7 +278,10 @@ type Engine interface {
 	ListPathRecursive(context.Context, models.Repository, string, string) ([]models.SnapshotEntry, string, error)
 	Restore(context.Context, models.Repository, string, RestoreOptions) (string, error)
 	DeleteSnapshot(context.Context, models.Repository, string) (string, error)
-	Check(context.Context, models.Repository, string) (string, error)
+	// Check runs the engine's whole-repository integrity check. It takes no
+	// snapshot on purpose: the snapshot-scoped check had no caller and was
+	// removed, and cold storage vaults refuse the whole-repository check.
+	Check(context.Context, models.Repository) (string, error)
 	Maintenance(context.Context, models.Repository) (string, error)
 }
 

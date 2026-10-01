@@ -11,61 +11,53 @@ import (
 
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/engines"
+	"github.com/local/replicaro/models"
+	"github.com/local/replicaro/operationruntime"
 	"github.com/local/replicaro/profilesync"
-	"github.com/local/replicaro/vaultlock"
 )
 
-// Vault removal and pending recovery-profile updates
+// Vault removal runs on the tracked operation path (see
+// vault_admin_operations.go). The request only checks what needs no lock and
+// queues the operation; the worker does the rest, in this order:
 //
-// Removing a vault rewrites the portable job definitions of every other vault
-// that shared a job with it and marks their recovery profiles for publication
-// (database.deleteRepository -> markVaultProfilesDirty). The profile queue
-// (profilesync) then publishes each of those profiles under that vault's lock.
-// Removing one of those vaults straight afterwards can hit one of two
-// temporary conflicts:
+//  1. Wait, holding no vault lock, until nothing else for the vault is queued
+//     or running (its own record excluded). Taking the lock first would
+//     deadlock: queued work for the vault is itself waiting for that lock.
+//     While the removal is pending, no new work for the vault is admitted
+//     (see database.ErrVaultBeingRemoved), so the wait ends.
+//  2. Take the vault lock. No second idle check is made under it; see
+//     removeVaultInBackground for why none is needed.
+//  3. Publish the vault's recovery profile under the lock and verify it, then
+//     stage the local engine artifacts and delete the local attachment in one
+//     transaction. The publication reports, and that transaction refuses with,
+//     database.ErrVaultProfilePending when a profile-relevant change committed
+//     in between (typically another vault's removal that rewrote a job shared
+//     with this vault). The worker then publishes once more and tries once
+//     more, still under the lock. If the profile still cannot be updated, the
+//     operation fails and records the vaultRemovalProfileStep step as failed;
+//     the vault card reads that step to offer Retry removal and Remove anyway.
+//     Nothing else is saved for it.
 //
-//   - the queue held the vault lock, so removal reported the vault as busy; or
-//   - removal published the profile itself, but another removal committed in
-//     between and marked this vault's profile pending again, so the final
-//     transactional check returned database.ErrVaultProfilePending.
+// The queued profile updates of other vaults are never skipped, cancelled or
+// discarded: they carry those vaults' changed job definitions. Only the
+// explicit Remove anyway (discardRecoveryProfile) leaves this vault's own
+// profile unpublished; it still waits for other work, takes the lock and
+// keeps every other safeguard.
 //
-// Removal reports exactly those two cases as vault_profile_update_pending.
-// The client says the vault information is being updated and repeats the
-// request with awaitProfileUpdate=true. That request wakes the queue, waits up
-// to vaultRemovalProfileUpdateWait until no profile update for the vault is
-// running or due, and then makes one normal removal attempt that rechecks
-// every safeguard: the lock, eligibility, its own profile publication,
-// artifact staging, and the transactional pending-profile check. If the vault
-// is still blocked by a profile update after that (or the wait runs out), the
-// answer is vault_profile_update_still_pending and the user can retry later.
-// A busy lock held by anything other than a profile update, and every other
-// failure, get their usual responses.
-//
-// The wait deliberately never skips, cancels, or discards the queued update.
-// Those updates carry the other vaults' changed job definitions; dropping one
-// would leave a remote recovery profile describing jobs as they were before
-// the earlier removal. Only the explicit "Remove anyway" confirmation
-// (discardRecoveryProfile) may leave this vault's own profile unpublished, and
-// it still waits for a profile update that holds the lock. When the update
-// fails rather than finishes, the retry's own publication fails the same way
-// and the client offers "Remove anyway" as before. Nothing is kept between
-// the two requests: no worker, queue, or record beyond the existing
-// vault_profile_sync row.
+// A removal can be cancelled while it waits in step 1 or 2 and not after.
 
-// vaultRemovalProfileUpdateWait bounds the awaitProfileUpdate wait. A variable
-// only so tests can shorten it.
-var vaultRemovalProfileUpdateWait = 2 * time.Minute
+// vaultRemovalProfileStep is the step a removal records when the recovery
+// profile could not be published. It is the stable signal the UI uses to
+// offer Remove anyway, so do not rename it.
+const vaultRemovalProfileStep = "recovery_profile_publication"
 
-const (
-	vaultProfileUpdatePendingCode      = "vault_profile_update_pending"
-	vaultProfileUpdateStillPendingCode = "vault_profile_update_still_pending"
-)
+// vaultRemovalIdlePoll is how often a pending removal looks again for the
+// vault's other queued or running work. A variable only so tests can shorten
+// it.
+var vaultRemovalIdlePoll = time.Second
 
-var errVaultProfileUpdateHoldsLock = errors.New("vault recovery profile update is in progress")
-
-func handleRepositoryRemoval(db *sql.DB, w http.ResponseWriter, r *http.Request) {
+func handleRepositoryRemoval(db *sql.DB, runtimeManager *operationruntime.Manager, w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
-
 	if id == "" {
 		badRequest(w, "missing repository id")
 		return
@@ -79,151 +71,192 @@ func handleRepositoryRemoval(db *sql.DB, w http.ResponseWriter, r *http.Request)
 		badRequest(w, "discardRecoveryProfile must be true when provided")
 		return
 	}
-	awaitProfileUpdate := false
-	switch value := r.URL.Query().Get("awaitProfileUpdate"); value {
-	case "":
-	case "true":
-		awaitProfileUpdate = true
-	default:
-		badRequest(w, "awaitProfileUpdate must be true when provided")
-		return
-	}
-	if awaitProfileUpdate {
-		profilesync.Wake(db)
-		settled, err := profilesync.WaitForPendingUpdate(r.Context(), db, id, vaultRemovalProfileUpdateWait)
-		if err != nil {
-			// Only the request's own context ending is a timeout. Any other
-			// error (reading the profile queue state) is a server failure and
-			// must not be presented as "try again later".
-			status := http.StatusInternalServerError
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				status = http.StatusRequestTimeout
-			}
-			writeError(w, status, err)
-			return
-		}
-		if !settled {
-			writeCodedError(w, http.StatusConflict, vaultProfileUpdateStillPendingCode,
-				"vault removal stopped because its recovery profile update is still in progress")
-			return
-		}
-	}
-	blocked := removeRepositoryOnce(db, w, r, id, discardRecoveryProfile)
-	if blocked == nil {
-		return
-	}
-	code := vaultProfileUpdatePendingCode
-	if awaitProfileUpdate {
-		code = vaultProfileUpdateStillPendingCode
-	}
-	writeCodedError(w, http.StatusConflict, code, blocked.Error())
-}
-
-// removeRepositoryOnce makes one removal attempt. It writes the response for
-// every outcome except removal blocked only by a recovery-profile update; that
-// error is returned unwritten so the caller can answer with the right code.
-// Its local artifacts and database state are unchanged in that case.
-func removeRepositoryOnce(db *sql.DB, w http.ResponseWriter, r *http.Request, id string, discardRecoveryProfile bool) error {
-	deletedRepo, repoErr := database.GetRepository(db, id)
-	if repoErr == nil {
-		unlock, lockOK, lockErr := vaultlock.YieldLowPriorityAndTryExclusiveContext(r.Context(), deletedRepo.ID)
-		if lockErr != nil {
-			writeError(w, http.StatusRequestTimeout, lockErr)
-			return nil
-		}
-		if !lockOK {
-			if profilesync.PublishingUnderLock(deletedRepo.ID) {
-				return errVaultProfileUpdateHoldsLock
-			}
-			writeError(w, http.StatusConflict, errors.New(vaultRemovalBusyMessage))
-			return nil
-		}
-		defer unlock()
-	} else if !errors.Is(repoErr, sql.ErrNoRows) {
-		writeError(w, http.StatusInternalServerError, repoErr)
-		return nil
-	}
-
-	if err := database.CheckRepositoryDeletionEligibility(db, id); err != nil {
-		if errors.Is(err, database.ErrJobRunActive) || errors.Is(err, database.ErrRepositoryConnectionReserved) {
-			writeError(w, http.StatusConflict, err)
-		} else if errors.Is(err, sql.ErrNoRows) {
+	repo, err := database.GetRepository(db, id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusNotFound, err)
 		} else {
 			writeError(w, http.StatusInternalServerError, err)
 		}
-		return nil
+		return
 	}
-	if !discardRecoveryProfile {
-		if err := profilesync.SyncRepositoryUnderLock(r.Context(), db, id); err != nil {
-			writeCodedError(w, http.StatusConflict, "vault_profile_sync_required",
-				fmt.Sprintf("vault removal stopped because its recovery profile could not be synchronized: %v", err))
-			return nil
+	if err := database.CheckRepositoryRemovalRequest(db, id); err != nil {
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			writeError(w, http.StatusNotFound, err)
+		case errors.Is(err, database.ErrRepositoryConnectionReserved), errors.Is(err, database.ErrVaultPasswordChangeRecoveryRequired):
+			writeError(w, http.StatusConflict, err)
+		default:
+			writeError(w, http.StatusInternalServerError, err)
 		}
+		return
 	}
-	stage, err := stageRepositoryArtifacts(deletedRepo, engines.RepositoryArtifactDelete)
+	title := vaultRemovalTitle(repo.Name)
+	operationID, err := startTrackedOperation(db, runtimeManager, database.QueuedOperation{
+		Kind: database.VaultRemovalKind, Title: title, RepositoryID: repo.ID, VaultChange: true,
+	}, func(operationID, status string) func() {
+		return prepareOperationNotification(db, operationID, database.VaultRemovalKind, title, status)
+	}, func(op *trackedOperation) {
+		removeVaultInBackground(op, repo, discardRecoveryProfile)
+	})
 	if err != nil {
-		writeError(w, http.StatusInternalServerError, fmt.Errorf("local engine credential staging failed: %w", err))
-		return nil
+		writeTrackedStartError(w, err)
+		return
+	}
+	writeTrackedOperationStarted(w, operationID)
+}
+
+func removeVaultInBackground(op *trackedOperation, repo models.Repository, discardRecoveryProfile bool) {
+	db := op.db
+	if err := waitForVaultIdle(op, repo.ID); err != nil {
+		op.notStarted(err)
+		return
+	}
+	// There is deliberately no second idle check under the lock, and no
+	// releasing the lock to go back to waiting. Nothing new can appear: from
+	// the moment this removal's record was queued, every place that records
+	// work for the vault refuses it in the same transaction
+	// (database.ErrVaultBeingRemoved), and job deletions of jobs that target
+	// the vault are counted by the wait above. Anything that still got through
+	// is caught by deleteRepository, which counts the same work in its own
+	// transaction and refuses, so the removal fails rather than deleting a
+	// vault that is in use.
+	unlock, err := op.waitForVault(repo.ID)
+	if err != nil {
+		op.notStarted(err)
+		return
+	}
+	// Held until the final status is saved (runs after op.finish).
+	defer unlock()
+	if !op.startWithoutCancel() {
+		op.notStarted(context.Canceled)
+		return
+	}
+	if err := op.activate(); err != nil {
+		op.fail(fmt.Errorf("start vault removal: %w", err))
+		return
+	}
+	if err := database.CheckRepositoryDeletionEligibility(db, repo.ID); err != nil {
+		op.fail(err)
+		return
 	}
 	deleteLocalState := deleteRepository
 	if discardRecoveryProfile {
 		deleteLocalState = deleteRepositoryDiscardingPendingProfile
 	}
-	deleteErr := deleteLocalState(db, id)
-	var cacheCleanupErr *database.MetadataCacheCleanupError
-	if deleteErr != nil && !errors.As(deleteErr, &cacheCleanupErr) {
+	var stage *engines.RepositoryArtifactStage
+	var deleteErr error
+	// A profile-relevant change can overtake this removal at two points: while
+	// the profile is being prepared (the sync then reports
+	// ErrVaultProfilePending and publishes nothing), or after the verified
+	// publication and before the delete transaction (which then refuses with
+	// ErrVaultProfilePending). Either way the removal publishes again and tries
+	// exactly once more, still under the lock; a second overtake fails it with
+	// the recovery-profile step. The one retry is shared by both points, so a
+	// removal never loops.
+	for attempt := 1; ; attempt++ {
+		if !discardRecoveryProfile {
+			if err := profilesync.SyncRepositoryUnderLock(op.ctx, db, repo.ID); err != nil {
+				if errors.Is(err, database.ErrVaultProfilePending) && attempt == 1 {
+					continue
+				}
+				if errors.Is(err, database.ErrVaultProfilePending) {
+					op.failRemovalProfile(fmt.Errorf("vault removal stopped because its recovery profile changed again while it was being updated: %w", err))
+					return
+				}
+				op.failRemovalProfile(fmt.Errorf("vault removal stopped because its recovery profile could not be synchronized: %w", err))
+				return
+			}
+		}
+		var err error
+		stage, err = stageRepositoryArtifacts(repo, engines.RepositoryArtifactDelete)
+		if err != nil {
+			op.fail(fmt.Errorf("local engine credential staging failed: %w", err))
+			return
+		}
+		deleteErr = deleteLocalState(db, repo.ID)
+		var cacheCleanupErr *database.MetadataCacheCleanupError
+		if deleteErr == nil || errors.As(deleteErr, &cacheCleanupErr) {
+			break
+		}
 		if restoreErr := restoreRepositoryArtifacts(stage); restoreErr != nil {
-			writeError(w, http.StatusInternalServerError, fmt.Errorf("vault deletion failed and local engine artifacts could not be restored: %v; restore error: %w", deleteErr, restoreErr))
-			return nil
+			op.fail(fmt.Errorf("vault deletion failed and local engine artifacts could not be restored: %v; restore error: %w", deleteErr, restoreErr))
+			return
 		}
-		if errors.Is(deleteErr, database.ErrVaultProfilePending) {
-			// A profile-relevant change committed after this attempt's own
-			// publication. The newer profile must be published first.
-			return deleteErr
+		if !errors.Is(deleteErr, database.ErrVaultProfilePending) {
+			op.fail(deleteErr)
+			return
 		}
-		if errors.Is(deleteErr, database.ErrJobRunActive) || errors.Is(deleteErr, database.ErrRepositoryConnectionReserved) {
-			writeError(w, http.StatusConflict, deleteErr)
-		} else if errors.Is(deleteErr, sql.ErrNoRows) {
-			writeError(w, http.StatusNotFound, deleteErr)
-		} else {
-			writeError(w, http.StatusInternalServerError, deleteErr)
+		if attempt == 2 {
+			// A profile-relevant change overtook both attempts. The vault is
+			// kept; the user can retry later or remove it anyway.
+			op.failRemovalProfile(fmt.Errorf("vault removal stopped because its recovery profile changed again while it was being updated: %w", deleteErr))
+			return
 		}
-		return nil
 	}
+	// The local attachment is gone from here on; the rest is cleanup and
+	// cannot undo it.
 	profilesync.Wake(db)
-	warnings := []string{}
+	notes := []string{}
 	if discardRecoveryProfile {
-		warnings = append(warnings, fmt.Sprintf("Vault %q removed from Replicaro without updating its recovery profile.", deletedRepo.Name))
+		notes = append(notes, fmt.Sprintf("Vault %q removed from Replicaro without updating its recovery profile.", repo.Name))
+	} else {
+		notes = append(notes, fmt.Sprintf("Vault %q removed from Replicaro.", repo.Name))
 	}
-	if cacheCleanupErr != nil {
-		warnings = append(warnings, "The vault was removed, but its local metadata cache requires manual cleanup.")
+	var cleanupErrors []string
+	var cacheCleanupErr *database.MetadataCacheCleanupError
+	if errors.As(deleteErr, &cacheCleanupErr) {
+		cleanupErrors = append(cleanupErrors, "The vault was removed, but its local metadata cache requires manual cleanup.")
 	}
-	var cleanupErrors []error
-	if err := removeDeletedRcloneConfig(id); err != nil {
-		cleanupErrors = append(cleanupErrors, fmt.Errorf("vault was deleted but its local rclone config requires cleanup: %w", err))
+	// Any Rclone Remote owns no private config; its user-selected file may
+	// occupy this UUID's ordinary private-config path.
+	if repo.Connector != engines.RcloneRemoteConnector {
+		if err := removeDeletedRcloneConfig(repo.ID); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Sprintf("vault was deleted but its local rclone config requires cleanup: %v", err))
+		}
 	}
 	if err := finalizeRepositoryArtifacts(stage); err != nil {
-		cleanupErrors = append(cleanupErrors, fmt.Errorf("vault was deleted but quarantined local engine artifacts require manual cleanup: %w", err))
+		cleanupErrors = append(cleanupErrors, fmt.Sprintf("vault was deleted but quarantined local engine artifacts require manual cleanup: %v", err))
 	}
 	if len(cleanupErrors) != 0 {
-		allErrors := make([]error, 0, len(warnings)+len(cleanupErrors))
-		for _, warning := range warnings {
-			allErrors = append(allErrors, errors.New(warning))
-		}
-		allErrors = append(allErrors, cleanupErrors...)
-		// Database deletion is already committed here. Preserve that truth in
-		// the API so a client cannot offer to keep or retry an absent vault.
-		writeCodedError(w, http.StatusInternalServerError, "vault_removal_cleanup_required", errors.Join(allErrors...).Error())
-		return nil
+		// Removed, with local cleanup left for the user: the removal happened,
+		// so this is not a failure, but it is not a clean success either.
+		op.finish("completed_with_issues", strings.Join(append(notes, cleanupErrors...), "\n"))
+		return
 	}
+	op.finish("success", strings.Join(notes, "\n"))
+}
 
-	if len(warnings) != 0 {
-		writeJSON(w, map[string]any{
-			"warning": strings.Join(warnings, " "),
-		})
-		return nil
+// waitForVaultIdle waits, holding no vault lock, until nothing other than the
+// removal itself is queued or running for the vault, including a job deletion
+// of a job that targets the vault (see database.RepositoryHasOtherActiveWork).
+// It returns early only on cancel or shutdown.
+func waitForVaultIdle(op *trackedOperation, repositoryID string) error {
+	for {
+		active, err := database.RepositoryHasOtherActiveWork(op.db, repositoryID)
+		if err != nil {
+			return fmt.Errorf("check the vault's queued or running work: %w", err)
+		}
+		if !active {
+			return nil
+		}
+		timer := time.NewTimer(vaultRemovalIdlePoll)
+		select {
+		case <-op.ctx.Done():
+			timer.Stop()
+			return op.ctx.Err()
+		case <-timer.C:
+		}
 	}
-	w.WriteHeader(http.StatusNoContent)
-	return nil
+}
+
+// failRemovalProfile ends a removal whose recovery profile could not be
+// updated. The failed vaultRemovalProfileStep step is what lets the vault card
+// offer Remove anyway for exactly this failure.
+func (op *trackedOperation) failRemovalProfile(err error) {
+	now := time.Now()
+	if stepErr := startOperationStep(op.db, op.id, "orchestration", vaultRemovalProfileStep, now); stepErr == nil {
+		_ = finishOperationStep(op.db, op.id, vaultRemovalProfileStep, "failed", err.Error(), now)
+	}
+	op.fail(err)
 }

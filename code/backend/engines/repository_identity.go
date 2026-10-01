@@ -1,6 +1,7 @@
 package engines
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -18,12 +19,13 @@ import (
 )
 
 // DetectRepositorySignatures inspects only exact-root, engine-owned marker
-// structures and does not authenticate or execute an engine.
-func DetectRepositorySignatures(repo models.Repository) ([]string, error) {
+// structures and does not authenticate or execute an engine. The listing of
+// the vault folder is bounded by ctx (see ReadWithin).
+func DetectRepositorySignatures(ctx context.Context, repo models.Repository) ([]string, error) {
 	if repo.Connector != "fs" {
 		return nil, fmt.Errorf("remote repository signatures require connector-backed root inspection")
 	}
-	entries, err := os.ReadDir(repo.Location)
+	entries, err := ReadWithin(ctx, func() ([]os.DirEntry, error) { return os.ReadDir(repo.Location) })
 	if err != nil {
 		return nil, err
 	}
@@ -43,9 +45,35 @@ func DetectRepositorySignatures(repo models.Repository) ([]string, error) {
 	return candidates, nil
 }
 
+// RepositoryFingerprintContext is RepositoryFingerprint for callers that hold
+// a vault lock or the Kopia initialization lock, or that are connecting a
+// vault: the filesystem marker read is bounded by ctx (see ReadWithin). Other
+// connectors read nothing locally and are computed directly.
+func RepositoryFingerprintContext(ctx context.Context, repo models.Repository, validationOutput string) (string, error) {
+	if repo.Connector != "fs" {
+		return RepositoryFingerprint(repo, validationOutput)
+	}
+	return ReadWithin(ctx, func() (string, error) { return RepositoryFingerprint(repo, validationOutput) })
+}
+
+// RepositoryMissingContext is RepositoryMissing for the same callers. For a
+// filesystem vault the check stats and lists the vault folder, so it is
+// bounded by ctx; an error means ctx ended before the check finished and
+// nothing is known about whether the repository is missing.
+func RepositoryMissingContext(ctx context.Context, repo models.Repository, validationOutput string) (bool, error) {
+	if repo.Connector != "fs" {
+		return RepositoryMissing(repo, validationOutput), nil
+	}
+	return ReadWithin(ctx, func() (bool, error) { return RepositoryMissing(repo, validationOutput), nil })
+}
+
 // RepositoryFingerprint binds a recovery preview to native repository material.
 // Exact-root configuration bytes are preferred; normalized validation output
 // is the remote-repository fallback.
+//
+// For a filesystem vault it reads the vault path directly and can block
+// indefinitely on a hung share, so code that holds a vault lock or serves a
+// request should call RepositoryFingerprintContext instead.
 func RepositoryFingerprint(repo models.Repository, validationOutput string) (string, error) {
 	if repo.Connector == "fs" {
 		markers := []string{}

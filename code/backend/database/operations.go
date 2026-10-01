@@ -19,8 +19,10 @@ var ErrTargetRunActive = errors.New("backup target already has a queued or runni
 var removeOperationLog = operationlog.Remove
 var ErrRepositoryTaskActive = errors.New("repository task already has a running operation")
 var ErrBackupTriggerChanged = errors.New("backup job was disabled or changed before it could be queued")
-var ErrInvalidOperationID = errors.New("operation id must be a canonical lowercase UUID v4")
-var ErrOperationIDExists = errors.New("operation id already exists")
+
+// ErrOperationActive is returned by QueueOperation when an operation it must
+// not duplicate is already queued or running.
+var ErrOperationActive = errors.New("the same operation is already queued or running")
 
 type BackupOperationRequest struct {
 	Title        string
@@ -41,60 +43,122 @@ func StartOperation(
 	kind, title, jobID, repositoryID string,
 	startedAt time.Time,
 ) (string, error) {
-	return StartOperationWithID(db, kind, title, jobID, repositoryID, nil, startedAt)
-}
-
-// StartOperationWithID lets a restore submission store the operation ID the UI
-// chose. Requiring a canonical UUID v4 keeps alternate spellings of an ID from
-// breaking exact lookup, and the primary key still rejects collisions.
-func StartOperationWithID(
-	db *sql.DB,
-	kind, title, jobID, repositoryID string,
-	requestedID *string,
-	startedAt time.Time,
-) (string, error) {
-	id := ""
-	if requestedID == nil {
-		id = uuid.New().String()
-	} else {
-		id = *requestedID
-		if err := ValidateOperationID(id); err != nil {
-			return "", ErrInvalidOperationID
-		}
-	}
-	result, err := db.Exec(
+	id := uuid.New().String()
+	if _, err := db.Exec(
 		`INSERT INTO operations
 			(id, kind, status, title, job_id, repository_id, engine, started_at)
-			VALUES (?, ?, 'running', ?, ?, ?, COALESCE((SELECT engine FROM repositories WHERE id = ?), ''), ?)
-			ON CONFLICT(id) DO NOTHING`,
+			VALUES (?, ?, 'running', ?, ?, ?, COALESCE((SELECT engine FROM repositories WHERE id = ?), ''), ?)`,
 		id, kind, title, jobID, repositoryID, repositoryID, formatSortableTimestamp(startedAt),
-	)
-	if err != nil {
+	); err != nil {
 		return "", err
-	}
-	if count, err := result.RowsAffected(); err != nil {
-		return "", err
-	} else if count != 1 {
-		return "", ErrOperationIDExists
 	}
 	return id, nil
 }
 
-func ValidateOperationID(id string) error {
-	parsed, err := uuid.Parse(id)
-	if err != nil || parsed == uuid.Nil || parsed.Version() != 4 ||
-		parsed.Variant() != uuid.RFC4122 || parsed.String() != id {
-		return ErrInvalidOperationID
-	}
-	return nil
+// QueuedOperation describes a request-started operation (restore, manual
+// check or maintenance, snapshot or job deletion, vault password change,
+// settings save or removal) whose record is created before its worker waits
+// for the vault.
+type QueuedOperation struct {
+	Kind, Title, JobID, RepositoryID string
+	// Exclusive refuses the new record while another queued or running
+	// operation has the same kind, repository and job. With MatchTitle the
+	// title has to match as well; snapshot deletion uses that because the
+	// snapshot ID is only carried in its title.
+	Exclusive  bool
+	MatchTitle bool
+	// VaultChange marks a vault administration job (password change, settings
+	// save, removal). Only one of those may be queued or running per vault;
+	// another is refused with ErrVaultChangeActive.
+	VaultChange bool
 }
 
-func OperationIDExists(db *sql.DB, id string) (bool, error) {
-	var exists int
-	if err := db.QueryRow(`SELECT EXISTS(SELECT 1 FROM operations WHERE id = ?)`, id).Scan(&exists); err != nil {
-		return false, err
+// QueueOperation creates the record as queued, with a server-generated ID. The
+// checks and the insert share one transaction so two requests cannot both
+// pass them. Every record for a vault is refused with ErrVaultBeingRemoved
+// while that vault's removal is queued or running, so the removal is not
+// starved by new work; a second removal gets the same answer.
+func QueueOperation(db *sql.DB, operation QueuedOperation, queuedAt time.Time) (string, error) {
+	tx, err := db.Begin()
+	if err != nil {
+		return "", err
 	}
-	return exists != 0, nil
+	defer func() { _ = tx.Rollback() }()
+	if removing, err := vaultRemovalPending(tx, operation.RepositoryID); err != nil {
+		return "", err
+	} else if removing {
+		return "", ErrVaultBeingRemoved
+	}
+	if operation.VaultChange {
+		if err := requireNoVaultChange(tx, operation.RepositoryID); err != nil {
+			return "", err
+		}
+	}
+	if operation.Exclusive {
+		var active int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM operations
+			WHERE kind = ? AND repository_id = ? AND job_id = ? AND (? = 0 OR title = ?)
+			AND status IN ('queued','running')`,
+			operation.Kind, operation.RepositoryID, operation.JobID, operation.MatchTitle, operation.Title).Scan(&active); err != nil {
+			return "", err
+		}
+		if active != 0 {
+			return "", ErrOperationActive
+		}
+	}
+	id := uuid.New().String()
+	if _, err := tx.Exec(`INSERT INTO operations
+		(id, kind, status, title, job_id, repository_id, engine, started_at)
+		VALUES (?, ?, 'queued', ?, ?, ?, COALESCE((SELECT engine FROM repositories WHERE id = ?), ''), ?)`,
+		id, operation.Kind, operation.Title, operation.JobID, operation.RepositoryID,
+		operation.RepositoryID, formatSortableTimestamp(queuedAt)); err != nil {
+		return "", err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// ActivateQueuedOperation moves a queued record to running once its worker
+// holds what it waited for. A manual check or maintenance also marks the
+// vault's last check or maintenance status running here, not when it was
+// queued: until the lock is taken nothing has run, and the startup Restic
+// unlock selection reads that column.
+func ActivateQueuedOperation(db *sql.DB, operationID string) error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var kind, repositoryID string
+	if err := tx.QueryRow(`SELECT kind, repository_id FROM operations WHERE id = ? AND status = 'queued'`,
+		operationID).Scan(&kind, &repositoryID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE operations SET status = 'running' WHERE id = ? AND status = 'queued'`, operationID); err != nil {
+		return err
+	}
+	if kind == "check" || kind == "maintenance" {
+		column := "last_check_status"
+		if kind == "maintenance" {
+			column = "last_maintenance_status"
+		}
+		result, err := tx.Exec(`UPDATE repositories SET `+column+` = 'running' WHERE id = ?`, repositoryID)
+		if err != nil {
+			return err
+		}
+		if count, _ := result.RowsAffected(); count != 1 {
+			return sql.ErrNoRows
+		}
+	}
+	return tx.Commit()
+}
+
+// RepositoryOperationTitle is the title of a check or maintenance record,
+// shared by the scheduler and the manual request so both read the same.
+func RepositoryOperationTitle(kind, repositoryName string) string {
+	return strings.Title(kind) + ": " + repositoryName
 }
 
 // StartRepositoryOperation atomically creates the durable running marker and
@@ -112,6 +176,14 @@ func StartRepositoryOperation(db *sql.DB, repo models.Repository, kind string, s
 	if exists != 1 {
 		return "", sql.ErrNoRows
 	}
+	// A scheduled check or maintenance is skipped while the vault's removal is
+	// pending, the same way a paused vault is: no record, no issue, and the
+	// scheduler tries again on a later tick.
+	if removing, err := vaultRemovalPending(tx, repo.ID); err != nil {
+		return "", err
+	} else if removing {
+		return "", ErrVaultBeingRemoved
+	}
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE repository_id = ? AND kind = ? AND status IN ('queued','running')`, repo.ID, kind).Scan(&active); err != nil {
 		return "", err
 	}
@@ -120,7 +192,7 @@ func StartRepositoryOperation(db *sql.DB, repo models.Repository, kind string, s
 	}
 	id := uuid.New().String()
 	if _, err := tx.Exec(`INSERT INTO operations (id, kind, engine, status, title, repository_id, started_at)
-		VALUES (?, ?, ?, 'running', ?, ?, ?)`, id, kind, repo.Engine, strings.Title(kind)+": "+repo.Name, repo.ID, formatSortableTimestamp(startedAt)); err != nil {
+		VALUES (?, ?, ?, 'running', ?, ?, ?)`, id, kind, repo.Engine, RepositoryOperationTitle(kind, repo.Name), repo.ID, formatSortableTimestamp(startedAt)); err != nil {
 		return "", err
 	}
 	column := "last_check_status"
@@ -177,7 +249,11 @@ func FinishRepositoryOperation(db *sql.DB, operationID string, repo models.Repos
 				return err
 			}
 			next := NextRunFrom(schedule, finishedAt)
-			if kind == "maintenance" && status != "success" {
+			// completed_with_issues means native maintenance itself succeeded and
+			// only a later Replicaro step failed, so the provider locks were
+			// renewed. Counting it as done avoids re-running native maintenance an
+			// hour later for nothing.
+			if kind == "maintenance" && status != "success" && status != "completed_with_issues" {
 				var objectLock models.ObjectLockSettings
 				if err := json.Unmarshal([]byte(objectLockJSON), &objectLock); err != nil {
 					return fmt.Errorf("decode stored object lock settings: %w", err)
@@ -254,6 +330,11 @@ func QueueBackupOperations(
 		}
 		if err := requireKopiaPolicyReady(tx, request.RepositoryID); err != nil {
 			return nil, err
+		}
+		if removing, err := vaultRemovalPending(tx, request.RepositoryID); err != nil {
+			return nil, err
+		} else if removing {
+			return nil, ErrVaultBeingRemoved
 		}
 		if err := tx.QueryRow(`SELECT COUNT(*) FROM operations WHERE job_id = ? AND repository_id = ? AND status IN ('queued', 'running')`, request.JobID, request.RepositoryID).Scan(&activeCount); err != nil {
 			return nil, err
