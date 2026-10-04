@@ -414,7 +414,7 @@ func handlerAtWithSecurityModeAndRcloneAuth(
 		updater = updaters[0]
 	}
 	return handlerAtWithSecurityModeRcloneAuthAndRuntime(
-		db, db, endpoint, nil, record, activate, mode, rcloneAuth, updater, false, operationruntime.New(),
+		db, db, endpoint, nil, record, activate, mode, rcloneAuth, updater, false, false, operationruntime.New(),
 	)
 }
 
@@ -428,6 +428,7 @@ func handlerAtWithSecurityModeRcloneAuthAndRuntime(
 	rcloneAuth *rcloneAuthStore,
 	updater *appupdate.Service,
 	keepStartAtLogin bool,
+	containerPackage bool,
 	runtimeManager *operationruntime.Manager,
 ) http.Handler {
 	// This copy replaces the web UI handler's for every /api/ request, so it
@@ -435,7 +436,7 @@ func handlerAtWithSecurityModeRcloneAuthAndRuntime(
 	security := requestSecurity{
 		endpoint: endpoint, lanOrigins: lanOrigins, mode: normalizedSecurityMode(mode), clientUUID: installationUUID(db),
 	}
-	handler := handlerForExecutionInstanceWithReader(db, readDB, uuid.NewString(), rcloneAuth, updater, keepStartAtLogin, runtimeManager)
+	handler := handlerForExecutionInstanceWithReader(db, readDB, uuid.NewString(), rcloneAuth, updater, keepStartAtLogin, containerPackage, runtimeManager)
 	if record.Version != "" {
 		mux := http.NewServeMux()
 		activationHandler := rendezvous.Handler(record, activate)
@@ -459,7 +460,7 @@ func handlerForExecutionInstance(
 	updater *appupdate.Service,
 	runtimeManagers ...*operationruntime.Manager,
 ) http.Handler {
-	return handlerForExecutionInstanceWithReader(db, db, executionInstanceID, rcloneAuth, updater, false, runtimeManagers...)
+	return handlerForExecutionInstanceWithReader(db, db, executionInstanceID, rcloneAuth, updater, false, false, runtimeManagers...)
 }
 
 // keepStartAtLogin is true only in headless service mode (Linux with
@@ -471,12 +472,16 @@ func handlerForExecutionInstance(
 // tells a remote user that, so the backend keeps the setting on and reports
 // the capability as unavailable, which hides the option in the existing
 // Settings page.
+//
+// containerPackage is true only for the Docker package, where the folder
+// picker starts at / (see resolveBrowsePath).
 func handlerForExecutionInstanceWithReader(
 	db, readDB *sql.DB,
 	executionInstanceID string,
 	rcloneAuth *rcloneAuthStore,
 	updater *appupdate.Service,
 	keepStartAtLogin bool,
+	containerPackage bool,
 	runtimeManagers ...*operationruntime.Manager,
 ) http.Handler {
 	runtimeManager := operationruntime.New()
@@ -526,7 +531,7 @@ func handlerForExecutionInstanceWithReader(
 	})
 
 	handle(mux, "/api/filesystem/directories", func(w http.ResponseWriter, r *http.Request) {
-		listing, err := browseDirectoriesBounded(r.Context(), r.URL.Query().Get("path"))
+		listing, err := browseDirectoriesBounded(r.Context(), r.URL.Query().Get("path"), containerPackage)
 		if errors.Is(err, errDirectoryNotResponding) {
 			writeCodedError(w, http.StatusGatewayTimeout, "directory_not_responding", err.Error())
 			return
@@ -2568,7 +2573,7 @@ func buildServerAtWithSecurityMode(
 	rcloneAuth := newRcloneAuthStore(manualRcloneBrowser...)
 	return buildServerWithRcloneAuth(
 		db, readDB, endpoint, lanOrigins, record, activate, readHeaderTimeout, mode, updater, runtimeManager,
-		rcloneAuth, keepStartAtLogin,
+		rcloneAuth, keepStartAtLogin, false,
 	)
 }
 
@@ -2586,7 +2591,7 @@ func buildContainerServerAtWithSecurityMode(
 ) (*http.Server, func() error) {
 	return buildServerWithRcloneAuth(
 		db, readDB, endpoint, lanOrigins, record, activate, readHeaderTimeout, mode, updater, runtimeManager,
-		newContainerRcloneAuthStore(rcloneAuthRelayPort), false,
+		newContainerRcloneAuthStore(rcloneAuthRelayPort), false, true,
 	)
 }
 
@@ -2602,10 +2607,11 @@ func buildServerWithRcloneAuth(
 	runtimeManager *operationruntime.Manager,
 	rcloneAuth *rcloneAuthStore,
 	keepStartAtLogin bool,
+	containerPackage bool,
 ) (*http.Server, func() error) {
 	server := &http.Server{
 		Handler: applicationHandlerAtWithSecurityModeAndRcloneAuth(
-			db, readDB, endpoint, lanOrigins, record, activate, mode, rcloneAuth, updater, keepStartAtLogin, runtimeManager,
+			db, readDB, endpoint, lanOrigins, record, activate, mode, rcloneAuth, updater, keepStartAtLogin, containerPackage, runtimeManager,
 		),
 		ReadHeaderTimeout: readHeaderTimeout,
 		ReadTimeout:       15 * time.Second,

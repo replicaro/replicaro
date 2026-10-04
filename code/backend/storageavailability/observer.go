@@ -37,10 +37,12 @@ import (
 	"github.com/local/replicaro/vaultidentity"
 )
 
-// DefaultObservationTimeout bounds one helper probe end to end. A probe that
-// hits it is treated as temporarily unreachable storage (pause), never as a
-// missing folder.
-const DefaultObservationTimeout = 5 * time.Second
+// DefaultObservationTimeout is the deadline for one helper probe. It starts
+// before the helper is prepared, and preparation is not interrupted when it
+// expires, so it is not a hard limit on how long a probe takes to return. A
+// probe that hits it is treated as temporarily unreachable storage (pause),
+// never as a missing folder.
+const DefaultObservationTimeout = 10 * time.Second
 const maxConcurrentBatchObservations = 8
 
 var ErrObserverUnavailable = errors.New("bounded storage observation is unavailable")

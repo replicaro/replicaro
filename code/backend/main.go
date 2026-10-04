@@ -81,6 +81,10 @@ type startupOptions struct {
 	loopbackPort            *int
 	containerPublishedPort  *int
 	rcloneAuthNoOpenBrowser bool
+	// noRoot asks the container package to switch from root to noRootUser,
+	// or to defaultNoRootUser when no user was given.
+	noRoot     bool
+	noRootUser *containerUser
 	// lanOrigins lives only in process memory. It is not persisted, has no
 	// environment-variable or settings alias, and is never handed to desktop,
 	// notification, rendezvous, or rclone code, which all stay on loopback.
@@ -116,6 +120,9 @@ Options:
       keeps Start at login on.
   --headless
       Another name for --rclone-auth-no-open-browser.
+  --no-root[=<uid>:<gid>]
+      Docker package only: run as this user and group instead of root.
+      Default: 1000:1000.
   --help, -h
       Show this help and exit.
 `
@@ -133,7 +140,7 @@ func parseStartupOptions(arguments []string) (startupOptions, error) {
 	// --headless is an alias of --rclone-auth-no-open-browser, and both set the
 	// same field. Each spelling is tracked on its own so passing both is
 	// accepted while repeating either one is still rejected.
-	var sawNoOpenBrowser, sawHeadless bool
+	var sawNoOpenBrowser, sawHeadless, sawNoRoot bool
 	for _, argument := range arguments {
 		switch {
 		case strings.HasPrefix(argument, "--loopback-port="):
@@ -194,6 +201,19 @@ func parseStartupOptions(arguments []string) (startupOptions, error) {
 			options.lanOrigins = append(options.lanOrigins, origin)
 		case argument == "--lan-origin":
 			return startupOptions{}, fmt.Errorf("--lan-origin must use exactly --lan-origin=<origin>")
+		case argument == "--no-root", strings.HasPrefix(argument, "--no-root="):
+			if sawNoRoot {
+				return startupOptions{}, fmt.Errorf("--no-root may be supplied only once")
+			}
+			sawNoRoot = true
+			options.noRoot = true
+			if value, ok := strings.CutPrefix(argument, "--no-root="); ok {
+				user, err := parseContainerUser(value)
+				if err != nil {
+					return startupOptions{}, fmt.Errorf("--no-root: %w", err)
+				}
+				options.noRootUser = &user
+			}
 		case strings.HasPrefix(argument, "--help="), strings.HasPrefix(argument, "-h="):
 			// Handled like the other options that take no value, which reject
 			// one (see --headless=), rather than showing help or ignoring it.
@@ -228,6 +248,11 @@ func parseStartupOptions(arguments []string) (startupOptions, error) {
 	// something else), so require the port to be pinned.
 	if len(options.lanOrigins) > 0 && options.loopbackPort == nil && options.containerPublishedPort == nil {
 		return startupOptions{unknownOptions: options.unknownOptions}, fmt.Errorf("--lan-origin requires --loopback-port=<port> or --container-published-port=<port>")
+	}
+	// Only the container package starts as root and can switch users. A
+	// desktop or service install already runs as the user who started it.
+	if options.noRoot && options.containerPublishedPort == nil {
+		return startupOptions{unknownOptions: options.unknownOptions}, fmt.Errorf("--no-root requires --container-published-port=<port>")
 	}
 	return options, nil
 }
@@ -808,6 +833,9 @@ func run() (result error) {
 	}
 	if options.containerPublishedPort != nil {
 		if err := requireContainerRuntime(); err != nil {
+			return err
+		}
+		if err := settleContainerUser(options.noRoot, options.noRootUser); err != nil {
 			return err
 		}
 	}

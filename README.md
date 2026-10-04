@@ -100,8 +100,9 @@ Don't want to search? No problem. You can also explore a vault just like a folde
     <tr><td width="760">Azure Blob Storage</td><td align="center" width="240">✓</td></tr>
     <tr><td width="760">Google Cloud Storage</td><td align="center" width="240">✓</td></tr>
     <tr><td width="760">SFTP/SSH</td><td align="center" width="240">✓</td></tr>
-    <tr><td width="760">WebDAV (Nextcloud, ownCloud, Apache, nginx with the dav-ext module, and other standard WebDAV servers)</td><td align="center" width="240">✓</td></tr>
+    <tr><td width="760">WebDAV (e.g., Nextcloud, ownCloud, Apache, nginx, and more)</td><td align="center" width="240">✓</td></tr>
     <tr><td width="760">Local, external, and mounted storage</td><td align="center" width="240">✓</td></tr>
+    <tr><td width="760">Any remote supported by Rclone</td><td align="center" width="240">✓</td></tr>
   </tbody>
 </table>
 
@@ -151,7 +152,7 @@ Build backup jobs around your data. No need to understand command-line.
   
 - **Removable and network storage detection.**
 
-  - If your source data or destination vault is removable/external/flash storage or a network location, Replicaro automatically pauses backup jobs when that removable or network storage is unavailable and automatically resumes jobs when it becomes available. Yes, Replicaro works even when the namespace (e.g., drive letter) of your removable/external/flash storage changes. It is like magic.
+  - If your source data or destination vault is removable/external/flash storage or a network location, Replicaro automatically pauses backup jobs when that removable or network storage is unavailable and automatically resumes jobs when it becomes available. It is like magic.
 
 - **Object lock & immutability.**
 
@@ -224,7 +225,7 @@ The canonical English interface catalog is at
 Translations are contributed through pull requests and require review before
 they are included in the app. A new catalog is a candidate until a maintainer
 explicitly registers its locale in the frontend catalog registry, backend
-catalog loader, and supported language setting. The v1.0.4 source includes
+catalog loader, and supported language setting. The v1.0.5 source includes
 English, German, French, Arabic, Urdu, Hindi, Spanish, Italian, Simplified
 Chinese (Mandarin), Traditional Chinese (Cantonese), Japanese, Irish, Korean,
 Malay, Indonesian, Turkish, Hebrew, European Portuguese, Brazilian Portuguese,

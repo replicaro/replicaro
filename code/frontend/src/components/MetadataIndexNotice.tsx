@@ -28,7 +28,7 @@ export function MetadataIndexNotice({
 			? known > 0 ? t("ui.metadataIndex.contentsProgress", { processed, known }) : t("ui.metadataIndex.contents")
 			: t("ui.metadataIndex.snapshots");
 	return <div className="inline-notice metadata-index-notice" role="status">
-		{!paused && <span className="spinner" />}
+		<span className="spinner" />
 		<span><strong>{message}</strong>
 			{blockSearchAndBrowse && <span>{t("ui.components.metadataindexnotice.search.and.browsing.is.disabled.while.indexing.completes")}</span>}
 			<span>{t("ui.components.metadataindexnotice.you.can.safely.close.this.page.if.you.need.to.indexing.will.resume.in")}</span>

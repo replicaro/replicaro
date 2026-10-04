@@ -1,4 +1,4 @@
-import { formatDisplayDate, formatDisplayNumber, getEffectiveLocale, renderMessage, t } from "../i18n";
+import { formatDisplayDate, formatDisplayNumber, formatDisplayTime, renderMessage, t } from "../i18n";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { Link, useSearchParams } from "react-router-dom";
@@ -154,11 +154,7 @@ function eventTime(value: string) {
 
     const today = new Date();
     if (date.toDateString() === today.toDateString()) {
-        return date.toLocaleTimeString(getEffectiveLocale(), {
-            hour: "2-digit",
-            minute: "2-digit",
-            hour12: true,
-        });
+        return formatDisplayTime(date, { hour: "2-digit", minute: "2-digit" });
     }
     return formatDisplayDate(date, { month: "short", day: "numeric" });
 }
@@ -1178,11 +1174,11 @@ export default function Overview() {
 						<div className="modal-section-label">{t("ui.pages.overview.live.log")}</div>
                         {!detailedOperationActive && <button type="button" className="text-button" aria-pressed={showRawLog} onClick={() => setShowRawLog((raw) => !raw)}>{showRawLog ? t("ui.pages.overview.show.readable.log") : t("ui.pages.overview.show.raw.log")}</button>}
 						{detailedOperationActive ? !operationDetail ? (
-							<p className="muted">{t("ui.pages.overview.waiting.for.output")}</p>
+							<p className="row muted"><span className="spinner" />{t("ui.pages.overview.waiting.for.output")}</p>
 						) : !operationDetail.live.available ? (
 							<p className="muted">{t("ui.pages.overview.live.output.is.unavailable.for.this.operation")}</p>
 						) : operationDetail.live.entries.length === 0 ? (
-							<p className="muted">{t("ui.pages.overview.waiting.for.output")}</p>
+							<p className="row muted"><span className="spinner" />{t("ui.pages.overview.waiting.for.output")}</p>
 						) : (
 							<pre className="output operation-live-log" aria-live="polite">{[
 								// The live log is never translated, including this marker;

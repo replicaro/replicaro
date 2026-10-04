@@ -1001,10 +1001,21 @@ function targetStatusLabel(status: string) {
 	}
 }
 
-// The backend reports a failed Vault Size refresh as a stable code rather than
-// text. Anything else it sends is shown as it arrives.
+// The backend reports a failed Vault Size refresh as a stable code naming the
+// step that failed, never the native error. A code this version doesn't know
+// gets the generic sentence.
+const vaultSizeFailureMessages: Record<string, () => string> = {
+	vault_size_storage_unreachable: () => t("ui.protect.vaultSizeFailure.storageUnreachable"),
+	vault_size_settings_changed: () => t("ui.protect.vaultSizeFailure.settingsChanged"),
+	vault_size_preparation_failed: () => t("ui.protect.vaultSizeFailure.preparationFailed"),
+	vault_size_timed_out: () => t("ui.protect.vaultSizeFailure.timedOut"),
+	vault_size_measurement_failed: () => t("ui.protect.vaultSizeFailure.measurementFailed"),
+	vault_size_result_unreadable: () => t("ui.protect.vaultSizeFailure.resultUnreadable"),
+	vault_size_save_failed: () => t("ui.protect.vaultSizeFailure.saveFailed"),
+};
+
 function vaultSizeFailureText(failure: string) {
-	return failure === "vault_size_refresh_failed" ? t("ui.protect.vaultSizeRefreshFailed") : failure;
+	return (Object.hasOwn(vaultSizeFailureMessages, failure) ? vaultSizeFailureMessages[failure] : () => t("ui.protect.vaultSizeRefreshFailed"))();
 }
 
 type JobSort = "newest" | "oldest" | "name-asc" | "name-desc";
@@ -5429,8 +5440,14 @@ export default function Protect() {
 								<div className={`vault-stat vault-size-stat${statsActive ? " is-refreshing" : ""}`} inert={cardBlocked || undefined}>
 									<div className="vault-size-summary">{sizePresentation ? <Tooltip content={sizePresentation.tooltip}><span className="vault-size-value" aria-label={sizePresentation.display}><strong>{sizePresentation.display}</strong></span></Tooltip> : <strong>{t("ui.pages.protect.not.measured.yet")}</strong>}<span>{t("ui.pages.protect.vault.size")}</span></div>
 									<div className="vault-size-meta"><small>{t("ui.protect.sizeStatsUpdated", { time: stats.vaultSizeMeasuredAt ? timeAgo(stats.vaultSizeMeasuredAt) : t("ui.protect.notMeasuredYet") })}</small><Tooltip content={t("ui.pages.protect.replicaro.periodically.refreshes.vault.size.stats.you.can.force.a.refr")}><button className="vault-stats-refresh" aria-label={t("ui.pages.protect.refresh.stats.now")} disabled={cardBlocked} onClick={() => refreshVaultSize(repo.id)}>{t("ui.pages.protect.refresh.stats.now")}</button></Tooltip></div>
-									{statsActive && <span className="vault-stats-refreshing">{!stats.paused && <span className="spinner" />}<span><strong>{statsStatus}</strong><span>{t("ui.pages.protect.you.can.safely.close.this.page.if.you.need.to.refreshing.will.resume.i")}</span></span></span>}
-									{stats.failure && <small className="recovery-warning">{vaultSizeFailureText(stats.failure)}</small>}
+									{statsActive && <span className="vault-stats-refreshing"><span className="spinner" /><span><strong>{statsStatus}</strong><span>{t("ui.pages.protect.you.can.safely.close.this.page.if.you.need.to.refreshing.will.resume.i")}</span></span></span>}
+									{stats.failure && <small className="recovery-warning vault-size-failure">
+										{/* The message stays on one line so the card doesn't grow; the
+										    tooltip shows it in full. The clipping is on the inner span
+										    because the tooltip popup lives inside the trigger. */}
+										<Tooltip content={vaultSizeFailureText(stats.failure)}><span className="vault-size-failure-message"><span>{vaultSizeFailureText(stats.failure)}</span></span></Tooltip>
+										<button className="vault-stats-refresh" disabled={cardBlocked} onClick={() => refreshVaultSize(repo.id)}>{t("ui.protect.vaultSizeTryAgain")}</button>
+									</small>}
 								</div>
 								<div className="row-actions vault-actions" inert={cardBlocked || undefined}>
 									{reconnectRequired && <button className="btn sm danger" disabled={cardBlocked} onClick={() => void openSavedVaultReconnect(repo)}>{t("ui.pages.protect.reconnect")}</button>}

@@ -185,10 +185,34 @@ export function formatDisplayDate(value: Date, options: Intl.DateTimeFormatOptio
     return value.toLocaleDateString(locale, { ...options, calendar: "gregory" });
 }
 
+// The clock style comes from the browser, not the UI language: a 24-hour
+// browser gets 24-hour times, and everything else (including a browser that
+// can't say) gets 12-hour. Web pages can't read the OS clock setting itself,
+// so Chrome and Edge report their own language/region convention here.
+// "h23" avoids engines that print midnight as 24:00 for hour12: false, and
+// hour12: true lets each language pick its own 12-hour form.
+function browserClockOptions(): Intl.DateTimeFormatOptions {
+    try {
+        const hourCycle = new Intl.DateTimeFormat(undefined, { hour: "numeric" }).resolvedOptions().hourCycle;
+        if (hourCycle === "h23" || hourCycle === "h24") return { hourCycle: "h23" };
+    } catch {
+        // Fall through to the 12-hour default.
+    }
+    return { hour12: true };
+}
+
+function withClock(options: Intl.DateTimeFormatOptions): Intl.DateTimeFormatOptions {
+    return options.hour === undefined ? options : { ...options, ...browserClockOptions() };
+}
+
 export function formatDisplayDateTime(value: Date, options: Intl.DateTimeFormatOptions, locale: string = effectiveLocale): string {
     // Apply the same calendar rule to timestamps without changing their instant
     // or time zone. Native output and serialized timestamps stay untouched.
-    return value.toLocaleString(locale, { ...options, calendar: "gregory" });
+    return value.toLocaleString(locale, { ...withClock(options), calendar: "gregory" });
+}
+
+export function formatDisplayTime(value: Date, options: Intl.DateTimeFormatOptions, locale: string = effectiveLocale): string {
+    return value.toLocaleTimeString(locale, { ...withClock(options), calendar: "gregory" });
 }
 
 function interpolate(template: string, values: Record<string, string | number>, locale: string): string {

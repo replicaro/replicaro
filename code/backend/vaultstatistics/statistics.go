@@ -29,10 +29,53 @@ const (
 	maximumOutputBytes = 1 << 20
 )
 
-// RefreshFailed is the failure code the status reports after a refresh
-// fails. The UI turns it into translated text, so it is a stable code and not
-// a sentence.
-const RefreshFailed = "vault_size_refresh_failed"
+// Failure codes the status reports after a refresh fails. Each one names the
+// step that failed and never the native error: Vault Size runs rclone with
+// private output, so its messages are not kept. The UI turns the codes into
+// translated text, so they are stable codes and not sentences.
+// RefreshFailed covers everything the other codes don't.
+const (
+	RefreshFailed             = "vault_size_refresh_failed"
+	FailureStorageUnreachable = "vault_size_storage_unreachable"
+	FailureSettingsChanged    = "vault_size_settings_changed"
+	FailurePreparation        = "vault_size_preparation_failed"
+	FailureTimedOut           = "vault_size_timed_out"
+	FailureMeasurement        = "vault_size_measurement_failed"
+	FailureResultUnreadable   = "vault_size_result_unreadable"
+	FailureSaveFailed         = "vault_size_save_failed"
+)
+
+// stepError tags an error with the failure code of the step that returned it.
+type stepError struct {
+	code string
+	err  error
+}
+
+func (e *stepError) Error() string { return e.err.Error() }
+func (e *stepError) Unwrap() error { return e.err }
+
+func failAt(code string, err error) error { return &stepError{code: code, err: err} }
+
+// failureCode picks the code for a failed refresh from the error's type alone.
+// An identity mismatch is reported as a storage-unavailable error too, but it
+// is not an unreachable storage, so it stays under RefreshFailed.
+func failureCode(err error) string {
+	var step *stepError
+	if errors.As(err, &step) {
+		return step.code
+	}
+	var unavailable *storageavailability.RepositoryStorageUnavailableError
+	if errors.As(err, &unavailable) {
+		if unavailable.ReasonCode == database.AvailabilityReasonIdentityMismatch {
+			return RefreshFailed
+		}
+		return FailureStorageUnreachable
+	}
+	if errors.Is(err, storageavailability.ErrRepositoryStorageUnavailable) {
+		return FailureStorageUnreachable
+	}
+	return RefreshFailed
+}
 
 var (
 	materializeRclone = rclone.Materialize
@@ -206,7 +249,11 @@ func (c *coordinator) run(db *sql.DB, repo models.Repository) {
 			break
 		}
 		if reloadErr != nil || currentRepo.Engine != repo.Engine || currentRepo.Connector != repo.Connector {
-			err = errors.Join(reloadErr, fmt.Errorf("queued Vault Size authority changed before measurement"))
+			authorityErr := fmt.Errorf("queued Vault Size authority changed before measurement")
+			if reloadErr == nil {
+				authorityErr = failAt(FailureSettingsChanged, authorityErr)
+			}
+			err = errors.Join(reloadErr, authorityErr)
 			unlock()
 			break
 		}
@@ -222,7 +269,9 @@ func (c *coordinator) run(db *sql.DB, repo models.Repository) {
 				c.mu.Unlock()
 				bytes, measureErr := measureVaultSize(workContext, currentRepo)
 				if measureErr == nil && context.Cause(workContext) == nil && c.ctx.Err() == nil {
-					measureErr = database.PublishVaultSize(db, currentRepo.ID, bytes, now())
+					if publishErr := database.PublishVaultSize(db, currentRepo.ID, bytes, now()); publishErr != nil {
+						measureErr = failAt(FailureSaveFailed, publishErr)
+					}
 				}
 				releaseAdmission()
 				err = measureErr
@@ -250,7 +299,7 @@ func (c *coordinator) run(db *sql.DB, repo models.Repository) {
 	delete(c.pending, repo.ID)
 	delete(c.paused, repo.ID)
 	if err != nil && c.ctx.Err() == nil && !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-		c.failures[repo.ID] = RefreshFailed
+		c.failures[repo.ID] = failureCode(err)
 		_ = database.LogWarning(db, "Vault Size refresh failed for vault "+repo.ID)
 	}
 	c.mu.Unlock()
@@ -259,7 +308,7 @@ func (c *coordinator) run(db *sql.DB, repo models.Repository) {
 func Measure(ctx context.Context, repo models.Repository) (result int64, err error) {
 	base, err := vaultprofile.BaseRemoteForVault(repo)
 	if err != nil {
-		return 0, fmt.Errorf("prepare base vault root")
+		return 0, failAt(FailurePreparation, fmt.Errorf("prepare base vault root"))
 	}
 	// An Any Rclone Remote vault reads the user's own config file in place and
 	// has no canonical config binding; its run environment is added after the
@@ -270,23 +319,23 @@ func Measure(ctx context.Context, repo models.Repository) (result int64, err err
 	if repo.Connector == engines.RcloneRemoteConnector {
 		run, runErr := engines.RcloneRemoteRunForRepository(repo)
 		if runErr != nil {
-			return 0, fmt.Errorf("prepare rclone remote: %w", runErr)
+			return 0, failAt(FailurePreparation, fmt.Errorf("prepare rclone remote: %w", runErr))
 		}
 		configPath, rcloneRemoteEnv = run.ConfigFile, run.Env
 	} else {
 		binding, err = engines.OpenExistingRcloneStatisticsConfigBinding(ctx, repo)
 		if err != nil {
-			return 0, fmt.Errorf("open canonical rclone configuration")
+			return 0, failAt(FailurePreparation, fmt.Errorf("open canonical rclone configuration"))
 		}
 		defer func() { err = errors.Join(err, binding.Close()) }()
 		configPath = binding.NativePath()
 	}
 	binary, err := materializeRclone()
 	if err != nil {
-		return 0, fmt.Errorf("prepare pinned rclone")
+		return 0, failAt(FailurePreparation, fmt.Errorf("prepare pinned rclone"))
 	}
 	if err := binding.Revalidate(ctx); err != nil {
-		return 0, fmt.Errorf("validate canonical rclone configuration")
+		return 0, failAt(FailureSettingsChanged, fmt.Errorf("validate canonical rclone configuration"))
 	}
 	environment := append([]string(nil), base.Env...)
 	for index, item := range environment {
@@ -297,18 +346,18 @@ func Measure(ctx context.Context, repo models.Repository) (result int64, err err
 		obscuredOutput, obscureErr := runRclone(ctx, binary,
 			[]string{"obscure", "-", "--config", configPath}, nil, raw+"\n", time.Minute, "rclone")
 		if obscureErr != nil {
-			return 0, fmt.Errorf("prepare connector credential")
+			return 0, failAt(FailurePreparation, fmt.Errorf("prepare connector credential"))
 		}
 		obscured := strings.TrimSpace(obscuredOutput)
 		if obscured == "" || strings.ContainsAny(obscured, "\r\n") {
-			return 0, fmt.Errorf("prepare connector credential")
+			return 0, failAt(FailurePreparation, fmt.Errorf("prepare connector credential"))
 		}
 		environment[index] = key + "=" + obscured
 	}
 	environment = append(environment, rcloneRemoteEnv...)
 	launchContext := command.ContextWithBeforeProcess(ctx, func(check context.Context) error {
 		if err := binding.Revalidate(check); err != nil {
-			return err
+			return failAt(FailureSettingsChanged, err)
 		}
 		return storageavailability.RequireRepositoryAvailable(check, repo)
 	})
@@ -317,9 +366,41 @@ func Measure(ctx context.Context, repo models.Repository) (result int64, err err
 		environment, "", 10*time.Minute, "rclone")
 	postErr := binding.Revalidate(context.WithoutCancel(ctx))
 	if nativeErr != nil || postErr != nil {
-		return 0, fmt.Errorf("native Vault Size measurement failed")
+		// Only the error's type picks the code; nativeErr is not wrapped, so
+		// none of rclone's private output can reach the status or the log.
+		return 0, failAt(nativeFailureCode(ctx, nativeErr), fmt.Errorf("native Vault Size measurement failed"))
 	}
-	return ParseSizeOutput(output)
+	bytes, err := ParseSizeOutput(output)
+	if err != nil {
+		return 0, failAt(FailureResultUnreadable, err)
+	}
+	return bytes, nil
+}
+
+// nativeFailureCode classifies a failed size command. With no command error,
+// the configuration check after the command failed, so the settings changed
+// while it ran. The check just before launch tags its own error, and storage
+// errors keep their code. Any other failure before the process started (such
+// as attaching it to its process tree) is not the storage's error, so it is
+// unexpected. A deadline that isn't the caller's own is the command's time
+// limit.
+func nativeFailureCode(ctx context.Context, nativeErr error) string {
+	if nativeErr == nil {
+		return FailureSettingsChanged
+	}
+	var step *stepError
+	var unavailable *storageavailability.RepositoryStorageUnavailableError
+	if errors.As(nativeErr, &step) || errors.As(nativeErr, &unavailable) || errors.Is(nativeErr, storageavailability.ErrRepositoryStorageUnavailable) {
+		return failureCode(nativeErr)
+	}
+	var beforeLaunch *command.PreProcessAdmissionError
+	if errors.As(nativeErr, &beforeLaunch) {
+		return RefreshFailed
+	}
+	if errors.Is(nativeErr, context.DeadlineExceeded) && ctx.Err() == nil {
+		return FailureTimedOut
+	}
+	return FailureMeasurement
 }
 
 func ParseSizeOutput(output string) (int64, error) {

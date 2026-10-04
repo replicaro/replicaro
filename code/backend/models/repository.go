@@ -323,8 +323,9 @@ type VaultSizeStatus struct {
 	Running             bool   `json:"running"`
 	Pending             bool   `json:"pending"`
 	Paused              bool   `json:"paused"`
-	// Failure is a stable code, such as "vault_size_refresh_failed", that the
-	// UI maps to translated text.
+	// Failure is a stable code naming the step that failed, such as
+	// "vault_size_storage_unreachable", that the UI maps to translated text.
+	// It never carries native error text.
 	Failure string `json:"failure,omitempty"`
 }
 

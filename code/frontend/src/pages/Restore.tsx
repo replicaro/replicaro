@@ -1,4 +1,4 @@
-import { formatDisplayDate, formatDisplayNumber, getEffectiveLocale, renderMessage, t } from "../i18n";
+import { formatDisplayDate, formatDisplayNumber, formatDisplayTime, renderMessage, t } from "../i18n";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
@@ -78,7 +78,7 @@ function fullDate(value: string) {
 
 function snapshotTime(value: string) {
     const date = parseTime(value);
-    return date?.toLocaleTimeString(getEffectiveLocale(), { hour: "2-digit", minute: "2-digit", hour12: false }) ?? "—";
+    return date ? formatDisplayTime(date, { hour: "2-digit", minute: "2-digit" }) : "—";
 }
 
 // A managed snapshot's source is shown as its job's name (see

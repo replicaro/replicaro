@@ -282,6 +282,18 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/container_user.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/container_user_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/container_user_other.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/database/activity.go",
       "mode": "100644"
     },

@@ -32,7 +32,7 @@ func ApplicationHandlerAt(db *sql.DB, endpoint runtimeendpoint.Endpoint, record 
 
 func ApplicationHandlerAtWithSecurityMode(db *sql.DB, endpoint runtimeendpoint.Endpoint, record rendezvous.Record, activate func() error, mode SecurityMode) http.Handler {
 	return applicationHandlerAtWithSecurityModeAndRcloneAuth(
-		db, db, endpoint, nil, record, activate, mode, newRcloneAuthStore(), appupdate.New(db), false,
+		db, db, endpoint, nil, record, activate, mode, newRcloneAuthStore(), appupdate.New(db), false, false,
 	)
 }
 
@@ -46,6 +46,7 @@ func applicationHandlerAtWithSecurityModeAndRcloneAuth(
 	rcloneAuth *rcloneAuthStore,
 	updater *appupdate.Service,
 	keepStartAtLogin bool,
+	containerPackage bool,
 	runtimeManagers ...*operationruntime.Manager,
 ) http.Handler {
 	runtimeManager := operationruntime.New()
@@ -58,7 +59,7 @@ func applicationHandlerAtWithSecurityModeAndRcloneAuth(
 		endpoint: endpoint, lanOrigins: lanOrigins, mode: normalizedSecurityMode(mode), clientUUID: installationUUID(db),
 	}
 	apiHandler := handlerAtWithSecurityModeRcloneAuthAndRuntime(
-		db, readDB, endpoint, lanOrigins, record, activate, mode, rcloneAuth, updater, keepStartAtLogin, runtimeManager,
+		db, readDB, endpoint, lanOrigins, record, activate, mode, rcloneAuth, updater, keepStartAtLogin, containerPackage, runtimeManager,
 	)
 	webUI, err := webUIFileSystem()
 	if err == nil {

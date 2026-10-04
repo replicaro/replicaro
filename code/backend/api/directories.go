@@ -69,8 +69,8 @@ var listPickerDirectory = listDirectory
 // browseDirectoriesBounded is the picker endpoint's entry point: the path is
 // resolved lexically first, and only the filesystem work runs in the shared
 // per-path call under directoryListingTimeout.
-func browseDirectoriesBounded(ctx context.Context, requested string) (directoryListing, error) {
-	abs, err := resolveBrowsePath(requested)
+func browseDirectoriesBounded(ctx context.Context, requested string, containerPackage bool) (directoryListing, error) {
+	abs, err := resolveBrowsePath(requested, containerPackage)
 	if err != nil {
 		return directoryListing{}, err
 	}
@@ -105,10 +105,18 @@ func browseDirectoriesBounded(ctx context.Context, requested string) (directoryL
 
 // resolveBrowsePath is lexical only (plus the home directory lookup), so it
 // never blocks on the storage being browsed.
-func resolveBrowsePath(requested string) (string, error) {
+//
+// An empty path opens the user's home folder, except in the Docker package.
+// There HOME is Replicaro's own folder inside its state volume, which no one
+// should pick or mount over, and the user's folders are bind mounts at paths
+// they chose, so the picker starts at / where those mounts are visible.
+func resolveBrowsePath(requested string, containerPackage bool) (string, error) {
 	// Keep whitespace in the chosen route; normalization below rejects `..`
 	// before cleanup so browsing cannot silently choose another directory.
 	path := requested
+	if path == "" && containerPackage {
+		path = "/"
+	}
 	if path == "" {
 		var err error
 		path, err = os.UserHomeDir()
