@@ -234,7 +234,7 @@ func SetClockForTests(clock func() time.Time) func() {
 }
 
 // SetNotificationDispatchForTests replaces notification delivery.
-func SetNotificationDispatchForTests(next func(string, bool, bool, notifications.Event, func(error))) func() {
+func SetNotificationDispatchForTests(next func([]string, bool, bool, notifications.Event, func(error))) func() {
 	previous := dispatchNotification
 	dispatchNotification = next
 	return func() { dispatchNotification = previous }
@@ -457,7 +457,7 @@ func markRequired(db *sql.DB, repositoryID, source string, notify bool) {
 	event := notifications.Event{
 		Event: "reconnect", Status: status, Locale: effective, MessageKey: MessageKey, MessageValues: values,
 	}
-	dispatchNotification(settings.WebhookURL, native, webhook, event, func(err error) {
+	dispatchNotification(settings.NotificationURLs, native, webhook, event, func(err error) {
 		if err != nil {
 			_ = database.LogError(db, "Notification failed: "+err.Error())
 		}
@@ -493,7 +493,7 @@ func reportOutOfSpace(db *sql.DB, repositoryID string) {
 		Event: "kopia_policy", Status: status, Locale: locale.Effective(settings.Language),
 		MessageKey: OutOfSpaceMessageKey, MessageValues: map[string]string{"vaultName": name},
 	}
-	dispatchNotification(settings.WebhookURL, native, webhook, event, func(err error) {
+	dispatchNotification(settings.NotificationURLs, native, webhook, event, func(err error) {
 		if err != nil {
 			_ = database.LogError(db, "Notification failed: "+err.Error())
 		}

@@ -46,13 +46,24 @@ type Settings struct {
 	NotifyWebhookOnSuccess       bool   `json:"notifyWebhookOnSuccess"`
 	NotifyWebhookOnFailure       bool   `json:"notifyWebhookOnFailure"`
 
+	// NotificationURLs is the System page's list of http(s) JSON webhooks and
+	// shoutrrr-style URLs, sent when the notifyWebhook switches above say so.
+	// GetSettings always returns a non-nil list. SaveSettings leaves the
+	// stored list alone when it is nil, so a caller that didn't load the list
+	// can't clear it by accident. WebhookURL is the older single-webhook
+	// setting: nothing sends to it any more, and SaveSettings derives it from
+	// this list so an older build keeps its webhook after a downgrade.
+	NotificationURLs []string `json:"notificationUrls"`
+
 	StartWithWindows             bool `json:"startWithWindows"`
 	StartAtLogin                 bool `json:"startAtLogin"`
 	MaxConcurrentJobRuns         int  `json:"maxConcurrentJobRuns"`
 	DisableAutomaticUpdateChecks bool `json:"disableAutomaticUpdateChecks"`
 }
 
-// NotificationChannels picks the channels for one finished operation status.
+// NotificationChannels picks the channels for one finished operation status:
+// native desktop notifications and the notification URL list (whose switches
+// keep their older notifyWebhook names).
 // A completed_with_issues result is part success and part failure, so a
 // channel sends it when either its success or its failure switch is on. The
 // result is still one notification per channel: turning both switches on does

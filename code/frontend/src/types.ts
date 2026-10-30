@@ -552,7 +552,10 @@ export interface Settings {
     defaultEngine: "restic" | "kopia";
     logRetentionDays: number;
     theme: ThemePreference;
+    /** Read-only now: the server sets it to the first http(s) entry of notificationUrls and ignores it on save. */
     webhookUrl: string;
+    /** http(s) entries go to the JSON webhook, other schemes are shoutrrr-style URLs. notifyWebhookOn* apply to all of them. */
+    notificationUrls: string[];
     notifyWindowsOnSuccess: boolean;
     notifyWindowsOnFailure: boolean;
     nativeNotificationsOnSuccess?: boolean;

@@ -31,6 +31,7 @@ import (
 	"github.com/local/replicaro/locale"
 	"github.com/local/replicaro/metadata"
 	"github.com/local/replicaro/models"
+	"github.com/local/replicaro/notifications"
 	"github.com/local/replicaro/operationlog"
 	"github.com/local/replicaro/operationruntime"
 	"github.com/local/replicaro/platforms"
@@ -2502,12 +2503,22 @@ func handlerForExecutionInstanceWithReader(
 				badRequest(w, "max concurrent job runs must be between 1 and 32")
 				return
 			}
+			// nil leaves the stored list alone (see models.Settings).
+			var notificationURLs []string
+			if req.NotificationURLs != nil {
+				checked, err := notifications.CheckURLs(*req.NotificationURLs)
+				if err != nil {
+					badRequest(w, err.Error())
+					return
+				}
+				notificationURLs = checked
+			}
 			err := database.SaveSettings(db, models.Settings{
 				DefaultEngine:                req.DefaultEngine,
 				LogRetentionDays:             req.LogRetentionDays,
 				Theme:                        req.Theme,
 				Language:                     language,
-				WebhookURL:                   req.WebhookURL,
+				NotificationURLs:             notificationURLs,
 				NotifyWindowsOnSuccess:       req.NotifyWindowsOnSuccess || req.NativeNotificationsOnSuccess,
 				NotifyWindowsOnFailure:       req.NotifyWindowsOnFailure || req.NativeNotificationsOnFailure,
 				NativeNotificationsOnSuccess: req.NativeNotificationsOnSuccess || req.NotifyWindowsOnSuccess,
@@ -2541,6 +2552,29 @@ func handlerForExecutionInstanceWithReader(
 
 			w.WriteHeader(http.StatusOK)
 		}
+	})
+
+	// Sends a test notification to the URLs as typed in the settings box,
+	// before they are saved. It ignores the success/failure switches and
+	// writes no operation or log entry; the page shows each URL's outcome.
+	handle(mux, "/api/settings/notification-urls/test", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			URLs []string `json:"urls"`
+		}
+		if err := decodeRequest(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		language := ""
+		if settings, err := database.GetSettings(readDB); err == nil {
+			language = settings.Language
+		}
+		results, err := notifications.SendTest(r.Context(), req.URLs, locale.Effective(language))
+		if err != nil {
+			badRequest(w, err.Error())
+			return
+		}
+		writeJSON(w, map[string]any{"results": results})
 	})
 
 	handle(mux, "/api/vault-profile-sync", func(w http.ResponseWriter, r *http.Request) {

@@ -95,22 +95,45 @@ func NormalizeConnectorOptions(engine string, integration integrations.Integrati
 	return normalized, nil
 }
 
-// NormalizeStorageOptions applies engine-neutral storage defaults while
-// preserving the distinction between an omitted host-key option and an
-// explicitly unsafe choice. Password authentication defaults to verification;
-// an explicit opt-out remains available to validation so it can fail closed.
+// NormalizeStorageOptions applies the catalog's engine-neutral defaults and
+// rejects options the catalog doesn't list. It runs only when connector
+// settings are entered or changed (create, Check/connect of an existing vault
+// and their retries, credential updates), never when a saved vault is used.
 func NormalizeStorageOptions(integration integrations.Integration, provided map[string]string) (map[string]string, error) {
 	normalized, err := integrations.NormalizeOptions(integration, provided)
 	if err != nil {
 		return nil, err
 	}
-	_, hostKeyOptionProvided := provided["insecure_ignore_host_key"]
-	if integration.ID == "sftp" &&
-		strings.TrimSpace(normalized["password"]) != "" &&
-		!hostKeyOptionProvided {
-		normalized["insecure_ignore_host_key"] = "false"
+	if integration.ID == "sftp" {
+		if err := validateSFTPSignIn(normalized); err != nil {
+			return nil, err
+		}
 	}
 	return normalized, nil
+}
+
+// validateSFTPSignIn requires an SFTP key file or SSH agent socket.
+//
+// Every vault also gets the rclone recovery sidecar, which signs in to the
+// server separately from the engine. On Linux, macOS and in Docker, rclone can
+// only use an agent if we hand it the socket (child processes don't inherit
+// SSH_AUTH_SOCK), and it doesn't read OpenSSH's default keys or ~/.ssh/config
+// the way ssh does for Restic and Kopia's external mode. A vault with both
+// fields blank would pass validation and then fail at the sidecar preflight
+// with only the generic sidecar error. On Windows, rclone and OpenSSH can fall
+// back to Pageant or the Windows OpenSSH agent pipe, but we still ask for one
+// of the two fields so the vault states how it signs in instead of depending
+// on whichever agent happens to be running.
+//
+// This lives here rather than in ValidateStorageOptions so it only runs when
+// the settings are entered or changed. Vaults saved before this rule keep
+// running with their saved settings. Only blankness is trimmed; the key
+// filename itself is passed on exactly as entered.
+func validateSFTPSignIn(options map[string]string) error {
+	if strings.TrimSpace(options["identity"]) == "" && strings.TrimSpace(options["ssh_auth_sock"]) == "" {
+		return errors.New("SFTP vaults need an SSH identity/key file or an SSH agent socket.")
+	}
+	return nil
 }
 
 // ValidateStorageOptions rejects ambiguous authentication combinations before
@@ -130,9 +153,6 @@ func ValidateStorageOptions(connector string, options map[string]string) error {
 		}
 		if err := validateSFTPPrivateKeyFormat(options); err != nil {
 			return err
-		}
-		if strings.TrimSpace(options["password"]) != "" && boolOption(options, "insecure_ignore_host_key") {
-			return fmt.Errorf("SFTP password authentication requires host-key verification")
 		}
 		if strings.TrimSpace(options["root"]) != "" {
 			return fmt.Errorf("SFTP root overrides are unsupported; use the vault path and path mode")
@@ -201,9 +221,6 @@ func validateSFTPPrivateKeyFormat(options map[string]string) error {
 			return fmt.Errorf("%s", guidance)
 		}
 	}
-	if isPuTTYPrivateKey([]byte(strings.TrimSpace(options["ssh_private_key"]))) {
-		return fmt.Errorf("%s", guidance)
-	}
 	return nil
 }
 
@@ -226,36 +243,6 @@ func readPrivateKeyPrefix(path string) []byte {
 	return data[:n]
 }
 
-// ValidateSFTPKnownHosts ensures password-bearing Kopia invocations cannot
-// outlive an earlier preview's host-key trust prerequisite.
-func ValidateSFTPKnownHosts(options map[string]string) (string, error) {
-	if strings.TrimSpace(options["password"]) == "" {
-		return "", nil
-	}
-	if boolOption(options, "insecure_ignore_host_key") {
-		return "", fmt.Errorf("Kopia SFTP password authentication requires host-key verification")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil || strings.TrimSpace(home) == "" {
-		if err == nil {
-			err = fmt.Errorf("user home is empty")
-		}
-		return "", fmt.Errorf("resolve SSH known_hosts: %w", err)
-	}
-	knownHosts := filepath.Join(home, ".ssh", "known_hosts")
-	info, err := os.Stat(knownHosts)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", fmt.Errorf("SSH known_hosts file %q is required for Kopia SFTP password authentication; add this server's host key before retrying", knownHosts)
-		}
-		return "", fmt.Errorf("inspect SSH known_hosts file: %w", err)
-	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("SSH known_hosts path %q is not a regular file", knownHosts)
-	}
-	return knownHosts, nil
-}
-
 func ValidateConnectorOptions(engine, connector string, options map[string]string) error {
 	connector = strings.ToLower(strings.TrimSpace(connector))
 	if !SupportsConnector(engine, connector) {
@@ -273,19 +260,10 @@ func ValidateConnectorOptions(engine, connector string, options map[string]strin
 		if identity := options["identity"]; strings.EqualFold(filepath.Ext(identity), ".ppk") {
 			return fmt.Errorf("PuTTY .ppk keys are not supported by the selected native SFTP tools; export the key in unencrypted OpenSSH private-key format")
 		}
-		if engine == KopiaID && strings.TrimSpace(options["password"]) != "" && sftpKeyAuthenticationConfigured(options) {
-			return fmt.Errorf("%s SFTP accepts either a password or an SSH key, not both", engine)
-		}
-		if engine == KopiaID && strings.TrimSpace(options["password"]) != "" && boolOption(options, "insecure_ignore_host_key") {
-			return fmt.Errorf("Kopia SFTP password authentication requires host-key verification")
-		}
 		if engine == KopiaID && boolOption(options, "insecure_ignore_host_key") {
 			if err := validateKopiaSFTPIdentityPath(options["identity"]); err != nil {
 				return err
 			}
-		}
-		if engine != KopiaID && strings.TrimSpace(options["password"]) != "" {
-			return fmt.Errorf("%s SFTP does not support password authentication; use an SSH identity/key file or agent", engine)
 		}
 	case "azblob":
 		account, key := azureCredentials(options)
@@ -331,15 +309,6 @@ func ValidateConnectorOptions(engine, connector string, options map[string]strin
 		}
 	}
 	return nil
-}
-
-func sftpKeyAuthenticationConfigured(options map[string]string) bool {
-	for _, key := range []string{"identity", "ssh_private_key", "ssh_auth_sock"} {
-		if strings.TrimSpace(options[key]) != "" {
-			return true
-		}
-	}
-	return false
 }
 
 func validateKopiaSFTPIdentityPath(identity string) error {
@@ -420,11 +389,6 @@ func storageOptionSupported(engine, connector, key string) bool {
 		unsupported["sse_customer_key"] = true
 		if engine == KopiaID {
 			unsupported["storage_class"] = true
-		}
-	case "sftp":
-		unsupported["ssh_private_key_ttl"] = true
-		if engine != KopiaID {
-			unsupported["password"] = true
 		}
 	case "gcs":
 		if engine == KopiaID || engine == ResticID {
@@ -590,15 +554,14 @@ func materializeGCSCredentials(repo models.Repository) (string, error) {
 	return materializeCredentialFile(repo, "gcs-credentials.json", data)
 }
 
-func materializeSSHPrivateKey(repo models.Repository) (string, error) {
-	if path := repo.ConnectorOptions["identity"]; strings.TrimSpace(path) != "" {
-		return path, nil
+// sftpIdentityFile returns the SFTP key filename exactly as entered, or "" when
+// the field is blank. Only the blankness test trims; the native engine must get
+// the same filename that validation looked at.
+func sftpIdentityFile(options map[string]string) string {
+	if path := options["identity"]; strings.TrimSpace(path) != "" {
+		return path
 	}
-	data := strings.TrimSpace(repo.ConnectorOptions["ssh_private_key"])
-	if data == "" {
-		return "", nil
-	}
-	return materializeCredentialFile(repo, "sftp-identity", data+"\n")
+	return ""
 }
 
 func materializeCredentialFile(repo models.Repository, name, data string) (string, error) {

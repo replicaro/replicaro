@@ -35,11 +35,16 @@ const (
 	SSHHostKeyChangedHelp = "The SFTP server's host key has changed since it was trusted. This can mean the server was reinstalled, or that something is intercepting the connection. Check with the server's administrator before updating known_hosts."
 )
 
+// SSHAuthenticationHelp explains an SFTP server turning down the SSH key. Only
+// key file and agent sign-in are supported, so the fix is always on the key or
+// the username, never a password.
+const SSHAuthenticationHelp = "The SFTP server didn't accept the SSH key. Check that the key file or the key in your SSH agent is added to this server's authorized keys and that the username is correct."
+
 // SSHHostKeyHelp returns the help for an error caused by an SFTP server's
 // host key, or "" for any other error. It reads OpenSSH's messages (Restic,
 // and Kopia with an SSH agent or with host-key verification off, run ssh),
-// the Go knownhosts errors Kopia's own SFTP client prints (with an SFTP
-// password or a key file), and rclone's, which arrive only as a classified
+// the Go knownhosts errors Kopia's own SFTP client prints (with a key file
+// and verification on), and rclone's, which arrive only as a classified
 // private failure. A changed key is checked first: OpenSSH also prints "Host
 // key verification failed." for it.
 func SSHHostKeyHelp(err error) string {
@@ -64,6 +69,25 @@ func SSHHostKeyHelp(err error) string {
 	return ""
 }
 
+// SSHAuthenticationFailureHelp returns SSHAuthenticationHelp when the SFTP
+// server refused the key, or "" for any other error. Callers check
+// SSHHostKeyHelp first, because a host-key refusal is the more specific
+// problem. Like SSHHostKeyHelp it reads OpenSSH's own message, the Go
+// x/crypto/ssh error Kopia's SFTP client prints, and rclone's sidecar failure,
+// which only arrives as a classified kind since its text is never kept.
+func SSHAuthenticationFailureHelp(err error) string {
+	if err == nil {
+		return ""
+	}
+	if command.PrivateOutputFailureKind(err) == command.PrivateFailureSSHAuthentication {
+		return SSHAuthenticationHelp
+	}
+	if command.SSHKeySignInRefused(err.Error()) {
+		return SSHAuthenticationHelp
+	}
+	return ""
+}
+
 func externalSSHRequired(repo models.Repository) bool {
 	if strings.ToLower(strings.TrimSpace(repo.Connector)) != "sftp" {
 		return false
@@ -72,13 +96,11 @@ func externalSSHRequired(repo models.Repository) bool {
 	case ResticID:
 		return true
 	case KopiaID:
+		// Kopia's own SFTP client needs a key file and a known_hosts file, so it
+		// is used only for a key file with host-key verification on. An agent
+		// socket alone, or verification turned off, goes through OpenSSH.
 		options := repo.ConnectorOptions
-		if strings.TrimSpace(options["password"]) != "" {
-			return false
-		}
-		hasIdentity := strings.TrimSpace(options["identity"]) != "" ||
-			strings.TrimSpace(options["ssh_private_key"]) != ""
-		return !hasIdentity || boolOption(options, "insecure_ignore_host_key")
+		return sftpIdentityFile(options) == "" || boolOption(options, "insecure_ignore_host_key")
 	default:
 		return false
 	}

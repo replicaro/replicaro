@@ -1,8 +1,8 @@
 {
   "schema": "replicaro-unsigned-build-inputs-v1",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "toolchains": {
-    "go": "1.26.7",
+    "go": "1.26.10",
     "node": "24.19.0",
     "npm": "11.17.0",
     "innoSetup": "7.1.0"

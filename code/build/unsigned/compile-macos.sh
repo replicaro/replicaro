@@ -23,7 +23,10 @@ cd "$root/backend"
 go run ./tools/webuiembed -dist "$build_root/frontend/dist" -output-root "$build_root" -virtual-root "$root/backend/api/webui_dist" \
   -base-overlay "$overlay" -helper-source "$root/backend/storagehelper/assets/$target/storage-helper" \
   -helper-built "$helper" -output "$product_overlay"
-CGO_ENABLED=1 GOOS=darwin GOARCH="$arch" MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-11.0}" go build -mod=readonly -buildvcs=false -tags replicaro_embedded_ui -trimpath -overlay "$product_overlay" -o "$build_root/Replicaro-$target" .
+# The default deployment target is the Go toolchain's minimum macOS. Go 1.26
+# needs macOS 12, and Go 1.27 needs 13, so raise this with any Go 1.27 move.
+# Keep it equal to LSMinimumSystemVersion in build-macos.sh.
+CGO_ENABLED=1 GOOS=darwin GOARCH="$arch" MACOSX_DEPLOYMENT_TARGET="${MACOSX_DEPLOYMENT_TARGET:-12.0}" go build -mod=readonly -buildvcs=false -tags replicaro_embedded_ui -trimpath -overlay "$product_overlay" -o "$build_root/Replicaro-$target" .
 ;;
   *) echo "unknown compilation stage" >&2; return 2;;
 esac

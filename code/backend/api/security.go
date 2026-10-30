@@ -77,7 +77,7 @@ var endpointMethods = map[string][]string{
 	"/api/jobs/enabled": {http.MethodPut}, "/api/engines": {http.MethodGet},
 	"/api/vault-profile-sync": {http.MethodGet, http.MethodPost},
 	"/api/engine":             {http.MethodGet}, "/api/logs": {http.MethodGet, http.MethodDelete},
-	"/api/settings": {http.MethodGet, http.MethodPost},
+	"/api/settings": {http.MethodGet, http.MethodPost}, "/api/settings/notification-urls/test": {http.MethodPost},
 }
 
 func secureAPIRequest(w http.ResponseWriter, r *http.Request) bool {

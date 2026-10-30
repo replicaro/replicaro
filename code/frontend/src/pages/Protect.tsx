@@ -949,8 +949,6 @@ function normalizedRcloneFolderName(value: string) {
 const vaultStorageOrder = ["fs", "s3", "azblob", "gcs", "sftp", "webdav", "dropbox", "google_drive", "onedrive", RCLONE_REMOTE_CONNECTOR];
 const hiddenVaultOptionKeys = new Set([
 	"sse_customer_key",
-	"ssh_private_key",
-	"ssh_private_key_ttl",
 	"credentials_json",
 ]);
 
@@ -963,13 +961,8 @@ function orderVaultStorageIntegrations(integrations: StorageIntegration[]) {
 	});
 }
 
-function visibleVaultOptions(options: IntegrationOption[], connector = "") {
-	// Vault setup intentionally supports key-based SFTP authentication only.
-	// Keep the backend's Kopia password capability available for compatibility,
-	// but never present or submit that credential through create or connect.
-	return options.filter((option) =>
-		!hiddenVaultOptionKeys.has(option.key) &&
-		!(connector === "sftp" && option.key === "password"));
+function visibleVaultOptions(options: IntegrationOption[]) {
+	return options.filter((option) => !hiddenVaultOptionKeys.has(option.key));
 }
 
 function providerPresentationDescription(
@@ -1514,7 +1507,7 @@ function integrationOptionsForEngine(
 	const provider = descriptors.find((descriptor) => descriptor.id === engine)?.providers
 		.find((candidate) => candidate.id === integration?.id && candidate.supported);
 	const fields = new Set(provider?.fields ?? []);
-	const supported = visibleVaultOptions((integration?.options ?? []).filter((option) => fields.has(option.key)), integration?.id ?? "");
+	const supported = visibleVaultOptions((integration?.options ?? []).filter((option) => fields.has(option.key)));
 	const result = integrationDefaults(integration ? { ...integration, options: supported } : undefined);
 	for (const option of supported) {
 		if (current[option.key] !== undefined) result[option.key] = current[option.key];
@@ -1536,7 +1529,7 @@ function withheldRcloneConfigPassword(form: VaultForm, key: string) {
 }
 
 function connectorOptionsForSubmission(form: VaultForm, integration: StorageIntegration | undefined) {
-	const presentedKeys = new Set(visibleVaultOptions(integration?.options ?? [], form.connector).map((option) => option.key)
+	const presentedKeys = new Set(visibleVaultOptions(integration?.options ?? []).map((option) => option.key)
 		.filter((key) => !withheldRcloneConfigPassword(form, key)));
 	// Options removed from the UI must not silently reach a backend adapter or
 	// native engine, including stale values restored from a pending intent.
@@ -1549,14 +1542,14 @@ function supportedIntegrations(engine: VaultForm["engine"], descriptors: EngineD
     const providers = new Map((descriptor?.providers ?? []).filter((provider) => provider.supported).map((provider) => [provider.id, provider]));
     return integrations.filter((integration) => providers.has(integration.id)).map((integration) => {
         const fields = new Set(providers.get(integration.id)?.fields ?? []);
-        return { ...integration, options: visibleVaultOptions(integration.options.filter((option) => fields.has(option.key)), integration.id) };
+        return { ...integration, options: visibleVaultOptions(integration.options.filter((option) => fields.has(option.key))) };
     });
 }
 
 function orderedConnectorOptions(integration: StorageIntegration | undefined, connector: string) {
 	const priorities: Record<string, string[]> = {
 		s3: ["endpoint", "access_key", "secret_access_key"],
-		sftp: ["port", "username", "identity", "ssh_private_key", "ssh_auth_sock"],
+		sftp: ["port", "username", "identity", "ssh_auth_sock"],
 	};
 	const order = priorities[connector] ?? [];
 	return [...(integration?.options ?? [])].sort((left, right) => {
@@ -1567,6 +1560,22 @@ function orderedConnectorOptions(integration: StorageIntegration | undefined, co
 		if (rightIndex < 0) return -1;
 		return leftIndex - rightIndex;
 	});
+}
+
+// SFTP vaults sign in with a key file or an SSH agent, and need one of the
+// two. Neither field is required on its own, so this sits next to the
+// required-field check instead of in the catalog. The vault's recovery sidecar
+// (rclone) signs in separately from the engine: on Linux, macOS and in Docker
+// it only reaches an agent through the socket we hand it and never reads
+// OpenSSH's default keys or ssh config, so a vault with both fields blank would
+// get through here and then fail at the sidecar check. On Windows rclone and
+// OpenSSH can fall back to Pageant or the Windows OpenSSH agent, but we still
+// ask for one field so the vault says how it signs in rather than relying on
+// whatever agent happens to be running. The backend makes the same check, and
+// only when the settings are entered or changed, so vaults saved before this
+// rule keep running.
+function missingSFTPAuthentication(connector: string, options: Record<string, string>) {
+	return connector === "sftp" && !String(options.identity ?? "").trim() && !String(options.ssh_auth_sock ?? "").trim();
 }
 
 function missingRequiredConnectorOptions(integration: StorageIntegration | undefined, options: Record<string, string>) {
@@ -2298,6 +2307,8 @@ function RemoteVaultFields({
 				{supportsPathMode && <label className="field"><span>{t("ui.pages.protect.vault.location.on.server")}</span><select value={pathMode} disabled={Boolean(form.pendingLocation)} onChange={(event) => updateOption("path_mode", event.target.value)}><option value="home">{t("ui.pages.protect.sftp.home.directory.recommended")}</option><option value="absolute">{t("ui.pages.protect.server.filesystem.root")}</option></select></label>}
 				<label className="field"><span>{absolutePath ? t("ui.pages.protect.vault.path.relative.to.server.filesystem.root") : t("ui.pages.protect.vault.path.relative.to.sftp.home")}</span><input aria-label={absolutePath ? t("ui.protect.vaultPathServerRoot") : t("ui.protect.vaultPathSftpHome")} value={form.prefix} placeholder={examplePlaceholder(absolutePath ? "/srv/backups/vault" : "backups/vault")} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /><small>{absolutePath ? t("ui.pages.protect.start.with.one.the.path.begins.at.the.server") : t("ui.pages.protect.do.not.start.with.the.path.begins.in.the")}</small></label>
                 {renderOption("identity")}
+                {/* No role="alert": this shows as soon as SFTP is picked, before anything is typed. */}
+                {missingSFTPAuthentication(integration.id, form.options) && <small className="inline-error">{t("ui.protect.sftpAuthenticationRequiredHint")}</small>}
             </>;
         }
         case "webdav": {
@@ -3193,12 +3204,19 @@ export default function Protect() {
             .catch((error: Error) => toast("error", error.message));
 	}, [load, toast]);
 
+	// Wait for both lists before following #vaults or #jobs. The vault list
+	// decides which section comes first, and once a vault exists Jobs sits on
+	// top, so a jobs list arriving after the scroll would push Vaults down
+	// and leave the page short of it. Neither list goes back to null, so this
+	// scrolls once per visit.
+	const listsLoaded = repos !== null && jobs !== null;
 	useEffect(() => {
+		if (!listsLoaded) return;
 		const target = window.location.hash.slice(1);
         if (target) {
             window.requestAnimationFrame(() => document.getElementById(target)?.scrollIntoView());
         }
-	}, []);
+	}, [listsLoaded]);
 
 	// Startup recovery finishes a change without an operation this page could
 	// follow, so a card showing it as finishing reads the saved phase again
@@ -3328,7 +3346,7 @@ export default function Protect() {
 				...item,
 				options: visibleVaultOptions(item.options.filter((option) =>
 					connectionOptionProviders.some((engine) => engine.providers.some((provider) =>
-						provider.id === item.id && provider.supported && provider.fields?.includes(option.key)))), item.id),
+						provider.id === item.id && provider.supported && provider.fields?.includes(option.key))))),
 			})),
 	);
 	const connectIntegrations = connectionIntegrations;
@@ -3337,9 +3355,11 @@ export default function Protect() {
 		connectForm.connector !== "s3" || option.key !== "storage_class" ||
 		(!connectForm.coldStorage && connectDetectedEngine === "restic"));
 	const connectMissingRequiredOptions = missingRequiredConnectorOptions(connectIntegration, connectForm.options);
+	const connectMissingSFTPAuthentication = missingSFTPAuthentication(connectForm.connector, connectForm.options);
 	const createOrderedOptions = orderedConnectorOptions(integration, vaultForm.connector).filter((option) =>
 		!vaultForm.coldStorage || vaultForm.connector !== "s3" || option.key !== "storage_class");
 	const createMissingRequiredOptions = missingRequiredConnectorOptions(integration, vaultForm.options);
+	const createMissingSFTPAuthentication = missingSFTPAuthentication(vaultForm.connector, vaultForm.options);
 	const createUsesRcloneSignIn = usesRcloneSignIn(vaultForm.connector);
 	// Restic through rclone into Replicaro/<vault name>: Restic is the only engine.
 	const createUsesVaultFolder = usesVaultFolderName(vaultForm.connector);
@@ -4243,6 +4263,10 @@ export default function Protect() {
 			toast("error", t("ui.protect.requiredConnectorFields", { fields: createMissingRequiredOptions.map((option) => knownMessage(`ui.integration.${vaultForm.connector}.option.${option.key}.label`, option.label)).join(", ") }));
 			return;
 		}
+		if (createMissingSFTPAuthentication) {
+			toast("error", t("ui.protect.sftpAuthenticationRequired"));
+			return;
+		}
         if (vaultForm.password !== vaultForm.passwordConfirmation) {
             toast("error", t("ui.protect.passwordsDoNotMatch"));
             return;
@@ -4352,6 +4376,10 @@ export default function Protect() {
 		// second entry here would only duplicate a secret that is not being set.
 		if (connectMissingRequiredOptions.length > 0) {
 			toast("error", t("ui.protect.requiredConnectorFields", { fields: connectMissingRequiredOptions.map((option) => knownMessage(`ui.integration.${connectForm.connector}.option.${option.key}.label`, option.label)).join(", ") }));
+			return false;
+		}
+		if (connectMissingSFTPAuthentication) {
+			toast("error", t("ui.protect.sftpAuthenticationRequired"));
 			return false;
 		}
 		const enteredOptions = connectorOptionsWithoutUnchangedDefaults(connectIntegration, connectorOptionsForSubmission(submittedForm, connectIntegration));
@@ -4619,6 +4647,10 @@ export default function Protect() {
 		}
 		if (connectMissingRequiredOptions.length > 0) {
 			toast("error", t("ui.protect.requiredConnectorFields", { fields: connectMissingRequiredOptions.map((option) => knownMessage(`ui.integration.${connectForm.connector}.option.${option.key}.label`, option.label)).join(", ") }));
+			return;
+		}
+		if (connectMissingSFTPAuthentication) {
+			toast("error", t("ui.protect.sftpAuthenticationRequired"));
 			return;
 		}
 		const payload = {
@@ -5496,14 +5528,10 @@ export default function Protect() {
 	// ordinary authorization Check reachable beside any saved-account retry.
 	const canCheckAnotherRcloneAccount = connectUsesRcloneSignIn;
 	const createVaultNameField = <label className="field"><span>{t("ui.pages.protect.vault.name")}</span><input aria-label={t("ui.pages.protect.vault.name")} disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.name} placeholder={t("ui.pages.protect.example.work.archive")} onChange={(event) => setVaultForm({ ...vaultForm, name: event.target.value })} /><small>{t("ui.protect.vaultNameLengthHelp", { count: MAX_VAULT_NAME_CODE_POINTS })}</small></label>;
-    return (
-        <div className="page protect-page">
-            <header className="page-header simple">
-                <h1 className="page-title">{t("ui.pages.protect.protect")}</h1>
-                <p className="page-desc">{t("ui.pages.protect.backup.your.data.into.encrypted.vaults")}</p>
-            </header>
-
-	            <section id="jobs">
+	// The Jobs and Vaults sections are built here and placed in the page below,
+	// where their order depends on whether any vault exists.
+	const jobsSection = (
+	            <section key="jobs" id="jobs">
 	                <div className="section-heading">
 	                    <h2>{t("ui.pages.protect.backup.jobs")}</h2>
 	                    <div className="job-heading-actions">
@@ -5643,8 +5671,9 @@ export default function Protect() {
                     />
                 )}
             </section>
-
-            <section className="vault-section" id="vaults">
+	);
+	const vaultsSection = (
+            <section key="vaults" className="vault-section" id="vaults">
                 <div className="section-heading">
                     <h2>{t("ui.pages.protect.vaults")}</h2>
                     <button className={`btn${repos !== null && repos.length === 0 ? " primary" : ""}`} onClick={() => setShowVaultChoice(true)}><Icon name="plus" size={14} /> {t("ui.pages.protect.vault")}</button>
@@ -5775,6 +5804,24 @@ export default function Protect() {
                     />
                 )}
             </section>
+	);
+	// With no vaults yet, Vaults comes first: a job can't be created without a
+	// vault, so a first-run user should land on the place to add one rather than
+	// an empty jobs list. Once a vault exists, jobs are what people use day to
+	// day, so they go back on top. While vaults are still loading we keep the
+	// usual order, otherwise everyone with vaults would see the sections swap
+	// on every page load. The real elements are reordered (not CSS order) so
+	// tab and screen-reader order match the screen; the keys let React move the
+	// existing sections instead of rebuilding them when the order flips.
+	const vaultsFirst = repos !== null && repos.length === 0;
+    return (
+        <div className="page protect-page">
+            <header className="page-header simple">
+                <h1 className="page-title">{t("ui.pages.protect.protect")}</h1>
+                <p className="page-desc">{t("ui.pages.protect.backup.your.data.into.encrypted.vaults")}</p>
+            </header>
+
+            {vaultsFirst ? [vaultsSection, jobsSection] : [jobsSection, vaultsSection]}
 
 	            {jobModal && (
 	                <Modal title={jobModal === "new" ? t("ui.protect.newBackupJob") : t("ui.protect.editJob")} wide onClose={closeJob}>
@@ -5981,7 +6028,7 @@ export default function Protect() {
 							<p><strong>{retryConnectionError ? t("ui.protect.previousConnectionIncomplete") : matchingConnectionIntent.state === "prepared" ? t("ui.protect.earlierConnectionSaved") : t("ui.protect.unfinishedConnectionFound")}</strong></p>
 							<p>{retryConnectionError ? t("ui.protect.savedAttemptAvailable") : matchingConnectionIntent.state === "prepared" ? t("ui.protect.prePublicationAttemptHelp") : t("ui.protect.profileUpdatedAttemptHelp")}</p>
 							{retryConnectionError && <p>{retryConnectionError}</p>}
-							<div className="vault-removal-actions">{!retryConnectionIntentId && <button className="btn primary" disabled={connectChecking || connectSaving} onClick={() => selectConnectionIntent(matchingConnectionIntent)}>{t("ui.pages.protect.continue.previous.connection")}</button>}{matchingConnectionIntent.state === "prepared" && <button className="btn" disabled={connectChecking || connectSaving || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => void startNewConnectionCheck(matchingConnectionIntent)}>{t("ui.pages.protect.start.a.new.check")}</button>}</div>
+							<div className="vault-removal-actions">{!retryConnectionIntentId && <button className="btn primary" disabled={connectChecking || connectSaving} onClick={() => selectConnectionIntent(matchingConnectionIntent)}>{t("ui.pages.protect.continue.previous.connection")}</button>}{matchingConnectionIntent.state === "prepared" && <button className="btn" disabled={connectChecking || connectSaving || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0 || connectMissingSFTPAuthentication} onClick={() => void startNewConnectionCheck(matchingConnectionIntent)}>{t("ui.pages.protect.start.a.new.check")}</button>}</div>
 						</section>}
 						{connectAttachmentChanged && <section className="recovery-warning recovery-fallback-message" role="alert">
 							<p>{t("ui.protect.reconnectAttachmentChanged")}</p>
@@ -5993,7 +6040,7 @@ export default function Protect() {
 						{!connectUsesRcloneSignIn && connectOrderedOptions.some((option) => option.advanced) && <button className="btn advanced-toggle" onClick={() => setConnectAdvanced((value) => !value)}><Icon name="settings" size={14} />{connectAdvanced ? t("ui.pages.protect.hide.advanced.settings") : t("ui.pages.protect.advanced.settings")}</button>}
 						{!connectUsesRcloneSignIn && connectAdvanced && <div className="advanced-panel">{connectOrderedOptions.filter((option) => option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={connectForm.connector} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}</div>}
 						<div className={`modal-footer${connectForm.connector === RCLONE_REMOTE_CONNECTOR ? " rclone-remote-dialog-footer" : ""}`}><button className="btn" disabled={connectSaving} onClick={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>{t("ui.pages.protect.cancel")}</button>
-										{matchingConnectionIntent && retryConnectionIntentId ? <button className="btn primary" disabled={connectChecking || connectSaving || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => void retryPendingConnection()}>{connectSaving && <span className="spinner" />}{retryConnectionError ? t("ui.protect.retryConnection") : t("ui.protect.continuePreviousConnection")}</button> : (!matchingConnectionIntent || canCheckAnotherRcloneAccount) && <button className="btn primary" disabled={connectChecking || connectReplacingVault || !vaultLocation(connectForm) || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0} onClick={() => { if (connectUsesRcloneSignIn) setConnectRcloneAuthorizationAction("check"); else void checkExistingVault(); }}>{connectChecking && <span className="spinner" />}{t("ui.pages.protect.check.existing.vault")}</button>}
+										{matchingConnectionIntent && retryConnectionIntentId ? <button className="btn primary" disabled={connectChecking || connectSaving || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0 || connectMissingSFTPAuthentication} onClick={() => void retryPendingConnection()}>{connectSaving && <span className="spinner" />}{retryConnectionError ? t("ui.protect.retryConnection") : t("ui.protect.continuePreviousConnection")}</button> : (!matchingConnectionIntent || canCheckAnotherRcloneAccount) && <button className="btn primary" disabled={connectChecking || connectReplacingVault || !vaultLocation(connectForm) || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0 || connectMissingSFTPAuthentication} onClick={() => { if (connectUsesRcloneSignIn) setConnectRcloneAuthorizationAction("check"); else void checkExistingVault(); }}>{connectChecking && <span className="spinner" />}{t("ui.pages.protect.check.existing.vault")}</button>}
 						</div>
 						</>}
 						{connectPreview && <>
@@ -6105,7 +6152,7 @@ export default function Protect() {
                             </div>
                         )}
                     </div>
-					<div className={`modal-footer${createUsesRcloneRemote ? " rclone-remote-dialog-footer" : ""}`}><button className="btn" disabled={vaultSaving} onClick={closeVaultCreate}>{t("ui.pages.protect.cancel")}</button><button className="btn primary" disabled={vaultSaving || !integration || !validVaultName(vaultForm.name) || !vaultLocation(vaultForm, true) || !validVaultPassword(vaultForm.password) || vaultForm.password !== vaultForm.passwordConfirmation || createMissingRequiredOptions.length > 0 || !validObjectLockSettings(vaultForm.objectLock, vaultForm.maintenanceSchedule)} onClick={() => { if (createUsesRcloneSignIn && !createRcloneAuth && !retryCreationIntentId) setShowCreateRcloneAuthorization(true); else void saveVault(); }}>{vaultSaving && <span className="spinner" />}{vaultSaving ? t("ui.pages.protect.creating") : retryCreationIntentId ? t("ui.pages.protect.retry.creation") : t("ui.pages.protect.create.vault")}</button></div>
+					<div className={`modal-footer${createUsesRcloneRemote ? " rclone-remote-dialog-footer" : ""}`}><button className="btn" disabled={vaultSaving} onClick={closeVaultCreate}>{t("ui.pages.protect.cancel")}</button><button className="btn primary" disabled={vaultSaving || !integration || !validVaultName(vaultForm.name) || !vaultLocation(vaultForm, true) || !validVaultPassword(vaultForm.password) || vaultForm.password !== vaultForm.passwordConfirmation || createMissingRequiredOptions.length > 0 || createMissingSFTPAuthentication || !validObjectLockSettings(vaultForm.objectLock, vaultForm.maintenanceSchedule)} onClick={() => { if (createUsesRcloneSignIn && !createRcloneAuth && !retryCreationIntentId) setShowCreateRcloneAuthorization(true); else void saveVault(); }}>{vaultSaving && <span className="spinner" />}{vaultSaving ? t("ui.pages.protect.creating") : retryCreationIntentId ? t("ui.pages.protect.retry.creation") : t("ui.pages.protect.create.vault")}</button></div>
 					</fieldset>
 					{vaultSaving && <KeepWindowOpenNotice />}
 					{vaultSaving && <VaultActivityLog records={vaultProgress} />}

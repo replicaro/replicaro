@@ -10,7 +10,6 @@ import (
 )
 
 var commandRunner = runCommand
-var commandRunnerWithInput = runCommandWithInput
 var privateCommandRunner = runPrivateCommand
 var capturedCommandRunner = runCapturedCommand
 
@@ -65,19 +64,14 @@ func IsReconnectRequired(err error) bool {
 
 func SetCommandRunnerForTests(next func(context.Context, string, []string, []string, time.Duration, string) (string, error)) func() {
 	previous := commandRunner
-	previousWithInput := commandRunnerWithInput
 	previousPrivate := privateCommandRunner
 	previousCaptured := capturedCommandRunner
 	if next == nil {
 		commandRunner = runCommand
-		commandRunnerWithInput = runCommandWithInput
 		privateCommandRunner = runPrivateCommand
 		capturedCommandRunner = runCapturedCommand
 	} else {
 		commandRunner = next
-		commandRunnerWithInput = func(ctx context.Context, path string, args, env []string, input string, timeout time.Duration, engine string) (string, error) {
-			return next(ctx, path, args, env, timeout, engine)
-		}
 		privateCommandRunner = func(ctx context.Context, path string, args, env []string, timeout time.Duration, engine string) (string, error) {
 			output, err := next(ctx, path, args, env, timeout, engine)
 			if err != nil {
@@ -104,7 +98,6 @@ func SetCommandRunnerForTests(next func(context.Context, string, []string, []str
 	}
 	return func() {
 		commandRunner = previous
-		commandRunnerWithInput = previousWithInput
 		privateCommandRunner = previousPrivate
 		capturedCommandRunner = previousCaptured
 	}
@@ -120,14 +113,6 @@ func runCapturedCommand(ctx context.Context, path string, args []string, env []s
 
 func runCommand(ctx context.Context, path string, args []string, env []string, timeout time.Duration, engine string) (string, error) {
 	output, err := command.Run(ctx, path, args, env, timeout, engine)
-	if err != nil {
-		return output, &CommandError{Engine: engine, Output: output, Err: err}
-	}
-	return output, nil
-}
-
-func runCommandWithInput(ctx context.Context, path string, args []string, env []string, input string, timeout time.Duration, engine string) (string, error) {
-	output, err := command.RunWithInputSecrets(ctx, path, args, env, input, timeout, engine)
 	if err != nil {
 		return output, &CommandError{Engine: engine, Output: output, Err: err}
 	}

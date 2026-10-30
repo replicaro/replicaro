@@ -224,7 +224,7 @@ func PrepareKopiaFilesystemReconnect(ctx context.Context, engine Engine, repo mo
 	if err != nil {
 		return paths, "", err
 	}
-	args, input, err := kopiaStorageInvocation(repo, "connect")
+	args, err := kopiaStorageArgs(repo, "connect")
 	if err != nil {
 		return paths, "", err
 	}
@@ -233,12 +233,7 @@ func PrepareKopiaFilesystemReconnect(ctx context.Context, engine Engine, repo mo
 	// so its first connect after rotation must bypass that stale entry. Kopia
 	// owns the refresh; parsing or deleting its cache here is not necessary.
 	args = append(args, "--disable-repository-format-cache")
-	var output string
-	if input != "" {
-		output, err = target.runWithInput(ctx, env, append(base, args...), input, command.NoTotalDeadline)
-	} else {
-		output, err = target.run(ctx, env, append(base, args...), command.NoTotalDeadline)
-	}
+	output, err := target.run(ctx, env, append(base, args...), command.NoTotalDeadline)
 	if err != nil {
 		return paths, output, err
 	}

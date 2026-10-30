@@ -3,7 +3,7 @@ import { useLocation, useNavigate, useOutletContext } from "react-router-dom";
 
 import { preventNumberInputWheel } from "../components/numberInput";
 import { ConfirmDialog, Loading, Modal, SaveChangesDialog, useToast } from "../components/ui";
-import { checkForAppUpdate, getEngines, getPlatform, getSettings, getSupportReport, openAppUpdateDownload, saveSettings } from "../services/api";
+import { checkForAppUpdate, getEngines, getPlatform, getSettings, getSupportReport, openAppUpdateDownload, saveSettings, testNotificationUrls } from "../services/api";
 import type { AppUpdateStatus, EngineDescriptor, PlatformInfo, Settings as SettingsType } from "../types";
 import type { AppUpdateOutletContext } from "../layouts/MainLayout";
 import { applyThemePreference } from "../theme";
@@ -57,6 +57,25 @@ function sameSettings(left: SettingsType, right: SettingsType): boolean {
     return JSON.stringify(left) === JSON.stringify(right);
 }
 
+// The server trims each notification URL and drops blank lines before storing
+// the list, so this is the list a save would actually store.
+function cleanNotificationUrls(urls: string[]): string[] {
+    return urls.map((url) => url.trim()).filter(Boolean);
+}
+
+// Used for the unsaved-changes check only. Blank lines, or a box cleared back
+// to empty when nothing was saved, change nothing that a save would store, so
+// they shouldn't trigger the prompt. The draft keeps the text exactly as typed.
+// webhookUrl is left out: it isn't editable here and save() derives it from
+// the list, so a draft typed during a save can hold an older value than the
+// saved copy even when the lists match.
+function sameStoredSettings(draft: SettingsType, saved: SettingsType): boolean {
+    return sameSettings(
+        { ...draft, notificationUrls: cleanNotificationUrls(draft.notificationUrls), webhookUrl: "" },
+        { ...saved, notificationUrls: cleanNotificationUrls(saved.notificationUrls), webhookUrl: "" },
+    );
+}
+
 export default function System() {
     const toast = useToast();
     const location = useLocation();
@@ -72,6 +91,7 @@ export default function System() {
     const [pendingSaveAction, setPendingSaveAction] = useState<PendingSaveAction | null>(null);
     const [manualUpdateStatus, setManualUpdateStatus] = useState<AppUpdateStatus | null>(null);
     const [checkingForUpdate, setCheckingForUpdate] = useState(false);
+    const [testingNotificationUrls, setTestingNotificationUrls] = useState(false);
     const [supportOpen, setSupportOpen] = useState(false);
     const [supportLoading, setSupportLoading] = useState(false);
     const [supportCopying, setSupportCopying] = useState(false);
@@ -92,6 +112,8 @@ export default function System() {
     // so focus can't go back to it when its dialog closes; the selector gets it.
     const focusLanguageSelectOnClose = useRef(false);
     const languageMessageId = useId();
+    const notificationUrlsId = useId();
+    const notificationUrlsHelpId = useId();
     const supportGeneration = useRef(0);
     const supportAbort = useRef<AbortController | null>(null);
     const supportCopyAttempt = useRef(0);
@@ -123,7 +145,16 @@ export default function System() {
     const save = async (language?: LanguageChoice): Promise<SaveResult> => {
         if (!settings || !savedSettings || saving) return "failed";
         const draftSettings = settings;
-        const attemptedSettings: SettingsType = language === undefined ? draftSettings : { ...draftSettings, language };
+        // The server trims the URLs and drops blank lines too; doing the same
+        // here means the box shows what was stored once the save goes through.
+        const notificationUrls = cleanNotificationUrls(draftSettings.notificationUrls);
+        // The server ignores a posted webhookUrl and stores the list's first
+        // http(s) entry there instead (older builds still read it). Mirror
+        // that so the saved copy matches what the server stores; otherwise a
+        // later failed save re-reads the settings, sees webhookUrl differ from
+        // the saved copy and wrongly takes the failed save as committed.
+        const webhookUrl = notificationUrls.find((url) => /^https?:\/\//i.test(url)) ?? "";
+        const attemptedSettings: SettingsType = { ...draftSettings, notificationUrls, webhookUrl, ...(language === undefined ? {} : { language }) };
 		const previouslySavedSettings = savedSettings;
         setSaving(true);
         try {
@@ -164,6 +195,24 @@ export default function System() {
             toast("error", (error as Error).message);
         } finally {
             setCheckingForUpdate(false);
+        }
+    };
+
+    // Tests the lines as they are in the box, saved or not, and ignores the
+    // failure/success checkboxes. Results come back per URL; their error text
+    // is the server's English text and is shown as given.
+    const sendTestNotification = async () => {
+        if (!settings || testingNotificationUrls) return;
+        setTestingNotificationUrls(true);
+        try {
+            const { results } = await testNotificationUrls(settings.notificationUrls);
+            const failures = results.filter((result) => !result.ok);
+            if (failures.length === 0) toast("ok", t("ui.system.notificationTestSent", { count: results.length }));
+            else toast("error", failures.map((result) => result.error).join("\n"));
+        } catch (error) {
+            toast("error", (error as Error).message);
+        } finally {
+            setTestingNotificationUrls(false);
         }
     };
 
@@ -236,7 +285,7 @@ export default function System() {
         }
     };
 
-    const dirty = Boolean(settings && savedSettings && !sameSettings(settings, savedSettings));
+    const dirty = Boolean(settings && savedSettings && !sameStoredSettings(settings, savedSettings));
     const savedLanguage: LanguageChoice = savedSettings?.language ?? "system";
     const languageChangePending = languageChoice !== null && languageChoice !== savedLanguage;
 
@@ -473,7 +522,27 @@ export default function System() {
             {(platform?.capabilities.startAtLogin ?? true) && <><div className="system-label">{t("ui.pages.system.startup")}</div><section className="system-section"><label className="check"><input type="checkbox" checked={settings.startAtLogin ?? settings.startWithWindows} onChange={(event) => setSettings({ ...settings, startAtLogin: event.target.checked, startWithWindows: event.target.checked })} />{t("ui.system.startAtLogin")}</label></section></>}
             <div className="system-label">{t("ui.pages.system.housekeeping")}</div><section className="system-section"><label className="field compact-field"><span>{t("ui.pages.system.keep.logs.for.days")}</span><input type="number" min={1} value={settings.logRetentionDays} onWheel={preventNumberInputWheel} onChange={(event) => setSettings({ ...settings, logRetentionDays: parseInt(event.target.value, 10) || 30 })} /></label></section>
             <div className="system-label">{t("ui.pages.system.backup.admission")}</div><section className="system-section"><label className="field system-control-field"><span>{t("ui.pages.system.maximum.simultaneous.backup.runs")}</span><input type="number" min={1} max={32} value={settings.maxConcurrentJobRuns} onWheel={preventNumberInputWheel} onChange={(event) => setSettings({ ...settings, maxConcurrentJobRuns: Math.min(32, Math.max(1, parseInt(event.target.value, 10) || 2)) })} /></label></section>
-            <div className="system-label">{t("ui.pages.system.notifications")}</div><section className="system-section notifications-section">{(platform?.capabilities.nativeNotifications ?? true) && <div className="notification-channel"><div className="notification-channel-title">{t("ui.pages.system.desktop")}</div><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnFailure ?? settings.notifyWindowsOnFailure} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnFailure: event.target.checked, notifyWindowsOnFailure: event.target.checked })} />{t("ui.system.notifyFailures")}</label><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnSuccess ?? settings.notifyWindowsOnSuccess} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnSuccess: event.target.checked, notifyWindowsOnSuccess: event.target.checked })} />{t("ui.system.notifySuccess")}</label></div>}<div className="notification-channel"><div className="notification-channel-title">{t("ui.pages.system.webhooks")}</div><label className="field system-wide-field"><span>{t("ui.pages.system.webhook.url")}</span><input type="url" value={settings.webhookUrl} onChange={(event) => setSettings({ ...settings, webhookUrl: event.target.value })} /><small>{t("ui.pages.system.leave.blank.if.not.using.webhooks")}</small></label><label className="check"><input type="checkbox" checked={settings.notifyWebhookOnFailure} onChange={(event) => setSettings({ ...settings, notifyWebhookOnFailure: event.target.checked })} />{t("ui.system.notifyFailures")}</label><label className="check"><input type="checkbox" checked={settings.notifyWebhookOnSuccess} onChange={(event) => setSettings({ ...settings, notifyWebhookOnSuccess: event.target.checked })} />{t("ui.system.notifySuccess")}</label></div><button className="btn primary save-settings" disabled={saving} onClick={() => requestSave("save")}>{saving ? t("ui.system.saving") : t("ui.system.saveSettings")}</button></section>
+            <div className="system-label">{t("ui.pages.system.notifications")}</div><section className="system-section notifications-section">{(platform?.capabilities.nativeNotifications ?? true) && <div className="notification-channel"><div className="notification-channel-title">{t("ui.pages.system.desktop")}</div><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnFailure ?? settings.notifyWindowsOnFailure} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnFailure: event.target.checked, notifyWindowsOnFailure: event.target.checked })} />{t("ui.system.notifyFailures")}</label><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnSuccess ?? settings.notifyWindowsOnSuccess} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnSuccess: event.target.checked, notifyWindowsOnSuccess: event.target.checked })} />{t("ui.system.notifySuccess")}</label></div>}
+                {/* http:// and https:// lines go to the JSON webhook, so there's no separate
+                    webhook field. The server fills the legacy webhookUrl from this list on
+                    save (older builds still read it), and the one pair of checkboxes below
+                    covers every URL. */}
+                <div className="notification-channel">
+                    <label className="notification-channel-title" htmlFor={notificationUrlsId}>{t("ui.system.notificationUrls")}</label>
+                    <div className="field system-wide-field">
+                        {/* One URL per line. Every line is kept in the draft, blank or not,
+                            so typing a new line doesn't swallow the Enter; blanks are
+                            dropped on save. */}
+                        <textarea id={notificationUrlsId} className="mono" rows={4} spellCheck={false} autoCapitalize="off" autoComplete="off" aria-describedby={notificationUrlsHelpId} value={settings.notificationUrls.join("\n")} onChange={(event) => setSettings({ ...settings, notificationUrls: event.target.value.split("\n") })} />
+                        {/* The catalogs can't hold web addresses, so the two http(s)
+                            scheme names come in as values; the sentence reads the same. */}
+                        <small id={notificationUrlsHelpId}>{t("ui.system.notificationUrlsHelp", { http: "http://", https: "https://" })}</small>
+                    </div>
+                    <label className="check"><input type="checkbox" checked={settings.notifyWebhookOnFailure} onChange={(event) => setSettings({ ...settings, notifyWebhookOnFailure: event.target.checked })} />{t("ui.system.notifyFailures")}</label>
+                    <label className="check"><input type="checkbox" checked={settings.notifyWebhookOnSuccess} onChange={(event) => setSettings({ ...settings, notifyWebhookOnSuccess: event.target.checked })} />{t("ui.system.notifySuccess")}</label>
+                    <div><button type="button" className="btn" disabled={testingNotificationUrls} onClick={() => void sendTestNotification()}>{testingNotificationUrls && <span className="spinner" />}{t("ui.system.sendTest")}</button></div>
+                </div>
+                <button className="btn primary save-settings" disabled={saving} onClick={() => requestSave("save")}>{saving ? t("ui.system.saving") : t("ui.system.saveSettings")}</button></section>
         </div>
         {supportOpen && <Modal title={t("ui.pages.system.report.bugs.or.errors")} onClose={closeSupportReport} wide><div className="support-report-modal">
             <p className="modal-intro">{t("ui.pages.system.submit.an.issue.on.github.to.report.a.replicaro.bug.error.you.will.nee")}</p>

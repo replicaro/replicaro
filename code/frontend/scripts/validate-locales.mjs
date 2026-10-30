@@ -24,6 +24,8 @@ const notificationContract = {
   'notifications.message.kopiaVaultOutOfSpace': 'vaultName',
   'notifications.appUpdate.title': '',
   'notifications.appUpdate.message': '',
+  'notifications.test.title': '',
+  'notifications.test.message': '',
   'notifications.task.backup': 'name',
   'notifications.task.backupTarget': 'name,target',
   'notifications.task.check': 'name',

@@ -34,7 +34,7 @@ NOTICES = {
     # go.mod). When go.mod, the pinned Go toolchain
     # (build/unsigned/inputs.json), frontend/package-lock.json or the bundled
     # fonts change, refresh the copied text and the label together.
-    "Go standard library (go1.26.7)": LICENSES / "go-LICENSE.txt",
+    "Go standard library (go1.26.10)": LICENSES / "go-LICENSE.txt",
     "github.com/google/uuid v1.6.0": LICENSES / "google-uuid-LICENSE.txt",
     "golang.org/x/sys v0.44.0": LICENSES / "golang-x-sys-LICENSE.txt",
     "golang.org/x/text v0.39.0": LICENSES / "golang-x-text-LICENSE.txt",
@@ -76,7 +76,7 @@ COMMON = [
     "Kopia",
     "rclone",
     "robfig/cron",
-    "Go standard library (go1.26.7)",
+    "Go standard library (go1.26.10)",
     "github.com/google/uuid v1.6.0",
     "golang.org/x/sys v0.44.0",
     "golang.org/x/text v0.39.0",

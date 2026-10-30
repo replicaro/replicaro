@@ -33,7 +33,7 @@ File history. Automation. End-to-end encryption. Compression. Deduplication. Use
 
 ## Backups Made Easy
 
-Creating backups should be easy. Replicaro makes it easy. Get started in five minutes or less, or your money back!
+Creating backups should be easy. Replicaro makes it easy. Get started in five minutes or less, or your money back! Just kidding; Replicaro actually has a strict no refund policy. Just kidding again; Replicaro is free, so obviously there cannot be any refunds since you do not pay us for anything. I may or may not have a lame sense of humor.
 
 <table width="100%">
   <tbody>
@@ -56,7 +56,7 @@ Creating backups should be easy. Replicaro makes it easy. Get started in five mi
 
 ## Restoring Made Easier
 
-Deleted the wrong file? Saved over an important document? You should not have to remember which backup contains the version you need. Replicaro's File History lets you find files by name or path, view complete file history, and choose which file version to restore. Restore one file/folder or several selected files or folders (Kopia vaults: one folder at a time, or several files together), with each having its own history. The choice is yours.
+Deleted the wrong file? Saved over an important document? You should not have to remember which backup contains the version you need. Replicaro's File History lets you find files by name or path, view complete file history, and choose which file version to restore. Restore one file/folder or several selected files or folders, with each having its own history. The choice is yours.
 
 Whole snapshot restore is supported too, of course.
 
@@ -72,7 +72,7 @@ View the history of your backed up files & folders, so you can restore specific 
 
 #### Search Across File History
 
-Search by name or path, compare available versions, select multiple files or folders (Kopia vaults: one folder at a time, or several files together), and restore.
+Search by name or path, compare available versions, select multiple files or folders, and restore.
 
 ![Searching for files in Replicaro File History](./readme-assets/file-history-dark.png)
 
@@ -168,7 +168,7 @@ Build backup jobs around your data. No need to understand command-line.
 
 - **Backup multiple computers to the same vault.**
 
-  - Use the same vault for up to 256 computers-at the same time! There is no server-client archiecture needed. You do not need to do anything special: just connect each computer to the vault, set up backup jobs on each computer, and Replicaro does its thing. (Note: Multi-computer vaults are not supported on Dropbox, Google Drive, OneDrive, and Any Rclone Remote vaults. You can use one Dropbox, Google Drive, or OneDrive account, or one rclone remote, to hold multiple vaults, but each vault can only be used by one computer.)
+  - Use the same vault for up to 256 computers-at the same time! There is no server-client archiecture needed. You do not need to do anything special: just connect each computer to the vault, set up backup jobs on each computer, and Replicaro does its thing. (Note: Multi-computer vaults are not supported on Dropbox, Google Drive, OneDrive, and Any Rclone Remote vaults. You can use one Dropbox, Google Drive, OneDrive account, or rclone remote to hold multiple vaults, but each vault can only be used by one computer.)
 
 - **Bring an existing vault.**
 
@@ -180,7 +180,7 @@ Build backup jobs around your data. No need to understand command-line.
 
 - **Check backup integrity.**
 
-  - A backup is only as good as your ability to recover it. Run or schedule integrity checks easily with Replicaro.
+  - A backup is only as good as your ability to recover it. Run or schedule automatic integrity checks easily with Replicaro.
 
 - **Follow work as it happens.**
 

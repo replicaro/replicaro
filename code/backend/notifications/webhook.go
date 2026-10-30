@@ -1,15 +1,13 @@
 package notifications
 
 import (
-	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -54,30 +52,42 @@ var showDesktopNotification = desktop.ShowNotification
 const maxWebhookMessageBytes = 16 << 10
 const maxWebhookResponseBytes = 64 << 10
 
+// webhookHTTPClient is the one client every notification request goes through.
+//
+// The only time limit on a notification is deliveryTimeout, one overall
+// deadline that deliver puts on the context of every request. The client has
+// no dial, TLS handshake or response header timeouts: a limit on one step
+// would cut a slow but healthy server short (a slow proxy, a slow handshake, a
+// receiver that does its work before it answers) while the notification still
+// had time left. Client.Timeout stays unset as well; it restarts for every
+// redirect hop that do() follows and adds nothing to the context deadline.
+//
+// Without step timeouts a dial that nothing waits for any more can hang, so
+// deliver calls CloseIdleConnections once a notification is done.
+//
+// Redirects are never followed by net/http; do() decides (see redirectTarget).
 var webhookHTTPClient = &http.Client{
 	Transport: &http.Transport{
-		Proxy:                 http.ProxyFromEnvironment,
-		DialContext:           (&net.Dialer{Timeout: 3 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-		TLSHandshakeTimeout:   5 * time.Second,
-		ResponseHeaderTimeout: 5 * time.Second,
-		IdleConnTimeout:       30 * time.Second,
-		MaxIdleConns:          10,
-		MaxIdleConnsPerHost:   2,
+		Proxy:               http.ProxyFromEnvironment,
+		DialContext:         (&net.Dialer{KeepAlive: 30 * time.Second}).DialContext,
+		IdleConnTimeout:     30 * time.Second,
+		MaxIdleConns:        10,
+		MaxIdleConnsPerHost: 2,
 	},
-	Timeout: 10 * time.Second,
 	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-		return errors.New("webhook redirect is not permitted")
+		return http.ErrUseLastResponse
 	},
 }
 
-// Dispatch gives asynchronous notification delivery explicit ownership. Send
-// itself has a bounded ten-second network context, and Wait lets application
-// and test shutdown drain the owned work before closing the database.
-func Dispatch(webhookURL string, nativeEnabled, webhookEnabled bool, event Event, onError func(error)) {
+// Dispatch gives asynchronous notification delivery explicit ownership. Every
+// delivery is bounded by the ten-second deliveryTimeout, and Wait lets
+// application and test shutdown drain the owned work before closing the
+// database.
+func Dispatch(urls []string, nativeEnabled, urlsEnabled bool, event Event, onError func(error)) {
 	dispatchWG.Add(1)
 	go func() {
 		defer dispatchWG.Done()
-		err := SendAll(webhookURL, nativeEnabled, webhookEnabled, event)
+		err := SendAll(urls, nativeEnabled, urlsEnabled, event)
 		if onError != nil {
 			onError(err)
 		}
@@ -119,8 +129,8 @@ func PrepareOperation(
 			"notification settings unavailable: "+err.Error(), time.Now())
 		return nil
 	}
-	nativeEnabled, webhookEnabled := settings.NotificationChannels(status)
-	if !nativeEnabled && !webhookEnabled {
+	nativeEnabled, urlsEnabled := settings.NotificationChannels(status)
+	if !nativeEnabled && !urlsEnabled {
 		return nil
 	}
 	notification := event(settings)
@@ -132,7 +142,7 @@ func PrepareOperation(
 		return nil
 	}
 	return func() {
-		Dispatch(settings.WebhookURL, nativeEnabled, webhookEnabled, notification, func(err error) {
+		Dispatch(settings.NotificationURLs, nativeEnabled, urlsEnabled, notification, func(err error) {
 			stepStatus, result := "succeeded", "notification delivery completed"
 			if err != nil {
 				stepStatus, result = "warning", err.Error()
@@ -159,21 +169,24 @@ func ShouldNotify(event Event) bool {
 }
 
 // SendAll delivers an operation event to the selected notification channels.
-func SendAll(webhookURL string, nativeEnabled, webhookEnabled bool, event Event) error {
+// The notification URLs are sent in parallel under one ten-second budget, and
+// the error has one line per failed URL (and one for the desktop
+// notification), in list order.
+func SendAll(urls []string, nativeEnabled, urlsEnabled bool, event Event) error {
 	if !ShouldNotify(event) {
 		return nil
 	}
 	prepare(&event)
-	var nativeErr, webhookErr error
+	var failures []error
 	if nativeEnabled {
-		nativeErr = showDesktopNotification(event.Title, event.Message, event.OperationID, notificationStatus(event))
+		failures = append(failures, showDesktopNotification(event.Title, event.Message, event.OperationID, notificationStatus(event)))
 	}
-	if webhookEnabled {
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		webhookErr = sendContext(ctx, webhookURL, event)
+	if urlsEnabled {
+		for _, outcome := range deliver(context.Background(), CleanURLs(urls), event) {
+			failures = append(failures, outcome.err)
+		}
 	}
-	return errors.Join(nativeErr, webhookErr)
+	return errors.Join(failures...)
 }
 
 func prepare(event *Event) {
@@ -227,7 +240,14 @@ func prepare(event *Event) {
 	event.Title = localizedNotificationTitle(*event)
 }
 
+// testEvent is the event name of the settings page's "Send test"
+// notification. Its JSON webhook body has event "test" and status "success".
+const testEvent = "test"
+
 func localizedNotificationTitle(event Event) string {
+	if event.Event == testEvent {
+		return locale.Text(event.Locale, "notifications.test.title", nil)
+	}
 	key := "notifications.title.failed"
 	switch notificationStatus(event) {
 	case "success":
@@ -276,46 +296,42 @@ func notificationStatus(event Event) string {
 	return "failed"
 }
 
-func Send(webhookURL string, event Event) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	return SendContext(ctx, webhookURL, event)
+// Send delivers event to one notification URL with the usual ten-second
+// budget. An empty URL sends nothing.
+func Send(notificationURL string, event Event) error {
+	return SendContext(context.Background(), notificationURL, event)
 }
 
 // SendContext is the lifecycle-aware delivery seam used by shutdown tests and
-// callers that own a stricter deadline.
-func SendContext(ctx context.Context, webhookURL string, event Event) error {
-	prepare(&event)
-	return sendContext(ctx, webhookURL, event)
-}
-
-func sendContext(ctx context.Context, webhookURL string, event Event) error {
-	if webhookURL == "" {
+// callers that own a stricter deadline. The ten-second budget still applies
+// when ctx has a later deadline or none.
+func SendContext(ctx context.Context, notificationURL string, event Event) error {
+	if notificationURL == "" {
 		return nil
 	}
+	prepare(&event)
+	return deliver(ctx, []string{notificationURL}, event)[0].err
+}
+
+// The JSON webhook. http:// and https:// URLs get the Event JSON as it is:
+// existing receivers parse it, so don't switch these URLs to another format
+// or move them onto the shoutrrr-style senders.
+
+type webhookSender struct{ url string }
+
+func parseWebhook(u *url.URL, raw string) (sender, error) {
+	if u.Host == "" {
+		return nil, errors.New("missing host")
+	}
+	// The URL is used as typed; user info in it still becomes basic auth.
+	return webhookSender{url: raw}, nil
+}
+
+func (s webhookSender) send(ctx context.Context, event Event) error {
 	body, err := json.Marshal(event)
 	if err != nil {
-		return err
+		return errDeliveryFailed
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, webhookURL, bytes.NewReader(body))
-	if err != nil {
-		return errors.New("invalid webhook configuration")
-	}
-	req.Header.Set("Content-Type", "application/json")
-	response, err := webhookHTTPClient.Do(req)
-	if err != nil {
-		if ctx.Err() != nil {
-			return fmt.Errorf("webhook delivery stopped: %w", ctx.Err())
-		}
-		if strings.Contains(err.Error(), "redirect is not permitted") {
-			return errors.New("webhook redirect is not permitted")
-		}
-		return errors.New("webhook delivery failed")
-	}
-	defer response.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxWebhookResponseBytes))
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return fmt.Errorf("webhook returned %s", response.Status)
-	}
-	return nil
+	_, err = do(ctx, request{url: s.url, header: jsonHeader(), body: body})
+	return err
 }

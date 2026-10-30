@@ -116,12 +116,6 @@
           "default": "22"
         },
         {
-          "key": "password",
-          "label": "SFTP/SSH password",
-          "secret": true,
-          "credential": true
-        },
-        {
           "key": "identity",
           "label": "SSH identity/key file",
           "placeholder": "C:\\Users\\me\\.ssh\\id_ed25519",
@@ -138,19 +132,6 @@
           "key": "ssh_auth_sock",
           "label": "SSH agent socket",
           "credential": true,
-          "advanced": true
-        },
-        {
-          "key": "ssh_private_key",
-          "label": "SSH private key material",
-          "kind": "textarea",
-          "secret": true,
-          "credential": true,
-          "advanced": true
-        },
-        {
-          "key": "ssh_private_key_ttl",
-          "label": "Temporary key lifetime",
           "advanced": true
         }
       ]

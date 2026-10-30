@@ -4944,8 +4944,13 @@ input, select, textarea { font-size: 14.5px; }
 }
 
 
-/* A touch more air between the two sections */
-.protect-page .vault-section {
+/* A touch more air between the two sections, whichever one comes first.
+   The first section sits on the header's own spacing, so it drops the
+   general .vault-section gap when Vaults is on top. */
+.protect-page > section {
+    margin-top: 0;
+}
+.protect-page > section + section {
     margin-top: 44px;
 }
 

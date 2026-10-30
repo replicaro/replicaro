@@ -10,6 +10,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -37,6 +39,12 @@ const (
 	// ContextWithStorageFullMarkers. It is only used to explain a failure;
 	// it never changes how the failure is retried.
 	PrivateFailureStorageFull
+	// PrivateFailureSSHAuthentication is an SFTP server turning down key
+	// sign-in: publickey was among the methods tried and none of them
+	// worked. A wrong password on a password-only remote is not this kind.
+	// Like the host-key kinds it only picks the help shown with the generic
+	// error; the native text itself is still withheld.
+	PrivateFailureSSHAuthentication
 )
 
 type PrivateOutputError struct {
@@ -342,12 +350,6 @@ func RunCaptured(ctx context.Context, path string, args, env []string, timeout t
 	}
 	_ = capture.publish(ctx, engine, status, diagnostic)
 	return capture, diagnostic, runErr
-}
-
-// RunWithInputSecrets is the process boundary for commands that require a
-// credential on standard input. The input is never placed in argv or output.
-func RunWithInputSecrets(ctx context.Context, path string, args, env []string, input string, timeout time.Duration, engine string) (string, error) {
-	return runWithInput(ctx, path, args, childProcess{env: nativeEnvironment(env)}, input, timeout, engine, false, false, nil, nil)
 }
 
 // RunWithInputSecretsPrivateOutput is for commands whose standard output is
@@ -718,6 +720,34 @@ func redactPrivateFailureText(stderr string, redactions []string) string {
 	return text
 }
 
+var (
+	openSSHPermissionDenied = regexp.MustCompile(`permission denied \(([a-z0-9@.,_-]+)\)`)
+	goSSHAttemptedMethods   = regexp.MustCompile(`ssh: unable to authenticate, attempted methods \[([^\]]*)\]`)
+)
+
+// SSHKeySignInRefused reports whether SSH client output says the server
+// turned down key sign-in. OpenSSH prints the methods the server still allows,
+// as in "Permission denied (password,publickey).", and Go's x/crypto/ssh
+// (rclone and Kopia's own SFTP client) prints the methods it tried, as in
+// "ssh: unable to authenticate, attempted methods [none publickey], no
+// supported methods remain". Either only counts when publickey is in the
+// list: an Any Rclone Remote SFTP remote with a wrong password fails with
+// "[none password]", and pointing that user at their SSH key would be wrong.
+func SSHKeySignInRefused(text string) bool {
+	lower := strings.ToLower(text)
+	for _, match := range openSSHPermissionDenied.FindAllStringSubmatch(lower, -1) {
+		if slices.Contains(strings.Split(match[1], ","), "publickey") {
+			return true
+		}
+	}
+	for _, match := range goSSHAttemptedMethods.FindAllStringSubmatch(lower, -1) {
+		if slices.Contains(strings.Fields(match[1]), "publickey") {
+			return true
+		}
+	}
+	return false
+}
+
 func classifyPrivateFailure(stderr string, storageFullMarkers ...string) PrivateFailureKind {
 	lower := strings.ToLower(stderr)
 	if strings.Contains(lower, "failed to authenticate decrypted block - bad password?") {
@@ -730,6 +760,12 @@ func classifyPrivateFailure(stderr string, storageFullMarkers ...string) Private
 	}
 	if strings.Contains(lower, "knownhosts: key is unknown") {
 		return PrivateFailureSSHHostKeyUnknown
+	}
+	// Check a refused key before the generic credential markers below so a
+	// wrong key or username can get its own help. It comes after the host-key
+	// checks: a host-key refusal ends the handshake before any key is offered.
+	if SSHKeySignInRefused(lower) {
+		return PrivateFailureSSHAuthentication
 	}
 	for _, marker := range []string{"credential", "authentication", "authorization", "access denied", "permission denied", "unauthorized", "forbidden", "private key", "certificate"} {
 		if strings.Contains(lower, marker) {

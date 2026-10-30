@@ -924,6 +924,20 @@ export const saveSettings = (settings: Settings) => {
     return foreground(() => post("/api/settings", writable));
 };
 
+export interface NotificationUrlTestResult {
+	/** 1-based position in the list after blank lines are dropped. */
+	index: number;
+	/** "webhook" for http(s), otherwise the URL scheme. */
+	type: string;
+	ok: boolean;
+	error?: string;
+}
+
+// The URLs go as typed, unsaved; the server cleans and checks them the same
+// way it does on save and answers 400 when the list itself is invalid.
+export const testNotificationUrls = (urls: string[]) =>
+	post<{ results: NotificationUrlTestResult[] }>("/api/settings/notification-urls/test", { urls });
+
 export const getAppUpdateStatus = () => request<AppUpdateStatus>("/api/app-update/status");
 
 export const checkForAppUpdate = () => post<AppUpdateStatus>("/api/app-update/check");

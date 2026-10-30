@@ -2,15 +2,18 @@ package database
 
 import (
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"github.com/google/uuid"
 	"github.com/local/replicaro/models"
 	"strconv"
+	"strings"
 )
 
 const installationIDKey = "installationId"
 const languageKey = "language"
+const notificationURLsKey = "notificationUrls"
 
 // EnsureLanguageSetting only fills the absent key. It runs on the writable
 // startup connection before read-only pools open, including on older installs.
@@ -127,6 +130,7 @@ func GetSettings(
 	defer rows.Close()
 	legacyStartSeen := false
 	neutralStartSeen := false
+	var storedNotificationURLs *string
 
 	for rows.Next() {
 
@@ -179,6 +183,8 @@ func GetSettings(
 
 		case "webhookUrl":
 			settings.WebhookURL = value
+		case notificationURLsKey:
+			storedNotificationURLs = &value
 
 		case "notifyWindowsOnSuccess":
 			settings.NotifyWindowsOnSuccess = value == "true"
@@ -219,7 +225,39 @@ func GetSettings(
 		// login startup.
 		settings.StartAtLogin = settings.StartWithWindows
 	}
+	settings.NotificationURLs = notificationURLs(storedNotificationURLs, settings.WebhookURL)
 	return settings, nil
+}
+
+// notificationURLs reads the stored list. Until the list is first saved there
+// is no row, and an existing webhook URL becomes the list's only entry; that is
+// the whole upgrade, with no migration. An unreadable row falls back the same
+// way rather than dropping every notification.
+func notificationURLs(stored *string, webhookURL string) []string {
+	if stored != nil {
+		var urls []string
+		if json.Unmarshal([]byte(*stored), &urls) == nil {
+			if urls == nil {
+				urls = []string{}
+			}
+			return urls
+		}
+	}
+	if webhookURL == "" {
+		return []string{}
+	}
+	return []string{webhookURL}
+}
+
+// firstWebhookURL is the first http(s) entry of the list, or "".
+func firstWebhookURL(urls []string) string {
+	for _, entry := range urls {
+		lower := strings.ToLower(entry)
+		if strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://") {
+			return entry
+		}
+	}
+	return ""
 }
 
 func SaveSettings(
@@ -276,7 +314,6 @@ func SaveSettings(
 		"defaultEngine": settings.DefaultEngine,
 		"theme":         settings.Theme,
 		languageKey:     settings.Language,
-		"webhookUrl":    settings.WebhookURL,
 		// The notification and startup preferences each have an older key name
 		// and a newer one. Both names are written, so a build that reads either
 		// one sees the same choice.
@@ -291,6 +328,17 @@ func SaveSettings(
 		"startAtLogin":                 strconv.FormatBool(settings.StartAtLogin || settings.StartWithWindows),
 		"maxConcurrentJobRuns":         strconv.Itoa(settings.MaxConcurrentJobRuns),
 		appUpdateDisableAutomaticKey:   strconv.FormatBool(settings.DisableAutomaticUpdateChecks),
+	}
+	if settings.NotificationURLs != nil {
+		encoded, err := json.Marshal(settings.NotificationURLs)
+		if err != nil {
+			return err
+		}
+		values[notificationURLsKey] = string(encoded)
+		// Older builds only know webhookUrl. Keep writing it, as the first
+		// http(s) entry of the list, so a downgrade keeps the JSON webhook
+		// working. Nothing in this build sends to it.
+		values["webhookUrl"] = firstWebhookURL(settings.NotificationURLs)
 	}
 	for key, value := range values {
 		if _, err := tx.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)

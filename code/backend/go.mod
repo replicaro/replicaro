@@ -1,6 +1,6 @@
 module github.com/local/replicaro
 
-go 1.26.7
+go 1.26.10
 
 require (
 	github.com/godbus/dbus/v5 v5.2.2

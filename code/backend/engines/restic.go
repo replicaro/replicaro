@@ -1137,11 +1137,7 @@ func resticStorage(repo models.Repository) (string, []string, []string, error) {
 		// literal, so escape once here; Azure/GCS colon grammars below are not URLs.
 		repository := "sftp://" + user + sftpHostPort(address) + (&url.URL{Path: separator + path}).EscapedPath()
 		sshArgs := []string{"-p", address.Port, "-o", externalSSHBatchMode}
-		identity, err := materializeSSHPrivateKey(repo)
-		if err != nil {
-			return "", nil, nil, err
-		}
-		if identity != "" {
+		if identity := sftpIdentityFile(options); identity != "" {
 			if strings.ContainsAny(identity, "\r\n\"") {
 				return "", nil, nil, fmt.Errorf("Restic SFTP identity paths cannot contain quotes or newlines")
 			}

@@ -1813,11 +1813,24 @@ func translateRemote(repo models.Repository) (remoteConfig, error) {
 		}
 		root = remotePath(effective.Bucket, effective.Prefix)
 	case "sftp":
+		// SFTP vaults sign in only with a key file or an SSH agent. PASS and
+		// KEY_PEM stay in the list, set empty like the other sign-in settings
+		// below, because these variables override same-named fields in the
+		// vault's rclone config file. Leaving them out would let a value in that
+		// file sign rclone in some way the engines never would.
+		//
+		// A key filename is passed byte for byte, spaces included, so rclone
+		// opens the same file validation looked at. Only a whitespace-only
+		// value counts as blank, as it does for the engines.
+		identity := repo.ConnectorOptions["identity"]
+		if strings.TrimSpace(identity) == "" {
+			identity = ""
+		}
 		env = append(env, "RCLONE_CONFIG_BASE_TYPE=sftp", "RCLONE_CONFIG_BASE_HOST="+effective.Host,
 			"RCLONE_CONFIG_BASE_USER="+effective.Username, "RCLONE_CONFIG_BASE_PORT="+effective.Port,
-			"RCLONE_CONFIG_BASE_PASS="+repo.ConnectorOptions["password"],
-			"RCLONE_CONFIG_BASE_KEY_FILE="+repo.ConnectorOptions["identity"],
-			"RCLONE_CONFIG_BASE_KEY_PEM="+repo.ConnectorOptions["ssh_private_key"],
+			"RCLONE_CONFIG_BASE_PASS=",
+			"RCLONE_CONFIG_BASE_KEY_FILE="+identity,
+			"RCLONE_CONFIG_BASE_KEY_PEM=",
 			"RCLONE_CONFIG_BASE_KEY_FILE_PASS=", "RCLONE_CONFIG_BASE_PUBKEY=",
 			"RCLONE_CONFIG_BASE_PUBKEY_FILE=", "RCLONE_CONFIG_BASE_SSH=",
 			"RCLONE_CONFIG_BASE_ASK_PASSWORD=false",
@@ -1836,9 +1849,6 @@ func translateRemote(repo models.Repository) (remoteConfig, error) {
 			info, statErr := os.Stat(knownHosts)
 			if statErr != nil {
 				if errors.Is(statErr, os.ErrNotExist) {
-					if repo.Engine == "kopia" && strings.TrimSpace(repo.ConnectorOptions["password"]) != "" {
-						return remoteConfig{}, fmt.Errorf("SSH known_hosts file %q is required for Kopia SFTP password authentication; add this server's host key before retrying", knownHosts)
-					}
 					return remoteConfig{}, fmt.Errorf("SSH known_hosts file %q does not exist; add this server's host key or enable \"Disable host-key/known_hosts verification\"", knownHosts)
 				}
 				return remoteConfig{}, fmt.Errorf("inspect SSH known_hosts file: %w", statErr)

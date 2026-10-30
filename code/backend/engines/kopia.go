@@ -3,7 +3,6 @@ package engines
 import (
 	"bufio"
 	"context"
-	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -257,9 +256,6 @@ func (s *kopiaRepositorySession) run(ctx context.Context, args []string, timeout
 		}
 		return output, err
 	}
-	if err := validateKopiaRepositoryInvocation(s.repo); err != nil {
-		return "", kopiaPreparationFailure(err)
-	}
 	commandContext, processStarted := command.ContextWithProcessStartTracking(ctx)
 	if eligibleKopiaLiveCommand(args) {
 		commandContext = command.ContextWithLiveOutputEnabled(commandContext)
@@ -277,9 +273,6 @@ func (s *kopiaRepositorySession) run(ctx context.Context, args []string, timeout
 }
 
 func (s *kopiaRepositorySession) runCaptured(ctx context.Context, args []string, timeout time.Duration) (*command.CapturedOutput, string, error) {
-	if err := validateKopiaRepositoryInvocation(s.repo); err != nil {
-		return nil, "", kopiaPreparationFailure(err)
-	}
 	commandContext, processStarted := command.ContextWithProcessStartTracking(ctx)
 	if eligibleKopiaLiveCommand(args) {
 		commandContext = command.ContextWithLiveOutputEnabled(commandContext)
@@ -356,9 +349,6 @@ func (e *kopiaEngine) Info(ctx context.Context, repo models.Repository) (output 
 	if err != nil {
 		return output, err
 	}
-	if err := validateKopiaRepositoryInvocation(repo); err != nil {
-		return output, err
-	}
 	status, statusErr := e.run(ctx, env, append(base, "repository", "status", "--json"), command.NoTotalDeadline)
 	if statusErr != nil {
 		return status, statusErr
@@ -385,11 +375,11 @@ func (e *kopiaEngine) Create(ctx context.Context, repo models.Repository) (outpu
 	// Only the native storage-create command streams live output to the user.
 	// The client and policy commands that follow are internal setup and do not.
 	repo = normalizedStorageRepository(repo, KopiaID)
-	args, input, err := kopiaStorageInvocation(repo, "create")
+	args, err := kopiaStorageArgs(repo, "create")
 	if err != nil {
 		return "", err
 	}
-	out, err := e.repoRunWithInput(command.ContextWithLiveOutputEnabled(ctx), repo, args, input, command.NoTotalDeadline)
+	out, err := e.repoRun(command.ContextWithLiveOutputEnabled(ctx), repo, args, command.NoTotalDeadline)
 	if err != nil {
 		return out, err
 	}
@@ -1186,9 +1176,6 @@ func (e *kopiaEngine) prepareIntegrityCheckCache(ctx context.Context, repo model
 	if err != nil {
 		return "", err
 	}
-	if err := validateKopiaRepositoryInvocation(repo); err != nil {
-		return "", err
-	}
 	operationRoot := filepath.Dir(operationConfig)
 	preparationCache := filepath.Join(operationRoot, "cache")
 	if err := os.Mkdir(preparationCache, 0o700); err != nil {
@@ -1246,9 +1233,6 @@ func (e *kopiaEngine) Check(ctx context.Context, repo models.Repository) (output
 	}
 	base, env, err := e.kopiaIntegrityBase(repo, operationConfig)
 	if err != nil {
-		return "", kopiaPreparationFailure(err)
-	}
-	if err := validateKopiaRepositoryInvocation(repo); err != nil {
 		return "", kopiaPreparationFailure(err)
 	}
 
@@ -1354,10 +1338,6 @@ func forgetKopiaCachedFormat(repo models.Repository) error {
 	return nil
 }
 
-func (e *kopiaEngine) repoRun(ctx context.Context, repo models.Repository, args []string, timeout time.Duration) (string, error) {
-	return e.repoRunWithInput(ctx, repo, args, "", timeout)
-}
-
 func (e *kopiaEngine) repoRunWithEnvironment(ctx context.Context, repo models.Repository, args []string, timeout time.Duration, key, value string) (string, error) {
 	repo = normalizedStorageRepository(repo, KopiaID)
 	base, env, err := e.baseArgs(repo)
@@ -1367,9 +1347,6 @@ func (e *kopiaEngine) repoRunWithEnvironment(ctx context.Context, repo models.Re
 	env = replaceEnvironment(env, key, value)
 	if output, readyErr := e.ensureKopiaRepository(ctx, repo, base, env, false); readyErr != nil {
 		return output, kopiaPreparationFailure(readyErr)
-	}
-	if err := validateKopiaRepositoryInvocation(repo); err != nil {
-		return "", kopiaPreparationFailure(err)
 	}
 	commandContext, processStarted := command.ContextWithProcessStartTracking(ctx)
 	// Only the password change comes through here; another command reusing
@@ -1409,11 +1386,11 @@ func removeEnvironment(env []string, key string) []string {
 	return result
 }
 
-// repoRunWithInput runs ordinary commands against the canonical Kopia config.
+// repoRun runs ordinary commands against the canonical Kopia config.
 // Integrity checks never come through here: Check runs `snapshot verify` on an
 // operation-owned config copy via runCaptured and does its own
 // admitIntegrityCheck, so there is deliberately no verify admission below.
-func (e *kopiaEngine) repoRunWithInput(ctx context.Context, repo models.Repository, args []string, input string, timeout time.Duration) (string, error) {
+func (e *kopiaEngine) repoRun(ctx context.Context, repo models.Repository, args []string, timeout time.Duration) (string, error) {
 	repo = normalizedStorageRepository(repo, KopiaID)
 	if !kopiaBootstrapCommand(args) {
 		if session := scopedKopiaSession(ctx, repo); session != nil {
@@ -1439,12 +1416,6 @@ func (e *kopiaEngine) repoRunWithInput(ctx context.Context, repo models.Reposito
 	}
 	var output string
 	var runErr error
-	if err := validateKopiaRepositoryInvocation(repo); err != nil {
-		if kopiaBootstrapCommand(args) {
-			return "", err
-		}
-		return "", kopiaPreparationFailure(err)
-	}
 	if len(args) >= 2 && args[0] == "snapshot" && args[1] == "delete" {
 		if admissionErr := admitNativeDeletion(ctx); admissionErr != nil {
 			return "", kopiaPreparationFailure(admissionErr)
@@ -1459,14 +1430,12 @@ func (e *kopiaEngine) repoRunWithInput(ctx context.Context, repo models.Reposito
 		}
 	}
 	var capture *command.CapturedOutput
-	if input == "" && eligibleKopiaLiveCommand(args) {
+	if eligibleKopiaLiveCommand(args) {
 		commandContext = command.ContextWithCapturedOutputKind(commandContext, kopiaOutputKind(args))
 		capture, output, runErr = e.runCaptured(commandContext, env, kopiaCommandArgs(base, args), timeout)
 		if capture != nil {
 			defer capture.Close()
 		}
-	} else if input != "" {
-		output, runErr = e.runWithInput(commandContext, env, kopiaCommandArgs(base, args), input, timeout)
 	} else {
 		output, runErr = e.run(commandContext, env, kopiaCommandArgs(base, args), timeout)
 	}
@@ -1513,9 +1482,6 @@ func (e *kopiaEngine) ensureKopiaRepository(ctx context.Context, repo models.Rep
 	if statErr != nil && !probeMissing {
 		return output, nil
 	}
-	if err := validateKopiaRepositoryInvocation(repo); err != nil {
-		return output, err
-	}
 	status, err := e.run(ctx, env, append(base, "repository", "status", "--json"), command.NoTotalDeadline)
 	if err != nil {
 		return output + status, err
@@ -1527,15 +1493,6 @@ func (e *kopiaEngine) ensureKopiaRepository(ctx context.Context, repo models.Rep
 		output += "\n"
 	}
 	return output + status, nil
-}
-
-func validateKopiaRepositoryInvocation(repo models.Repository) error {
-	repo = normalizedStorageRepository(repo, KopiaID)
-	if repo.Connector != "sftp" || strings.TrimSpace(repo.ConnectorOptions["password"]) == "" {
-		return nil
-	}
-	_, err := ValidateSFTPKnownHosts(repo.ConnectorOptions)
-	return err
 }
 
 func kopiaBootstrapCommand(args []string) bool {
@@ -1722,73 +1679,11 @@ func schemeForKopiaS3(config map[string]any) string {
 }
 
 func (e *kopiaEngine) connect(ctx context.Context, repo models.Repository) (string, error) {
-	args, input, err := kopiaStorageInvocation(repo, "connect")
+	args, err := kopiaStorageArgs(repo, "connect")
 	if err != nil {
 		return "", err
 	}
-	return e.repoRunWithInput(ctx, repo, args, input, command.NoTotalDeadline)
-}
-
-type kopiaStorageToken struct {
-	Version string                  `json:"version"`
-	Storage kopiaStorageTokenConfig `json:"storage"`
-}
-
-type kopiaStorageTokenConfig struct {
-	Type   string                   `json:"type"`
-	Config kopiaSFTPTokenConfigData `json:"config"`
-}
-
-type kopiaSFTPTokenConfigData struct {
-	Path           string `json:"path"`
-	Host           string `json:"host"`
-	Port           int    `json:"port"`
-	Username       string `json:"username"`
-	Password       string `json:"password,omitempty"`
-	KnownHostsFile string `json:"knownHostsFile,omitempty"`
-}
-
-func kopiaStorageInvocation(repo models.Repository, operation string) ([]string, string, error) {
-	repo = normalizedStorageRepository(repo, KopiaID)
-	args, err := kopiaStorageArgs(repo, operation)
-	if err != nil {
-		return nil, "", err
-	}
-	if repo.Connector != "sftp" || strings.TrimSpace(repo.ConnectorOptions["password"]) == "" {
-		return args, "", nil
-	}
-	address, err := effectiveAddress(repo)
-	if err != nil {
-		return nil, "", err
-	}
-	if boolOption(repo.ConnectorOptions, "insecure_ignore_host_key") {
-		return nil, "", fmt.Errorf("Kopia SFTP password authentication requires host-key verification")
-	}
-	// Kopia's from-config token path accepts storage credentials on stdin;
-	// keeping the password out of argv preserves Replicaro's process boundary.
-	port, err := strconv.Atoi(address.Port)
-	if err != nil {
-		return nil, "", fmt.Errorf("Kopia SFTP port: %w", err)
-	}
-	knownHosts, err := ValidateSFTPKnownHosts(repo.ConnectorOptions)
-	if err != nil {
-		return nil, "", err
-	}
-	token := kopiaStorageToken{
-		Version: "1",
-		Storage: kopiaStorageTokenConfig{
-			Type: "sftp",
-			Config: kopiaSFTPTokenConfigData{
-				Path: address.Prefix, Host: address.Host, Port: port, Username: address.Username,
-				Password: repo.ConnectorOptions["password"], KnownHostsFile: knownHosts,
-			},
-		},
-	}
-	data, err := json.Marshal(token)
-	if err != nil {
-		return nil, "", fmt.Errorf("encode Kopia SFTP credentials: %w", err)
-	}
-	return args, base64.RawURLEncoding.EncodeToString(data) + "\n", nil
+	return e.repoRun(ctx, repo, args, command.NoTotalDeadline)
 }
 
 func kopiaStorageArgs(repo models.Repository, operation string) ([]string, error) {
@@ -1821,13 +1716,6 @@ func kopiaStorageArgs(repo models.Repository, operation string) ([]string, error
 		if address.Username == "" {
 			return nil, fmt.Errorf("SFTP username is required for Kopia")
 		}
-		if strings.TrimSpace(options["password"]) != "" {
-			if boolOption(options, "insecure_ignore_host_key") {
-				return nil, fmt.Errorf("Kopia SFTP password authentication requires host-key verification")
-			}
-			args = append(args, "from-config", "--token-stdin")
-			return append(args, common...), nil
-		}
 		// Kopia stores these ssh options in repository.config when it connects,
 		// so a vault connected by an earlier version keeps its old options until
 		// it is reconnected or its credentials are updated; both run
@@ -1836,10 +1724,7 @@ func kopiaStorageArgs(repo models.Repository, operation string) ([]string, error
 		// the check after a connect fails. Don't add an automatic refresh here
 		// without a product decision.
 		sshArgs := []string{"-p", address.Port, "-o", externalSSHBatchMode}
-		identity, err := materializeSSHPrivateKey(repo)
-		if err != nil {
-			return nil, err
-		}
+		identity := sftpIdentityFile(options)
 		insecure := boolOption(options, "insecure_ignore_host_key")
 		if identity != "" && !insecure {
 			home, err := os.UserHomeDir()
@@ -1943,12 +1828,6 @@ func (e *kopiaEngine) runCaptured(ctx context.Context, env, args []string, timeo
 	return capturedCommandRunner(ctx, e.path, args, env, timeout, KopiaID)
 }
 
-func (e *kopiaEngine) runWithInput(ctx context.Context, env, args []string, input string, timeout time.Duration) (string, error) {
-	if e.path == "" {
-		return "", fmt.Errorf("bundled kopia engine is unavailable")
-	}
-	return commandRunnerWithInput(ctx, e.path, args, env, input, timeout, KopiaID)
-}
 func parseKopiaSnapshot(output string) (models.Snapshot, error) {
 	return parseKopiaSnapshotReader(strings.NewReader(output))
 }
