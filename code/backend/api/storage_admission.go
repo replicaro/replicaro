@@ -40,6 +40,14 @@ func storageBindingError(err error, subject, ability, fallback string) error {
 }
 
 func storageBindingErrorForPlatform(platform string, err error, subject, ability, fallback string) error {
+	if refusal := storageavailability.SourceRefusal(err); refusal != nil {
+		// A symlink, device, pipe or socket, or a file mounted on its own: the
+		// path is there but can't be a job source, and only these two texts
+		// tell the user what to choose instead. Every other failure keeps the
+		// fixed message below. Only source probes can produce these, so vault
+		// bindings never take this branch.
+		return &storageBindingFailure{message: refusal.Error(), cause: err}
+	}
 	if platform != "darwin" || !storageavailability.IsPermissionDenied(err) {
 		// The public message stays fixed. The wrapped cause only lets the support
 		// recorder classify the local storage failure.
@@ -74,10 +82,16 @@ func bindExistingRepositoryStorage(ctx context.Context, repo models.Repository) 
 	return bound, nil
 }
 
+// bindJobSourceStorage binds the source of a job being created. A new job's
+// kind isn't known until its path is probed, so it is bound as "unknown" and
+// comes back as a folder job ("") or a file job.
 func bindJobSourceStorage(ctx context.Context, job models.BackupJob) (models.BackupJob, error) {
+	job.SourceKind = models.SourceKindUnknown
 	return bindJobSourceStorageAt(ctx, job, storageavailability.StageJobCreateSource)
 }
 
+// bindJobSourceStorageAt probes with the kind job already carries; see
+// storageavailability.BindJobSource.
 func bindJobSourceStorageAt(ctx context.Context, job models.BackupJob, stage string) (models.BackupJob, error) {
 	bound, err := storageavailability.BindJobSource(ctx, job, stage)
 	if err != nil {
@@ -87,11 +101,17 @@ func bindJobSourceStorageAt(ctx context.Context, job models.BackupJob, stage str
 	return bound, nil
 }
 
+// bindImportedJobSourceStorage is first binding of a recovered or adopted job.
+// It probes by the job's recorded kind: a folder job with the folder probe, a
+// file job expecting a file, and an adopted import of unknown kind finding
+// out which it is. A failure reads as the missing-source guidance, except the
+// macOS permission guidance and the two source refusals, which say what to
+// do better than "copy the job".
 func bindImportedJobSourceStorage(ctx context.Context, job models.BackupJob) (models.BackupJob, error) {
 	bound, err := bindJobSourceStorageAt(ctx, job, storageavailability.StageJobBindSource)
 	if err != nil {
 		var access *macOSAccessError
-		if errors.As(err, &access) {
+		if errors.As(err, &access) || storageavailability.SourceRefusal(err) != nil {
 			return models.BackupJob{}, err
 		}
 		return models.BackupJob{}, &storageBindingFailure{message: importedSourceMissingMessage, cause: err}
@@ -110,12 +130,23 @@ func bindImportedJobSourceStorage(ctx context.Context, job models.BackupJob) (mo
 // restore still succeeds; first binding then runs again when the job is
 // enabled or run, exactly as it does for any imported job, and reports the
 // failure there.
+//
+// The probe follows the definition's recorded kind, as every first binding
+// does. If an unknown kind turns out to be a file, the definition's exclusion
+// and marker-file settings are cleared here, so the CreateJob that stores the
+// kind also stores them empty: a file job never keeps them (they have no
+// effect on one file, and CreateJob refuses a file job that has them).
+// CreateJob then marks the vault profiles and Kopia policy states of the
+// job's vaults, as it does for every new job.
 func firstBindRestoredSource(ctx context.Context, job models.BackupJob) models.BackupJob {
 	job.SourceBindingState = "unbound_imported"
 	job.SourceStorageVersion, job.SourceStorageKey, job.SourceStorageDescriptorJSON = "", "", ""
 	bound, err := bindImportedJobSourceStorage(ctx, job)
 	if err != nil {
 		return job
+	}
+	if job.SourceKind == models.SourceKindUnknown && bound.IsFileSource() {
+		bound.Excludes, bound.SkipNoBackupFolders, bound.SkipCacheDirFolders, bound.SkipMarkerFileName = "", false, false, ""
 	}
 	return bound
 }

@@ -121,7 +121,7 @@ func (definition *portableJobDefinition) UnmarshalJSON(data []byte) error {
 func portableDefinitionFromModel(job models.BackupJob) portableJobDefinition {
 	definition := portableJobDefinition{
 		BackupJob: vaultprofile.BackupJob{
-			JobUUID: job.ID, Name: job.Name, Source: job.Source, Schedule: job.Schedule,
+			JobUUID: job.ID, Name: job.Name, Source: job.Source, SourceKind: job.SourceKind, Schedule: job.Schedule,
 			Retention: job.Retention, RetentionHourly: job.RetentionHourly,
 			RetentionDaily: job.RetentionDaily, RetentionWeekly: job.RetentionWeekly,
 			RetentionMonthly: job.RetentionMonthly, RetentionYearly: job.RetentionYearly,
@@ -302,7 +302,7 @@ func insertDormantRecoveryJobs(tx *sql.Tx, repositoryID string, definitions []Do
 			return nil, err
 		}
 		var activeJSON, portableJSON, alias string
-		var name, source, sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
+		var name, source, sourceKind, sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
 		var schedule, excludes, tag, beforeScriptPath, afterScriptPath string
 		var skipNoBackup, skipCacheDir bool
 		var skipMarkerName string
@@ -315,12 +315,12 @@ func insertDormantRecoveryJobs(tx *sql.Tx, repositoryID string, definitions []Do
 			skip_nobackup_folders,skip_cachedir_folders,skip_marker_file_name,tag,
 			before_script_path,before_script_must_succeed,after_script_path,after_script_must_succeed,
 			engine_settings,
-			portable_target_ids,enabled,resolved_source_path FROM backup_jobs WHERE id=?`, definition.JobID).Scan(
+			portable_target_ids,enabled,resolved_source_path,source_kind FROM backup_jobs WHERE id=?`, definition.JobID).Scan(
 			&name, &source, &sourceStorageVersion, &sourceStorageKey, &sourceStorageJSON, &sourceBindingState,
 			&schedule, &retention, &retentionHourly, &retentionDaily, &retentionWeekly,
 			&retentionMonthly, &retentionYearly, &excludes, &skipNoBackup, &skipCacheDir, &skipMarkerName,
 			&tag, &beforeScriptPath, &beforeScriptMustSucceed,
-			&afterScriptPath, &afterScriptMustSucceed, &activeJSON, &portableJSON, &enabled, &alias)
+			&afterScriptPath, &afterScriptMustSucceed, &activeJSON, &portableJSON, &enabled, &alias, &sourceKind)
 		if err != nil && err != sql.ErrNoRows {
 			return nil, err
 		}
@@ -332,7 +332,7 @@ func insertDormantRecoveryJobs(tx *sql.Tx, repositoryID string, definitions []Do
 			}
 			active := portableJobDefinition{
 				BackupJob: vaultprofile.BackupJob{
-					JobUUID: definition.JobID, Name: name, Source: source, Schedule: schedule,
+					JobUUID: definition.JobID, Name: name, Source: source, SourceKind: sourceKind, Schedule: schedule,
 					Retention: retention, RetentionHourly: nullableRetentionValue(retentionHourly),
 					RetentionDaily: nullableRetentionValue(retentionDaily), RetentionWeekly: nullableRetentionValue(retentionWeekly),
 					RetentionMonthly: nullableRetentionValue(retentionMonthly), RetentionYearly: nullableRetentionValue(retentionYearly),
@@ -524,7 +524,7 @@ func PrepareDormantRecoveryJob(db *sql.DB, repositoryID, jobID string) (models.B
 		return models.BackupJob{}, fmt.Errorf("dormant recovery definition is invalid")
 	}
 	job := models.BackupJob{
-		ID: saved.JobUUID, Name: saved.Name, Source: saved.Source, Schedule: saved.Schedule,
+		ID: saved.JobUUID, Name: saved.Name, Source: saved.Source, SourceKind: saved.SourceKind, Schedule: saved.Schedule,
 		Retention: saved.Retention, RetentionHourly: saved.RetentionHourly,
 		RetentionDaily: saved.RetentionDaily, RetentionWeekly: saved.RetentionWeekly,
 		RetentionMonthly: saved.RetentionMonthly, RetentionYearly: saved.RetentionYearly,

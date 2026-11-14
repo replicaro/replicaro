@@ -147,9 +147,16 @@ const SnapshotRow = memo(function SnapshotRow({ snapshot, job, ready, actions }:
 		<time>{snapshotTime(snapshot.timestamp)}</time>
 		{job ? <JobSourceLabel job={job} className="snapshot-source" /> : <span className="snapshot-source">{snapshotSourceLabel(snapshot)}</span>}
 		<span className="snapshot-size">{snapshot.size || "—"}</span>
-		<span className="snapshot-actions">{snapshotRoots(snapshot).map((root) => snapshot.nativeRootType === "f"
-			? <Tooltip key={root.nativeRootId} content={t("ui.pages.restore.this.snapshot.does.not.support.browse.it.only.supports.restore")}><button className="btn sm snapshot-browse-unavailable" aria-label={t("ui.pages.restore.browse")} aria-disabled="true">{t("ui.pages.restore.browse")}</button></Tooltip>
-			: <button key={root.nativeRootId} className="btn sm" disabled={!ready} onClick={() => actions.browse(snapshot, root)}>{t("ui.pages.restore.browse")}{snapshotRoots(snapshot).length > 1 ? ` ${snapshotRootLabel(root)}` : ""}</button>)}<button className="btn sm restore-button" onClick={() => actions.restore(snapshot)}>{t("ui.pages.restore.restore")}</button><Tooltip content={t("ui.pages.restore.delete.snapshot")}><button className="btn ghost-icon danger-hover" aria-label={t("ui.pages.restore.delete")} onClick={() => actions.remove(snapshot)}><Icon name="trash" size={15} /></button></Tooltip></span>
+		<span className="snapshot-actions">{snapshotRoots(snapshot).map((root) => {
+			const label = `${t("ui.pages.restore.browse")}${snapshotRoots(snapshot).length > 1 ? ` ${snapshotRootLabel(root)}` : ""}`;
+			// A root that is a single file has no folder to browse; the whole
+			// restore below restores it. Kopia's header says so for its one
+			// root, and the indexed entries say so for every root (Restic's
+			// header doesn't). The server refuses the browse either way.
+			return snapshot.nativeRootType === "f" || snapshot.fileRootIds?.includes(root.nativeRootId)
+				? <Tooltip key={root.nativeRootId} content={t("ui.restore.fileSourceBrowseUnavailable")}><button className="btn sm snapshot-browse-unavailable" aria-label={label} aria-disabled="true">{label}</button></Tooltip>
+				: <button key={root.nativeRootId} className="btn sm" disabled={!ready} onClick={() => actions.browse(snapshot, root)}>{label}</button>;
+		})}<button className="btn sm restore-button" onClick={() => actions.restore(snapshot)}>{t("ui.pages.restore.restore")}</button><Tooltip content={t("ui.pages.restore.delete.snapshot")}><button className="btn ghost-icon danger-hover" aria-label={t("ui.pages.restore.delete")} onClick={() => actions.remove(snapshot)}><Icon name="trash" size={15} /></button></Tooltip></span>
 	</article>;
 }, (previous, next) => previous.ready === next.ready && previous.job === next.job && previous.actions === next.actions &&
 	(previous.snapshot === next.snapshot || JSON.stringify(previous.snapshot) === JSON.stringify(next.snapshot)));

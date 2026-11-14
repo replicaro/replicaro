@@ -30,6 +30,9 @@ var (
 	ErrJobSourceImmutable = errors.New("backup job source cannot be changed after creation")
 	ErrJobSourceChanged   = errors.New("backup job source changed during binding; retry the operation")
 	ErrJobSourceUnbound   = errors.New("imported backup job source is not bound to this computer")
+	// ErrFileSourceExclusions refuses saving a single-file job with folder
+	// exclusion settings, which can never apply to one file.
+	ErrFileSourceExclusions = errors.New("a backup job whose source is a single file can't have exclusions or skip-folder options")
 	// ErrJobDefinitionChanged refuses an edit whose revision no longer matches
 	// the stored definition. The API sends this text with the
 	// job_definition_changed code, which the UI translates.
@@ -266,7 +269,7 @@ const jobColumns = `id, name, source, source_storage_version, source_storage_key
 	retention_hourly, retention_daily, retention_weekly, retention_monthly, retention_yearly,
 	excludes, skip_nobackup_folders, skip_cachedir_folders, skip_marker_file_name, tag,
 	before_script_path, before_script_must_succeed, after_script_path, after_script_must_succeed,
-	engine_settings, portable_target_ids`
+	engine_settings, portable_target_ids, source_kind`
 
 type engineSettingsEnvelope struct {
 	Version int                   `json:"version"`
@@ -328,7 +331,7 @@ func scanJob(scan func(dest ...any) error) (models.BackupJob, error) {
 		&j.Retention, &hourly, &daily, &weekly, &monthly, &yearly,
 		&j.Excludes, &j.SkipNoBackupFolders, &j.SkipCacheDirFolders, &j.SkipMarkerFileName,
 		&j.Tag, &j.BeforeScriptPath, &j.BeforeScriptMustSucceed,
-		&j.AfterScriptPath, &j.AfterScriptMustSucceed, &settingsJSON, &targetIDsJSON)
+		&j.AfterScriptPath, &j.AfterScriptMustSucceed, &settingsJSON, &targetIDsJSON, &j.SourceKind)
 	if err == nil {
 		j.RetentionHourly = nullableRetentionValue(hourly)
 		j.RetentionDaily = nullableRetentionValue(daily)
@@ -657,6 +660,15 @@ func CreateJob(db *sql.DB, job models.BackupJob) (string, error) {
 	if err := validateJobSourceBinding(job); err != nil {
 		return "", err
 	}
+	if err := validateJobSourceKind(job); err != nil {
+		return "", err
+	}
+	if err := validateFileSourceOptions(job); err != nil {
+		return "", err
+	}
+	if job.IsFileSource() {
+		job.Excludes = ""
+	}
 	tx, err := db.Begin()
 	if err != nil {
 		return "", err
@@ -701,8 +713,8 @@ func CreateJob(db *sql.DB, job models.BackupJob) (string, error) {
 		retention_hourly, retention_daily, retention_weekly, retention_monthly, retention_yearly,
 		excludes, skip_nobackup_folders, skip_cachedir_folders, skip_marker_file_name,
 		tag, before_script_path, before_script_must_succeed,
-		after_script_path, after_script_must_succeed, engine_settings, portable_target_ids)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		after_script_path, after_script_must_succeed, engine_settings, portable_target_ids, source_kind)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		id, job.Name, job.Source, job.SourceStorageVersion, job.SourceStorageKey,
 		job.SourceStorageDescriptorJSON, func() string {
 			if job.SourceBindingState == "" {
@@ -714,7 +726,7 @@ func CreateJob(db *sql.DB, job models.BackupJob) (string, error) {
 		job.RetentionHourly, job.RetentionDaily, job.RetentionWeekly, job.RetentionMonthly, job.RetentionYearly,
 		job.Excludes, job.SkipNoBackupFolders, job.SkipCacheDirFolders, job.SkipMarkerFileName,
 		job.Tag, job.BeforeScriptPath, job.BeforeScriptMustSucceed,
-		job.AfterScriptPath, job.AfterScriptMustSucceed, string(settingsJSON), string(portableJSON))
+		job.AfterScriptPath, job.AfterScriptMustSucceed, string(settingsJSON), string(portableJSON), job.SourceKind)
 	if err != nil {
 		return "", err
 	}
@@ -845,6 +857,16 @@ func updateJob(db *sql.DB, job models.BackupJob, definitionEdit bool, expectedRe
 	}
 	if err := validateJobSourceTransition(existingJob, job, false); err != nil {
 		return err
+	}
+	// The kind is part of the source, which a definition edit never changes,
+	// so the stored kind is what this edit is checked against (the UPDATE
+	// below doesn't write it).
+	job.SourceKind = existingJob.SourceKind
+	if err := validateFileSourceOptions(job); err != nil {
+		return err
+	}
+	if job.IsFileSource() {
+		job.Excludes = ""
 	}
 	if normalizedJobSourceBindingState(existingJob.SourceBindingState) == "bound" {
 		// A definition update never changes the local binding. Writing the
@@ -1034,6 +1056,113 @@ func validateJobSourceTransition(existing, next models.BackupJob, allowFirstBind
 		existing.SourceStorageVersion, existing.SourceStorageKey, existing.SourceStorageDescriptorJSON,
 		next.SourceStorageVersion, next.SourceStorageKey, next.SourceStorageDescriptorJSON) {
 		return ErrJobSourceImmutable
+	}
+	return nil
+}
+
+// validateJobSourceKind checks a kind about to be stored. "unknown" only
+// describes a recovered or imported job that hasn't been bound here yet.
+func validateJobSourceKind(job models.BackupJob) error {
+	switch job.SourceKind {
+	case "", models.SourceKindFile:
+		return nil
+	case models.SourceKindUnknown:
+		if normalizedJobSourceBindingState(job.SourceBindingState) == "unbound_imported" {
+			return nil
+		}
+		return fmt.Errorf("a bound backup job source must have a known kind")
+	default:
+		return fmt.Errorf("unsupported backup job source kind")
+	}
+}
+
+// validateJobSourceKindTransition is the kind's counterpart of
+// validateJobSourceTransition. Whether a source is a folder or a file is
+// fixed with the source itself: it changes only once, when a recovered or
+// imported job of unknown kind is first bound on this computer and the
+// probe has seen what the path is.
+func validateJobSourceKindTransition(existing, next models.BackupJob, allowFirstBinding bool) error {
+	if err := validateJobSourceKind(next); err != nil {
+		return err
+	}
+	if existing.SourceKind == next.SourceKind {
+		return nil
+	}
+	if existing.SourceKind == models.SourceKindUnknown && allowFirstBinding &&
+		normalizedJobSourceBindingState(existing.SourceBindingState) == "unbound_imported" &&
+		normalizedJobSourceBindingState(next.SourceBindingState) == "bound" {
+		return nil
+	}
+	return ErrJobSourceImmutable
+}
+
+// recordFirstBindingSourceKind stores the kind a first binding found, when it
+// differs from the recorded one. Callers run validateJobSourceKindTransition
+// first, so the only change that gets here is an adopted import of unknown
+// kind settling as a folder ("") or a file, in the same transaction that
+// saves its binding. It reports whether the kind changed.
+//
+// When an unknown import turns out to be a file, its exclusion and
+// marker-file settings are cleared in the same statement. Adopted imports are
+// created without any, so they can only be there if the user edited the job
+// before enabling it; on one file they never had an effect, a file job is
+// never saved with them, and the Kopia job policy would otherwise keep their
+// ignore rules. The callers republish the vault profiles, rewrite the dormant
+// copies from the saved row and refresh the Kopia policy states.
+//
+// This statement is separate from the binding's UPDATE on purpose: a job whose
+// recorded kind is already known (every folder job) never runs it, so its
+// first binding writes the binding and nothing else.
+func recordFirstBindingSourceKind(tx *sql.Tx, jobID, recordedKind, foundKind string) (bool, error) {
+	if recordedKind == foundKind {
+		return false, nil
+	}
+	if recordedKind != models.SourceKindUnknown {
+		return false, ErrJobSourceImmutable
+	}
+	query := `UPDATE backup_jobs SET source_kind=? WHERE id=? AND source_kind='unknown'`
+	if foundKind == models.SourceKindFile {
+		query = `UPDATE backup_jobs SET source_kind=?, excludes='', skip_nobackup_folders=0,
+			skip_cachedir_folders=0, skip_marker_file_name='' WHERE id=? AND source_kind='unknown'`
+	}
+	result, err := tx.Exec(query, foundKind, jobID)
+	if err != nil {
+		return false, err
+	}
+	if count, _ := result.RowsAffected(); count != 1 {
+		return false, ErrJobSourceImmutable
+	}
+	return true, nil
+}
+
+// validateFileSourceOptions refuses folder exclusion settings on a file
+// source. It runs where a definition is saved (job creation and edits), not
+// when a row is read: a stored job must always load, so it can be shown,
+// corrected or deleted.
+//
+// Recovery doesn't call it. A recovered file job that carries these settings
+// can only come from a vault profile written by something other than these
+// save paths, and refusing it would block recovering the whole vault, so
+// attaching stores the job row, and any dormant copy, exactly as recovered.
+// Every later save of that job comes through here: a save that keeps the
+// settings is refused and one that clears them is accepted. Restoring a
+// dormant copy saves the job with CreateJob when no local job exists and with
+// UpdateJob when one does, so it is such a save too.
+func validateFileSourceOptions(job models.BackupJob) error {
+	if !job.IsFileSource() {
+		return nil
+	}
+	if job.SkipNoBackupFolders || job.SkipCacheDirFolders || job.SkipMarkerFileName != "" {
+		return ErrFileSourceExclusions
+	}
+	// Exclusions are one pattern per line. A line of only whitespace is
+	// accepted here as no exclusion, but it is not harmless if stored: Restic
+	// is given every non-empty line as an --exclude pattern. That's why the
+	// callers store a file job's exclusions as "" once this check passes.
+	for _, line := range strings.Split(job.Excludes, "\n") {
+		if strings.TrimSpace(line) != "" {
+			return ErrFileSourceExclusions
+		}
 	}
 	return nil
 }
@@ -1297,12 +1426,12 @@ func SetJobEnabledWithSourceBindingCommitted(db *sql.DB, id string, enabled bool
 	}
 	defer func() { _ = tx.Rollback() }()
 	var schedule, nextRun, source, sourceStorageVersion, sourceStorageKey, sourceStorageJSON string
-	var sourceBindingState string
+	var sourceBindingState, sourceKind string
 	var wasEnabled bool
 	if err := tx.QueryRow(`SELECT schedule,enabled,COALESCE(next_run,''),source,
-		source_storage_version,source_storage_key,source_storage_json,source_binding_state
+		source_storage_version,source_storage_key,source_storage_json,source_binding_state,source_kind
 		FROM backup_jobs WHERE id=?`, id).Scan(&schedule, &wasEnabled, &nextRun, &source,
-		&sourceStorageVersion, &sourceStorageKey, &sourceStorageJSON, &sourceBindingState); err != nil {
+		&sourceStorageVersion, &sourceStorageKey, &sourceStorageJSON, &sourceBindingState, &sourceKind); err != nil {
 		return false, err
 	}
 	bindSource := enabled && normalizedJobSourceBindingState(sourceBindingState) == "unbound_imported"
@@ -1313,7 +1442,7 @@ func SetJobEnabledWithSourceBindingCommitted(db *sql.DB, id string, enabled bool
 		existing := models.BackupJob{
 			ID: id, Source: source, SourceStorageVersion: sourceStorageVersion,
 			SourceStorageKey: sourceStorageKey, SourceStorageDescriptorJSON: sourceStorageJSON,
-			SourceBindingState: sourceBindingState,
+			SourceBindingState: sourceBindingState, SourceKind: sourceKind,
 		}
 		if sourceBinding.ID != id {
 			return false, ErrJobSourceImmutable
@@ -1322,6 +1451,9 @@ func SetJobEnabledWithSourceBindingCommitted(db *sql.DB, id string, enabled bool
 			return false, ErrJobSourceChanged
 		}
 		if err := validateJobSourceTransition(existing, *sourceBinding, true); err != nil {
+			return false, err
+		}
+		if err := validateJobSourceKindTransition(existing, *sourceBinding, true); err != nil {
 			return false, err
 		}
 		if err := validateJobSourceBinding(*sourceBinding); err != nil {
@@ -1333,11 +1465,14 @@ func SetJobEnabledWithSourceBindingCommitted(db *sql.DB, id string, enabled bool
 		// Do not enable a different source or replace the winning local identity.
 		existing := models.BackupJob{Source: source, SourceBindingState: sourceBindingState,
 			SourceStorageVersion: sourceStorageVersion, SourceStorageKey: sourceStorageKey,
-			SourceStorageDescriptorJSON: sourceStorageJSON}
+			SourceStorageDescriptorJSON: sourceStorageJSON, SourceKind: sourceKind}
 		if sourceBinding.ID != id {
 			return false, ErrJobSourceImmutable
 		}
 		if err := validateJobSourceTransition(existing, *sourceBinding, true); err != nil {
+			return false, err
+		}
+		if err := validateJobSourceKindTransition(existing, *sourceBinding, true); err != nil {
 			return false, err
 		}
 	}
@@ -1367,6 +1502,12 @@ func SetJobEnabledWithSourceBindingCommitted(db *sql.DB, id string, enabled bool
 	}
 	if count, _ := result.RowsAffected(); count == 0 {
 		return false, sql.ErrNoRows
+	}
+	kindResolved := false
+	if bindSource {
+		if kindResolved, err = recordFirstBindingSourceKind(tx, id, sourceKind, sourceBinding.SourceKind); err != nil {
+			return false, err
+		}
 	}
 	if _, err := tx.Exec(`UPDATE backup_job_targets
 		SET logical_size_bytes=NULL, logical_size_measured_at='' WHERE job_id=?`, id); err != nil {
@@ -1401,7 +1542,10 @@ func SetJobEnabledWithSourceBindingCommitted(db *sql.DB, id string, enabled bool
 	if err := markVaultProfilesDirty(tx, affected); err != nil {
 		return false, err
 	}
-	if bindSource && source != sourceBinding.Source {
+	// A resolved kind may have cleared exclusions and marker-file options, which
+	// are part of the Kopia desired policy; the refresh is a no-op for a vault
+	// whose desired policy is unchanged.
+	if bindSource && (source != sourceBinding.Source || kindResolved) {
 		if _, err := RefreshKopiaPolicyStatesTx(tx, affected); err != nil {
 			return false, err
 		}
@@ -1439,12 +1583,18 @@ func BindImportedJobSource(db *sql.DB, expectedSource string, bound models.Backu
 		return err
 	}
 	if normalizedJobSourceBindingState(existing.SourceBindingState) == "bound" {
-		return validateJobSourceTransition(existing, bound, true)
+		if err := validateJobSourceTransition(existing, bound, true); err != nil {
+			return err
+		}
+		return validateJobSourceKindTransition(existing, bound, true)
 	}
 	if existing.Source != expectedSource {
 		return ErrJobSourceChanged
 	}
 	if err := validateJobSourceTransition(existing, bound, true); err != nil {
+		return err
+	}
+	if err := validateJobSourceKindTransition(existing, bound, true); err != nil {
 		return err
 	}
 	if err := validateJobSourceBinding(bound); err != nil {
@@ -1461,6 +1611,10 @@ func BindImportedJobSource(db *sql.DB, expectedSource string, bound models.Backu
 	if count, _ := result.RowsAffected(); count != 1 {
 		return ErrJobSourceImmutable
 	}
+	kindResolved, err := recordFirstBindingSourceKind(tx, bound.ID, existing.SourceKind, bound.SourceKind)
+	if err != nil {
+		return err
+	}
 	// Read the committed definition inside this transaction; binding input does
 	// not own unrelated settings or portable targets.
 	saved, err := scanJob(tx.QueryRow(`SELECT `+jobColumns+` FROM backup_jobs WHERE id = ?`, bound.ID).Scan)
@@ -1471,7 +1625,10 @@ func BindImportedJobSource(db *sql.DB, expectedSource string, bound models.Backu
 	if err != nil {
 		return err
 	}
-	if existing.Source != saved.Source {
+	// A resolved kind is part of the portable definition, so the vault profiles
+	// must be republished even when the source is unchanged. The edit revision
+	// leaves the kind out, so nothing else would notice that they are stale.
+	if existing.Source != saved.Source || kindResolved {
 		rows, err := tx.Query(`SELECT repository_id FROM backup_job_targets WHERE job_id=?`, bound.ID)
 		if err != nil {
 			return err
@@ -1493,8 +1650,10 @@ func BindImportedJobSource(db *sql.DB, expectedSource string, bound models.Backu
 		if _, err := RefreshKopiaPolicyStatesTx(tx, affected); err != nil {
 			return err
 		}
-		if _, err := tx.Exec(`UPDATE backup_job_targets SET logical_size_bytes=NULL, logical_size_measured_at='' WHERE job_id=?`, bound.ID); err != nil {
-			return err
+		if existing.Source != saved.Source {
+			if _, err := tx.Exec(`UPDATE backup_job_targets SET logical_size_bytes=NULL, logical_size_measured_at='' WHERE job_id=?`, bound.ID); err != nil {
+				return err
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {

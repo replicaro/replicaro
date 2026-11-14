@@ -473,7 +473,7 @@ func vaultProfileChoice(profile vaultprofile.Profile) VaultProfileChoice {
 
 func reviewedLocalJobDefinition(job models.BackupJob) models.BackupJob {
 	return models.BackupJob{
-		ID: job.ID, Name: job.Name, Source: job.Source, Schedule: job.Schedule, Enabled: job.Enabled,
+		ID: job.ID, Name: job.Name, Source: job.Source, SourceKind: job.SourceKind, Schedule: job.Schedule, Enabled: job.Enabled,
 		Retention: job.Retention, RetentionHourly: job.RetentionHourly,
 		RetentionDaily: job.RetentionDaily, RetentionWeekly: job.RetentionWeekly,
 		RetentionMonthly: job.RetentionMonthly, RetentionYearly: job.RetentionYearly,
@@ -698,11 +698,19 @@ func requireRecoveredJobSourcesAvailable(ctx context.Context, jobs []models.Back
 	return nil
 }
 
+// importedSourceJobs adopts one job per native source root found in a vault
+// that has no Replicaro profile. A native root can be a folder or a single
+// file, and nothing on this computer has looked at it yet, so the kind is
+// recorded as unknown; first binding probes the path and records what it
+// finds, once. Do not default it to "" (folder): a root that is a file would
+// then be refused as a missing source when the job is enabled, and the profile
+// would publish it to other computers as a folder job.
 func importedSourceJobs(repo models.Repository, sources []string) []models.BackupJob {
 	jobs := make([]models.BackupJob, 0, len(sources))
 	for index, source := range sources {
 		jobs = append(jobs, models.BackupJob{
 			ID: uuid.NewString(), Name: fmt.Sprintf("Imported source %d", index+1), Source: source,
+			SourceKind:         models.SourceKindUnknown,
 			SourceBindingState: "unbound_imported", Schedule: "manual", Enabled: false, Retention: 100,
 			EngineSettings: models.EngineSettings{repo.Engine: {}}, PortableTargetIDs: []string{repo.ID},
 			Targets: []models.BackupJobTarget{{RepositoryID: repo.ID, Engine: repo.Engine}},
@@ -2191,7 +2199,8 @@ func finishExistingVaultPreview(ctx context.Context, input ExistingVaultStorage,
 			savedRetention := models.BackupJob{Retention: saved.Retention, RetentionHourly: saved.RetentionHourly,
 				RetentionDaily: saved.RetentionDaily, RetentionWeekly: saved.RetentionWeekly,
 				RetentionMonthly: saved.RetentionMonthly, RetentionYearly: saved.RetentionYearly}
-			if reviewed.Name != saved.Name || reviewed.Source != saved.Source || reviewed.Schedule != saved.Schedule ||
+			if reviewed.Name != saved.Name || reviewed.Source != saved.Source || reviewed.SourceKind != saved.SourceKind ||
+				reviewed.Schedule != saved.Schedule ||
 				!models.RetentionPolicyEqual(reviewed, savedRetention) || reviewed.Excludes != saved.Exclusions || reviewed.Tag != saved.Tag ||
 				reviewed.SkipNoBackupFolders != saved.SkipNoBackupFolders || reviewed.SkipCacheDirFolders != saved.SkipCacheDirFolders ||
 				reviewed.SkipMarkerFileName != saved.SkipMarkerFileName ||
@@ -2980,7 +2989,7 @@ func handleExistingVaultConnect(db *sql.DB, auth *rcloneAuthStore) http.HandlerF
 			// fields, so the validated transition, not the raw request shape, decides
 			// this. Do not reintroduce per-job request selections here.
 			for _, saved := range preview.Profile.Jobs {
-				job := models.BackupJob{ID: saved.JobUUID, Name: saved.Name, Source: saved.Source, Schedule: saved.Schedule,
+				job := models.BackupJob{ID: saved.JobUUID, Name: saved.Name, Source: saved.Source, SourceKind: saved.SourceKind, Schedule: saved.Schedule,
 					Retention: saved.Retention, RetentionHourly: saved.RetentionHourly,
 					RetentionDaily: saved.RetentionDaily, RetentionWeekly: saved.RetentionWeekly,
 					RetentionMonthly: saved.RetentionMonthly, RetentionYearly: saved.RetentionYearly,

@@ -15,6 +15,13 @@ const installationIDKey = "installationId"
 const languageKey = "language"
 const notificationURLsKey = "notificationUrls"
 
+// The two notification title prefixes. Older builds don't know these keys and
+// ignore them, so no migration is needed either way.
+const (
+	desktopNotificationTitlePrefixKey = "desktopNotificationTitlePrefix"
+	notificationURLTitlePrefixKey     = "notificationUrlTitlePrefix"
+)
+
 // EnsureLanguageSetting only fills the absent key. It runs on the writable
 // startup connection before read-only pools open, including on older installs.
 func EnsureLanguageSetting(db *sql.DB) error {
@@ -104,8 +111,13 @@ func GetSettings(
 	db *sql.DB,
 ) (models.Settings, error) {
 
+	desktopTitlePrefix, urlTitlePrefix := "", ""
 	settings := models.Settings{
 		DefaultEngine: "restic",
+		// Always set, so the settings page gets "" rather than null and
+		// sends the field back with its next save.
+		DesktopNotificationTitlePrefix: &desktopTitlePrefix,
+		NotificationURLTitlePrefix:     &urlTitlePrefix,
 		// autoStart and minimizeToTray rows from older versions are left in
 		// place and ignored; nothing in Replicaro acts on either preference.
 		LogRetentionDays:             30,
@@ -185,6 +197,10 @@ func GetSettings(
 			settings.WebhookURL = value
 		case notificationURLsKey:
 			storedNotificationURLs = &value
+		case desktopNotificationTitlePrefixKey:
+			desktopTitlePrefix = value
+		case notificationURLTitlePrefixKey:
+			urlTitlePrefix = value
 
 		case "notifyWindowsOnSuccess":
 			settings.NotifyWindowsOnSuccess = value == "true"
@@ -339,6 +355,14 @@ func SaveSettings(
 		// http(s) entry of the list, so a downgrade keeps the JSON webhook
 		// working. Nothing in this build sends to it.
 		values["webhookUrl"] = firstWebhookURL(settings.NotificationURLs)
+	}
+	// nil leaves the stored prefix alone (see models.Settings). The value is
+	// stored as given; the API has already cleaned and checked it.
+	if settings.DesktopNotificationTitlePrefix != nil {
+		values[desktopNotificationTitlePrefixKey] = *settings.DesktopNotificationTitlePrefix
+	}
+	if settings.NotificationURLTitlePrefix != nil {
+		values[notificationURLTitlePrefixKey] = *settings.NotificationURLTitlePrefix
 	}
 	for key, value := range values {
 		if _, err := tx.Exec(`INSERT INTO settings (key, value) VALUES (?, ?)

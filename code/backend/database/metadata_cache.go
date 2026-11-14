@@ -374,12 +374,35 @@ func searchReadyMetadataFilesPageForAuthority(ctx context.Context, db *sql.DB, a
 	// Search and browse intentionally touch only _files/_file_versions and child
 	// existence. The millions-row membership table is lazy until path selection.
 	pattern := searchLikePattern(foldMetadataSearchText(query))
-	rows, err := tx.QueryContext(ctx, metadataSearchCatalogSQL, repositoryDatabaseID, pattern, limit, offset)
+	// Matching single-file sources come first, then the folder results, as one
+	// list paged by one offset. The catalog query skips every source row, which
+	// is the only row a single-file source has, so the file matches come from
+	// their own query and are placed ahead of the catalog rows. Do not merge
+	// them into the catalog query: it serves every folder search and is tuned
+	// for large caches (see metadataSearchCatalogSQL).
+	//
+	// With F file matches, this page shows files[min(offset,F):min(offset+limit,F)]
+	// and fills the rest from the catalog starting at max(0, offset-F). Both
+	// reads share this transaction, after the revision gate, so F can't change
+	// between the pages of one revision.
+	files, err := metadataFileRootSearchTx(ctx, tx, repositoryDatabaseID, pattern)
+	if err != nil {
+		return nil, revision, err
+	}
+	// The end is computed from the clamped start, so an offset near the
+	// largest int can't overflow into a negative slice bound.
+	start := min(offset, len(files))
+	end := start + min(limit, len(files)-start)
+	result := append([]models.FileSearchResult{}, files[start:end]...)
+	catalogLimit := limit - len(result)
+	if catalogLimit == 0 {
+		return result, revision, tx.Commit()
+	}
+	rows, err := tx.QueryContext(ctx, metadataSearchCatalogSQL, repositoryDatabaseID, pattern, catalogLimit, max(0, offset-len(files)))
 	if err != nil {
 		return nil, revision, err
 	}
 	defer rows.Close()
-	result := []models.FileSearchResult{}
 	for rows.Next() {
 		var item models.FileSearchResult
 		var parent string
@@ -456,6 +479,12 @@ func browseReadyMetadataEntriesPageForAuthority(ctx context.Context, db *sql.DB,
 			result = append(result, item)
 		}
 		if err := rows.Err(); err != nil {
+			return nil, revision, err
+		}
+		if err := rows.Close(); err != nil {
+			return nil, revision, err
+		}
+		if err := markMetadataFileRootSourcesTx(ctx, tx, repositoryDatabaseID, result); err != nil {
 			return nil, revision, err
 		}
 	} else {
@@ -596,6 +625,25 @@ func readyMetadataFileHistoryPageForAuthority(ctx context.Context, db *sql.DB, a
 	if err != nil {
 		return nil, revision, err
 	}
+	// An empty path names the source itself. Only a single-file source has a
+	// history there: one file version per snapshot. The history handler
+	// refuses an empty path for any other source, but the cache can change
+	// between that check and this read, so the file-root check is repeated
+	// here in the read's own transaction.
+	//
+	// Every other source goes on to the folder read below. A folder source
+	// can still arrive here with a path of only slashes; stored parent
+	// paths are relative, so the descendant prefix "/" matches nothing and the
+	// result is the folder itself once for each snapshot whose listing has an
+	// entry directly inside it.
+	fileRoot := false
+	if path == "" {
+		files, fileErr := metadataFileRootSourcesTx(ctx, tx, repositoryDatabaseID, []string{source})
+		if fileErr != nil {
+			return nil, revision, fileErr
+		}
+		fileRoot = files[source]
+	}
 	var fileID int64
 	var hasChild int
 	if err := tx.QueryRowContext(ctx, metadataHistoryFileLookupSQL,
@@ -604,6 +652,12 @@ func readyMetadataFileHistoryPageForAuthority(ctx context.Context, db *sql.DB, a
 			return []models.FileVersion{}, revision, tx.Commit()
 		}
 		return nil, revision, err
+	}
+	if fileRoot {
+		// A root that was a folder in other snapshots also has children. Its
+		// history here is the file's own versions only; the folder snapshots
+		// are reached through the items inside it.
+		hasChild = 0
 	}
 	rows, err := tx.QueryContext(ctx, metadataDirectHistorySQL, repositoryDatabaseID, fileID)
 	if err != nil {
@@ -1469,10 +1523,19 @@ func insertMetadataTempRows(ctx context.Context, tx *sql.Tx, prefix, tuple strin
 
 func insertMetadataEntriesBatchedTxContext(ctx context.Context, tx *sql.Tx, repositoryID string, entrySetID int64, snapshot models.Snapshot, entries []models.SnapshotEntry) error {
 	if snapshot.NativeRootType == "f" {
-		if len(entries) != 0 {
-			return fmt.Errorf("Kopia file-root snapshot cannot contain indexed entries")
+		// Kopia reports the root type in its snapshot list. A file root holds
+		// exactly one entry, the file itself at an empty path (see the root
+		// rules below); payload paths below a file can't exist.
+		//
+		// A file root with no entry is what earlier versions indexed every
+		// such snapshot as. It stays accepted and stays without catalog rows,
+		// so an existing cache keeps working without a re-index.
+		if len(entries) == 0 {
+			return nil
 		}
-		return nil
+		if len(entries) != 1 || normalizeMetadataPath(entries[0].Path) != "" || entries[0].IsDir {
+			return fmt.Errorf("Kopia file-root snapshot can only contain its own file entry")
+		}
 	}
 
 	repositoryDatabaseID, err := metadataRepositoryDatabaseID(tx, repositoryID)
@@ -1498,6 +1561,19 @@ func insertMetadataEntriesBatchedTxContext(ctx context.Context, tx *sql.Tx, repo
 	// large snapshot is not duplicated in Go and in both SQLite staging tables.
 	// Reintroducing explicit rows here roughly doubles ingestion allocations.
 	supportRows := map[string][3]string{}
+	// Source-root entries. A folder root is never an entry of its own: its
+	// source row (root, "", "") holds no version. The only
+	// root that is an entry is a single file backed up on its own: its version
+	// (mode, size, not a directory) is stored on the source row, because the
+	// file has no parent folder inside the snapshot and inventing one (or
+	// listing the file as a child of itself) would show paths that don't
+	// exist. So an empty-path entry is accepted only when it is not a
+	// directory and is the only entry of its root; an empty-path directory
+	// entry, a second root entry, or a root entry next to other entries means
+	// the listing is not what either engine produces and is refused. The
+	// file's name is not stored: the source row's name stays empty.
+	rootFileEntries := map[string]bool{}
+	entriesPerRoot := map[string]int{}
 	for _, entry := range entries {
 		foundRoot := false
 		entryRoot := normalizeMetadataRoot(entry.SourceRoot)
@@ -1509,8 +1585,17 @@ func insertMetadataEntriesBatchedTxContext(ctx context.Context, tx *sql.Tx, repo
 		if !foundRoot {
 			return fmt.Errorf("metadata entry root does not belong to snapshot")
 		}
+		entriesPerRoot[entryRoot]++
 		path := normalizeMetadataPath(entry.Path)
 		if path == "" {
+			if entry.IsDir {
+				return fmt.Errorf("metadata source root cannot be cached as a directory entry")
+			}
+			if rootFileEntries[entryRoot] {
+				return fmt.Errorf("metadata source root has more than one file entry")
+			}
+			rootFileEntries[entryRoot] = true
+			memberships[entryRoot+"\x00\x00"] = stagedMetadataMembership{root: entryRoot, mode: entry.Mode, size: entry.Size}
 			continue
 		}
 		parent, name := splitMetadataRelative(path)
@@ -1533,6 +1618,11 @@ func insertMetadataEntriesBatchedTxContext(ctx context.Context, tx *sql.Tx, repo
 			}
 			supportRows[ancestorKey] = [3]string{entryRoot, ancestorParent, ancestorName}
 			current = ancestorParent
+		}
+	}
+	for root := range rootFileEntries {
+		if entriesPerRoot[root] != 1 {
+			return fmt.Errorf("metadata file root cannot contain other entries")
 		}
 	}
 	for _, root := range normalizedRoots {

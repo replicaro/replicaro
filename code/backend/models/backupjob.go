@@ -4,6 +4,7 @@ type BackupJob struct {
 	ID                          string            `json:"id"`
 	Name                        string            `json:"name"`
 	Source                      string            `json:"source"`
+	SourceKind                  string            `json:"sourceKind,omitempty"` // see SourceKindFile
 	SourceStorageVersion        string            `json:"-"`
 	SourceStorageKey            string            `json:"-"`
 	SourceStorageDescriptorJSON string            `json:"-"`
@@ -48,6 +49,22 @@ type BackupJob struct {
 	// so an edit made from an outdated copy is refused. It is never stored;
 	// omitempty keeps it out of job definitions that are saved as JSON.
 	Revision string `json:"revision,omitempty"`
+}
+
+// Kinds of job source other than a folder. A folder source has no kind at all
+// (the empty string), which is what every job created before single-file
+// sources existed has, so their stored rows, API JSON and vault profiles stay
+// exactly as they were. SourceKindUnknown is only used for a recovered or
+// imported job whose source hasn't been bound on this computer yet and whose
+// kind therefore hasn't been observed; its first binding settles it.
+const (
+	SourceKindFile    = "file"
+	SourceKindUnknown = "unknown"
+)
+
+// IsFileSource reports whether the job backs up a single file.
+func (job BackupJob) IsFileSource() bool {
+	return job.SourceKind == SourceKindFile
 }
 
 type EngineSettings map[string]EngineJobSettings

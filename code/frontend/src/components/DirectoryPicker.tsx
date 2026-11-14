@@ -5,24 +5,45 @@ import { APIError, browseDirectories } from "../services/api";
 import type { DirectoryListing } from "../types";
 import { Icon, Loading, Modal } from "./ui";
 
+// What the picker lets the user choose.
+//
+// - "folder": folders only. Every picker uses this except the job source.
+//   It requests the plain folders-only listing, with no files parameter.
+// - "fileOrFolder": the job source of a new job. Files are listed too and can
+//   be chosen, and so can the open folder.
+// - "file": "Update job source" for a job whose source is a single file. Files
+//   are listed and one must be chosen; folders are only for moving around,
+//   since a file job can't be pointed at a folder.
+//
+// Keep "folder" the default and keep the other modes opt-in: the vault and
+// restore destination pickers must never list or return files.
+export type DirectoryPickMode = "folder" | "fileOrFolder" | "file";
+
 export function DirectoryField({
     value,
     onChange,
+	onPicked,
     placeholder,
 	buttonLabel = t("ui.pages.protect.browse"),
 	ariaLabel,
 	disabled = false,
 	readOnly = false,
 	autoFocus = false,
+	pick = "folder",
 }: {
     value: string;
     onChange: (value: string) => void;
+	// Called after onChange when the value comes from the picker, with what
+	// was chosen. A typed value never reports a kind; see the new-job form for
+	// how it learns one.
+	onPicked?: (path: string, kind: "file" | "folder") => void;
     placeholder?: string;
 	buttonLabel?: string;
 	ariaLabel?: string;
 	disabled?: boolean;
 	readOnly?: boolean;
 	autoFocus?: boolean;
+	pick?: DirectoryPickMode;
 }) {
     const [open, setOpen] = useState(false);
 
@@ -47,9 +68,11 @@ export function DirectoryField({
             {open && (
                 <DirectoryPicker
                     initialPath={value}
+					pick={pick}
                     onCancel={() => setOpen(false)}
-                    onSelect={(path) => {
+                    onSelect={(path, kind) => {
                         onChange(path);
+						onPicked?.(path, kind);
                         setOpen(false);
                     }}
                 />
@@ -60,15 +83,21 @@ export function DirectoryField({
 
 function DirectoryPicker({
     initialPath,
+	pick,
     onSelect,
     onCancel,
 }: {
     initialPath: string;
-    onSelect: (path: string) => void;
+	pick: DirectoryPickMode;
+    onSelect: (path: string, kind: "file" | "folder") => void;
     onCancel: () => void;
 }) {
+	const listsFiles = pick !== "folder";
     const [listing, setListing] = useState<DirectoryListing | null>(null);
     const [path, setPath] = useState(initialPath);
+	// The file chosen in the open folder, by its path; empty when none is.
+	// Only the file modes ever set it.
+	const [chosenFile, setChosenFile] = useState("");
     const [error, setError] = useState("");
 	// The backend ends a listing after 60 seconds when the folder (typically a
 	// dead network share or a disconnected mapped drive) does not answer; the
@@ -105,11 +134,21 @@ function DirectoryPicker({
 			}
 			let fallback = false;
 			try {
-				const next = await browseDirectories(target, controller.signal);
+				// The folder picker sends exactly the folders-only request; only
+				// the file modes add the files parameter.
+				const next = listsFiles
+					? await browseDirectories(target, controller.signal, true)
+					: await browseDirectories(target, controller.signal);
 				if (generationRef.current !== generation || controller.signal.aborted) return;
 				loadedRef.current = next;
 				setListing(next);
-				setPath(next.current);
+				// A path that is a file comes back as the folder that holds it,
+				// with the file in its list. It is chosen right away, so the
+				// picker opens on a file path typed in the field, and Go on a
+				// file path typed in the picker lands on that file.
+				const file = listsFiles ? next.files?.find((entry) => entry.path === target) : undefined;
+				setChosenFile(file?.path ?? "");
+				setPath(file?.path ?? next.current);
 			} catch (reason) {
 				if (generationRef.current !== generation || controller.signal.aborted || (reason as { name?: string })?.name === "AbortError") return;
 				// The fallback's own failure keeps the first error, which names
@@ -126,6 +165,7 @@ function DirectoryPicker({
 				if (loadedRef.current) {
 					setListing(loadedRef.current);
 					setPath(loadedRef.current.current);
+					setChosenFile("");
 				} else fallback = target !== "";
 			} finally {
 				if (requestRef.current?.generation === generation) requestRef.current = null;
@@ -133,7 +173,7 @@ function DirectoryPicker({
 			if (fallback) await run("", true);
 		};
 		await run(requested, false);
-	}, [cancelLoad]);
+	}, [cancelLoad, listsFiles]);
 
     useEffect(() => {
 		const timer = window.setTimeout(() => void load(initialPath), 0);
@@ -148,14 +188,23 @@ function DirectoryPicker({
 		onCancel();
 	};
 
+	// In "fileOrFolder" the button returns the chosen file, or the open folder
+	// when no file is chosen. In "file" it only ever returns a file.
+	const returnsFile = listsFiles && chosenFile !== "";
+
     return (
-        <Modal title={t("ui.components.directorypicker.choose.a.folder")} onClose={close} wide>
+        <Modal title={listsFiles ? t("ui.components.directorypicker.chooseFileOrFolder") : t("ui.components.directorypicker.choose.a.folder")} onClose={close} wide>
             <div className="directory-input" style={{ marginBottom: 12 }}>
                 <input
                     className="mono"
                     type="text"
                     value={path}
-                    onChange={(event) => setPath(event.target.value)}
+					onChange={(event) => {
+						// Typing a new path drops the chosen file, like moving
+						// to another folder does. Go opens what was typed.
+						setPath(event.target.value);
+						setChosenFile("");
+					}}
                     onKeyDown={(event) => {
                         if (event.key === "Enter") void load(path);
                     }}
@@ -201,9 +250,36 @@ function DirectoryPicker({
                                 <Icon name="folder" size={15} /> <span>{directory.name}</span>
                             </button>
                         ))}
-                        {listing.directories.length === 0 && !listing.parent && (
-                            <p className="muted">{t("ui.components.directorypicker.no.subfolders")}</p>
-                        )}
+						{listsFiles && listing.files?.map((file) => (
+							<button
+								type="button"
+								key={file.path}
+								aria-pressed={chosenFile === file.path}
+								onClick={() => {
+									// A toggle: pressing the chosen file again clears
+									// the choice and puts the open folder back in the
+									// path box, which in "fileOrFolder" makes the
+									// folder the selection again.
+									const next = chosenFile === file.path ? "" : file.path;
+									setChosenFile(next);
+									setPath(next || listing.current);
+								}}
+							>
+								<Icon name="file" size={15} /> <span>{file.name}</span>
+							</button>
+						))}
+						{/* The folder picker shows its empty text only at a folder
+						    without a parent (a drive or filesystem root). The file
+						    modes have their own text and show it whenever the
+						    folder has nothing to list. Keep the two conditions
+						    separate. */}
+						{listsFiles
+							? listing.directories.length === 0 && !listing.files?.length && (
+								<p className="muted">{t("ui.components.directorypicker.noFilesOrSubfolders")}</p>
+							)
+							: listing.directories.length === 0 && !listing.parent && (
+								<p className="muted">{t("ui.components.directorypicker.no.subfolders")}</p>
+							)}
                     </div>
                     <div className="modal-footer">
                         <button type="button" className="btn" onClick={close}>
@@ -211,12 +287,16 @@ function DirectoryPicker({
                         <button
                             type="button"
                             className="btn primary"
+							disabled={pick === "file" && !returnsFile}
 							onClick={() => {
 								cancelLoad();
-								onSelect(listing.current);
+								if (returnsFile) onSelect(chosenFile, "file");
+								else onSelect(listing.current, "folder");
 							}}
                         >
-                            {t("ui.components.directorypicker.select.this.folder")}</button>
+							{returnsFile || pick === "file"
+								? t("ui.components.directorypicker.selectThisFile")
+								: t("ui.components.directorypicker.select.this.folder")}</button>
                     </div>
                 </>
             )}

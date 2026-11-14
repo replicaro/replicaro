@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 
 import { DirectoryField } from "../components/DirectoryPicker";
+import { FloatingTooltip } from "../components/FloatingTooltip";
 import { BackupRunPicker } from "../components/BackupRunPicker";
 import { ListControls } from "../components/ListControls";
 import { RcloneAuthorization } from "../components/RcloneAuthorization";
@@ -11,6 +12,7 @@ import { MarkerFileFields } from "../components/MarkerFileFields";
 import { markerFileNameError } from "../components/markerFileName";
 import { UpdateJobSourceDialog } from "../components/UpdateJobSourceDialog";
 import { jobCurrentSource, jobSourceNeedsUpdate } from "../jobSourceDisplay";
+import { isSingleFileJob, singleFileSourceFilters, useJobSourceKinds } from "../jobSourceKind";
 import { displayPath } from "../nativePathDisplay";
 import {
 	activeJobDeletions,
@@ -2745,6 +2747,11 @@ export default function Protect() {
 	const [jobCopyDraft, setJobCopyDraft] = useState(false);
 	const [jobForm, setJobForm] = useState<JobForm>({ ...emptyJob });
 	const [jobAdditionalSources, setJobAdditionalSources] = useState<string[]>([]);
+	// The sources the open new-job form would create jobs for: one for a copy,
+	// the first source plus any added ones otherwise. Edit job has none here,
+	// because its source can't change and its kind comes with the job.
+	const jobStepSources = jobModal === "new" ? (jobCopyDraft ? [jobForm.source] : [jobForm.source, ...jobAdditionalSources]) : [];
+	const jobSourceKinds = useJobSourceKinds(jobStepSources, jobModal === "new");
 	const [jobCreationResults, setJobCreationResults] = useState<JobMutationResult[] | null>(null);
 	const [jobCreationRetrying, setJobCreationRetrying] = useState(false);
     const [jobInitialForm, setJobInitialForm] = useState<JobForm | null>(null);
@@ -3416,6 +3423,19 @@ export default function Protect() {
 	const editedJob = jobModal && jobModal !== "new" ? jobModal : null;
 	const jobFormUsesKopia = selectedEngines.includes("kopia") || Boolean(editedJob?.unattachedTargets &&
 		Object.prototype.hasOwnProperty.call(editedJob.engineSettings ?? {}, "kopia"));
+	// Exclude patterns and marker files only work inside a folder, so for a
+	// single-file source they are greyed out, shown empty and saved empty
+	// (the backend refuses a file job with any of them set). A new job's step
+	// counts as soon as one of its sources is known to be a file; a step that
+	// mixes files and folders is refused on save anyway. The values typed for
+	// folders stay in the form underneath and come back if the file source is
+	// removed. Folder steps and folder jobs use the form's values as they are.
+	const jobFormSingleFile = editedJob ? isSingleFileJob(editedJob) : jobStepSources.some(jobSourceKinds.isFile);
+	const jobFormFilters = jobFormSingleFile ? { ...jobForm, ...singleFileSourceFilters } : jobForm;
+	// Bulk edit can't change exclude patterns while the selection includes a
+	// single-file job: the edit sends one value to every selected job.
+	const bulkIncludesSingleFile = selectedJobs.some(isSingleFileJob);
+	const bulkChangesExcludes = bulkForm.changeExcludes && !bulkIncludesSingleFile;
 	const bulkSelectedEngines = Array.from(new Set((bulkForm.repositoryIds ?? []).map((id) => repos?.find((repo) => repo.id === id)?.engine).filter(Boolean))) as string[];
 
 	const resetConnectWorkflow = () => {
@@ -3486,6 +3506,7 @@ export default function Protect() {
 		setClosePrompt(null);
 		setJobCopyDraft(false);
 		setJobAdditionalSources([]);
+		jobSourceKinds.reset();
 	        setJobAdvanced(false);
 		setJobSaveAttempted(false);
 		const initial = job ? jobToForm(job) : emptyJob;
@@ -3503,6 +3524,7 @@ export default function Protect() {
 		setJobAdvanced(false);
 		setJobSaveAttempted(false);
 		setJobAdditionalSources([]);
+		jobSourceKinds.reset();
 		const initial = jobToForm(job);
 		setJobForm({
 			...initial,
@@ -3563,6 +3585,15 @@ export default function Protect() {
 			toast("error", t("ui.protect.uniqueJobNameRequired"));
 			return null;
 		}
+		// Every job of a step is created from one shared payload, and a file
+		// job can't take the exclude and marker settings a folder job may
+		// have, so a step is all files or all folders. A source without an
+		// answer yet counts as a folder here; the backend checks each
+		// job on save.
+		if (!editedJob && jobFormSingleFile && !sourceDrafts.every((draft) => jobSourceKinds.isFile(draft.source))) {
+			toast("error", t("ui.protect.mixedFileFolderSources"));
+			return null;
+		}
 		const intervalError = customScheduleError(jobForm);
 		if (intervalError) {
 			toast("error", intervalError);
@@ -3573,7 +3604,7 @@ export default function Protect() {
 			toast("error", t("ui.protect.invalidCronSchedule"));
 			return null;
 		}
-		const markerError = jobForm.skipCustomMarker ? markerFileNameError(jobForm.skipMarkerFileName) : "";
+		const markerError = jobFormFilters.skipCustomMarker ? markerFileNameError(jobFormFilters.skipMarkerFileName) : "";
 		if (markerError) {
 			toast("error", markerError);
 			return null;
@@ -3621,10 +3652,10 @@ export default function Protect() {
 			retentionWeekly,
 			retentionMonthly,
 			retentionYearly,
-            excludes: jobForm.excludes,
-			skipNoBackupFolders: jobForm.skipNoBackupFolders,
-			skipCacheDirFolders: jobForm.skipCacheDirFolders,
-			skipMarkerFileName: jobForm.skipCustomMarker ? jobForm.skipMarkerFileName : "",
+            excludes: jobFormFilters.excludes,
+			skipNoBackupFolders: jobFormFilters.skipNoBackupFolders,
+			skipCacheDirFolders: jobFormFilters.skipCacheDirFolders,
+			skipMarkerFileName: jobFormFilters.skipCustomMarker ? jobFormFilters.skipMarkerFileName : "",
             tag: jobForm.tag.trim(),
 			beforeScriptPath: jobForm.beforeScriptPath,
 			beforeScriptMustSucceed: jobForm.beforeScriptMustSucceed,
@@ -3822,7 +3853,7 @@ export default function Protect() {
 	};
 
 	const bulkHasChanges = () => bulkForm.changeSchedule || bulkForm.changeRetention ||
-		bulkForm.changeExcludes || bulkForm.changeTag || bulkForm.changeScripts || bulkForm.replaceDestinations;
+		bulkChangesExcludes || bulkForm.changeTag || bulkForm.changeScripts || bulkForm.replaceDestinations;
 
 	const reviewBulkEdit = () => {
 		if (!bulkHasChanges()) {
@@ -3872,7 +3903,10 @@ export default function Protect() {
 			payload.retentionMonthly = parsedRetention(bulkForm.retentionMonthly, true) as number | undefined;
 			payload.retentionYearly = parsedRetention(bulkForm.retentionYearly, true) as number | undefined;
 		}
-		if (bulkForm.changeExcludes) payload.excludes = bulkForm.excludes;
+		// Every job keeps its own stored exclude and marker settings unless the
+		// exclude change applies, which it never does while a single-file job
+		// is selected.
+		if (bulkChangesExcludes) payload.excludes = bulkForm.excludes;
 		if (bulkForm.changeTag) payload.tag = bulkForm.tag.trim();
 		if (bulkForm.changeScripts) {
 			payload.beforeScriptPath = bulkForm.beforeScriptPath;
@@ -5814,6 +5848,25 @@ export default function Protect() {
 	// tab and screen-reader order match the screen; the keys let React move the
 	// existing sections instead of rebuilding them when the order flips.
 	const vaultsFirst = repos !== null && repos.length === 0;
+	// The job form's exclude patterns and marker-file boxes. For a single-file
+	// source they are greyed out inside one block that carries the
+	// explanation: disabled controls get no hover events in every browser, so
+	// the tooltip sits on the block, and the block is a labelled group that
+	// can take focus, so keyboard and screen-reader users reach it too. The
+	// explanation is a FloatingTooltip: the block can be taller than the
+	// dialog's visible area, and a popup placed inside the dialog's scrolling
+	// box would be cut off at its edge. A folder source renders the two
+	// settings straight into the panel, without the block.
+	const jobFilterFields = <>
+		<label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" rows={3} value={jobFormFilters.excludes} disabled={jobFormSingleFile} placeholder={`${examplePlaceholder("*.tmp")}\n${examplePlaceholder("node_modules")}`} onChange={(event) => setJobForm({ ...jobForm, excludes: event.target.value })} /><small>{t("ui.pages.protect.one.pattern.per.line.for.files.folders.this.job.should.skip")}</small></label>
+		<MarkerFileFields value={jobFormFilters} usesKopia={jobFormUsesKopia} singleFile={jobFormSingleFile} showErrors={jobSaveAttempted} onChange={(markers) => setJobForm({ ...jobForm, ...markers })} />
+	</>;
+	// The same explanation on bulk edit's exclude patterns while a single-file
+	// job is selected; there the block is the whole setting.
+	const bulkExcludesFields = <>
+		<label className="check"><input type="checkbox" checked={bulkChangesExcludes} disabled={bulkIncludesSingleFile} onChange={(event) => setBulkForm({ ...bulkForm, changeExcludes: event.target.checked })} />{t("ui.pages.protect.change.exclude.patterns")}</label>
+		{bulkChangesExcludes && <div className="bulk-setting-fields"><label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" rows={3} value={bulkForm.excludes} placeholder={`${examplePlaceholder("*.tmp")}\n${examplePlaceholder("node_modules")}`} onChange={(event) => setBulkForm({ ...bulkForm, excludes: event.target.value })} /><small>{t("ui.pages.protect.one.pattern.per.line.for.files.folders.these.jobs.should.skip")}</small></label></div>}
+	</>;
     return (
         <div className="page protect-page">
             <header className="page-header simple">
@@ -5830,11 +5883,11 @@ export default function Protect() {
 							{jobModal === "new" && !jobCopyDraft ? <>
 								<p className="muted modal-intro">{t("ui.pages.protect.you.can.add.one.or.more.source.data.to.back.up.each.source.data.will.g")}</p>
 								<label className="field"><span>{t("ui.pages.protect.name")}</span><input autoFocus value={jobForm.name} placeholder={t("ui.pages.protect.example.documents.nightly")} onChange={(event) => setJobForm({ ...jobForm, name: event.target.value })} /></label>
-								<label className="field"><span>{t("ui.pages.protect.source.data")}</span><DirectoryField ariaLabel={t("ui.pages.protect.source.data")} value={jobForm.source} onChange={(source) => setJobForm({ ...jobForm, source })} /><small>{t("ui.pages.protect.must.be.a.local.folder.mounted.share.mapped.drive.or.network.path.exte")}</small></label>
+								<label className="field"><span>{t("ui.pages.protect.source.data")}</span><DirectoryField ariaLabel={t("ui.pages.protect.source.data")} value={jobForm.source} pick="fileOrFolder" onPicked={jobSourceKinds.record} onChange={(source) => setJobForm({ ...jobForm, source })} /><small>{t("ui.pages.protect.must.be.a.local.folder.mounted.share.mapped.drive.or.network.path.exte")}</small></label>
 								{jobAdditionalSources.map((source, index) => <div className="field job-additional-source" key={index}>
 									<span>{t("ui.pages.protect.source.data")}</span>
 									<div className="job-additional-source-controls">
-										<DirectoryField ariaLabel={t("ui.protect.numberedSourceData", { number: index + 2 })} value={source} onChange={(nextSource) => setJobAdditionalSources((current) => current.map((item, itemIndex) => itemIndex === index ? nextSource : item))} />
+										<DirectoryField ariaLabel={t("ui.protect.numberedSourceData", { number: index + 2 })} value={source} pick="fileOrFolder" onPicked={jobSourceKinds.record} onChange={(nextSource) => setJobAdditionalSources((current) => current.map((item, itemIndex) => itemIndex === index ? nextSource : item))} />
 										<button type="button" className="btn sm danger-outline remove-source" aria-label={t("ui.protect.removeNumberedSource", { number: index + 2 })} onClick={() => setJobAdditionalSources((current) => current.filter((_, itemIndex) => itemIndex !== index))}>{t("ui.pages.protect.remove.source")}</button>
 									</div>
 									<small>{t("ui.pages.protect.must.be.a.local.folder.mounted.share.mapped.drive.or.network.path.exte")}</small>
@@ -5846,7 +5899,7 @@ export default function Protect() {
 								    permits source updates before local binding, but exposing that here would
 								    let users point the same job ID at different data and alter native retention
 								    scope. Backend mutability does not imply an editable source field. */}
-								<label className="field"><span>{t("ui.pages.protect.source.data")}</span><DirectoryField ariaLabel={t("ui.pages.protect.source.data")} value={jobModal !== "new" && jobModal ? jobCurrentSource(jobModal) : jobForm.source} readOnly={jobModal !== "new"} autoFocus={jobCopyDraft} onChange={(source) => setJobForm({ ...jobForm, source })} /><small>{jobModal === "new" ? t("ui.pages.protect.must.be.a.local.folder.mounted.share.mapped.drive.or.network.path.exte") : t("ui.protect.editSourceImmutableHelp")}</small></label>
+								<label className="field"><span>{t("ui.pages.protect.source.data")}</span><DirectoryField ariaLabel={t("ui.pages.protect.source.data")} value={jobModal !== "new" && jobModal ? jobCurrentSource(jobModal) : jobForm.source} readOnly={jobModal !== "new"} autoFocus={jobCopyDraft} pick={jobModal === "new" ? "fileOrFolder" : "folder"} onPicked={jobSourceKinds.record} onChange={(source) => setJobForm({ ...jobForm, source })} /><small>{jobModal === "new" ? t("ui.pages.protect.must.be.a.local.folder.mounted.share.mapped.drive.or.network.path.exte") : t("ui.protect.editSourceImmutableHelp")}</small></label>
 							</>}
                         <div className="field"><span>{t("ui.pages.protect.destination.vaults")}</span><DestinationVaultPicker repositories={repos ?? []} selectedIds={jobForm.repositoryIds} onChange={(repositoryIds) => setJobForm({ ...jobForm, repositoryIds })} /><small>{t("ui.pages.protect.select.one.or.more.vaults.backups.for.all.vaults.are.managed.by.this.j")}</small></div>
                         <label className="field"><span>{t("ui.pages.protect.schedule")}</span><select aria-label={t("ui.pages.protect.schedule")} value={jobForm.schedule} onChange={(event) => setJobForm({ ...jobForm, schedule: event.target.value })}>{schedulePresets.map(([value, label]) => <option key={value} value={value}>{label()}</option>)}</select><small>{scheduleHelp(jobForm.schedule)}</small></label>
@@ -5867,8 +5920,9 @@ export default function Protect() {
 									<label className="field"><span>{t("ui.pages.protect.keep.n.latest.monthly.snapshots")}</span><input aria-label={t("ui.pages.protect.keep.n.latest.monthly.snapshots")} type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionMonthly} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionMonthly: event.target.value })} /></label>
 									<label className="field"><span>{t("ui.pages.protect.keep.n.latest.yearly.snapshots")}</span><input aria-label={t("ui.pages.protect.keep.n.latest.yearly.snapshots")} type="number" min={1} max={MAX_RETENTION_COUNT} value={jobForm.retentionYearly} onWheel={preventNumberInputWheel} onChange={(event) => setJobForm({ ...jobForm, retentionYearly: event.target.value })} /></label>
 								</div>
-	                                <label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" rows={3} value={jobForm.excludes} placeholder={`${examplePlaceholder("*.tmp")}\n${examplePlaceholder("node_modules")}`} onChange={(event) => setJobForm({ ...jobForm, excludes: event.target.value })} /><small>{t("ui.pages.protect.one.pattern.per.line.for.files.folders.this.job.should.skip")}</small></label>
-								<MarkerFileFields value={jobForm} usesKopia={jobFormUsesKopia} showErrors={jobSaveAttempted} onChange={(markers) => setJobForm({ ...jobForm, ...markers })} />
+								{jobFormSingleFile
+									? <FloatingTooltip className="single-file-settings" role="group" inModal content={t("ui.protect.singleFileFiltersUnavailable")} label={t("ui.protect.singleFileFiltersUnavailable")}>{jobFilterFields}</FloatingTooltip>
+									: jobFilterFields}
 								<label className="field"><span>{t("ui.pages.protect.tag.optional")}</span><input value={jobForm.tag} onChange={(event) => setJobForm({ ...jobForm, tag: event.target.value })} /><small>{t("ui.pages.protect.optional.label.applied.to.snapshots.created.by.this.job")}</small></label>
                                 <div className="engine-settings">
 									<div className="engine-settings-heading"><strong>{t("ui.pages.protect.engine.specific.settings.optional")}</strong><small>{t("ui.pages.protect.these.settings.apply.only.to.the.selected.vault.engines")}</small></div>
@@ -5916,10 +5970,9 @@ export default function Protect() {
 							<label className="check"><input type="checkbox" checked={bulkForm.changeRetention} onChange={(event) => setBulkForm({ ...bulkForm, changeRetention: event.target.checked })} />{t("ui.pages.protect.change.retention")}</label>
 							{bulkForm.changeRetention && <div className="bulk-setting-fields"><label className="field"><span>{t("ui.pages.protect.retention.policy")}</span><select aria-label={t("ui.pages.protect.bulk.retention.policy")} value={retentionPreset(bulkForm.retention)} onChange={(event) => setBulkForm({ ...bulkForm, retention: event.target.value === "custom" ? (retentionPreset(bulkForm.retention) === "custom" ? bulkForm.retention : "") : event.target.value })}>{retentionPresets.map(([value, label]) => <option key={value} value={value}>{label()}</option>)}</select></label>{retentionPreset(bulkForm.retention) === "custom" && <label className="field compact-field"><span>{t("ui.pages.protect.number.of.latest.snapshots.to.keep")}</span><input type="number" min={1} max={MAX_MAIN_RETENTION_COUNT} value={bulkForm.retention} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retention: event.target.value })} /></label>}<div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.keep.n.latest.hourly.snapshots")}</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionHourly} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionHourly: event.target.value })} /></label><label className="field"><span>{t("ui.pages.protect.keep.n.latest.daily.snapshots")}</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionDaily} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionDaily: event.target.value })} /></label><label className="field"><span>{t("ui.pages.protect.keep.n.latest.weekly.snapshots")}</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionWeekly} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionWeekly: event.target.value })} /></label><label className="field"><span>{t("ui.pages.protect.keep.n.latest.monthly.snapshots")}</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionMonthly} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionMonthly: event.target.value })} /></label><label className="field"><span>{t("ui.pages.protect.keep.n.latest.yearly.snapshots")}</span><input type="number" min={1} max={MAX_RETENTION_COUNT} value={bulkForm.retentionYearly} onWheel={preventNumberInputWheel} onChange={(event) => setBulkForm({ ...bulkForm, retentionYearly: event.target.value })} /></label></div></div>}
 						</section>
-						<section className="bulk-setting">
-							<label className="check"><input type="checkbox" checked={bulkForm.changeExcludes} onChange={(event) => setBulkForm({ ...bulkForm, changeExcludes: event.target.checked })} />{t("ui.pages.protect.change.exclude.patterns")}</label>
-							{bulkForm.changeExcludes && <div className="bulk-setting-fields"><label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" rows={3} value={bulkForm.excludes} placeholder={`${examplePlaceholder("*.tmp")}\n${examplePlaceholder("node_modules")}`} onChange={(event) => setBulkForm({ ...bulkForm, excludes: event.target.value })} /><small>{t("ui.pages.protect.one.pattern.per.line.for.files.folders.these.jobs.should.skip")}</small></label></div>}
-						</section>
+						{bulkIncludesSingleFile
+							? <FloatingTooltip className="bulk-setting" role="group" inModal content={t("ui.protect.singleFileFiltersUnavailable")} label={t("ui.protect.singleFileFiltersUnavailable")}>{bulkExcludesFields}</FloatingTooltip>
+							: <section className="bulk-setting">{bulkExcludesFields}</section>}
 						<section className="bulk-setting">
 							<label className="check"><input type="checkbox" checked={bulkForm.changeTag} onChange={(event) => setBulkForm({ ...bulkForm, changeTag: event.target.checked })} />{t("ui.pages.protect.change.tag")}</label>
 							{bulkForm.changeTag && <div className="bulk-setting-fields"><label className="field"><span>{t("ui.pages.protect.tag.optional")}</span><input value={bulkForm.tag} onChange={(event) => setBulkForm({ ...bulkForm, tag: event.target.value })} /><small>{t("ui.pages.protect.optional.label.applied.to.snapshots.created.by.these.jobs")}</small></label></div>}
@@ -5941,14 +5994,14 @@ export default function Protect() {
 						<div><strong>{t("ui.pages.protect.settings")}</strong><span>{[
 							bulkForm.changeSchedule && t("ui.pages.protect.schedule"),
 							bulkForm.changeRetention && t("ui.pages.protect.retention"),
-							bulkForm.changeExcludes && t("ui.pages.protect.exclude.patterns"),
+							bulkChangesExcludes && t("ui.pages.protect.exclude.patterns"),
 							bulkForm.changeTag && t("ui.pages.protect.tag"),
 							bulkForm.changeScripts && t("ui.pages.protect.scripts"),
 							bulkForm.replaceDestinations && t("ui.protect.destinationVaultsAndEngineOptions"),
 						].filter(Boolean).join(", ")}</span></div>
 						{bulkForm.changeSchedule && <div><strong>{t("ui.pages.protect.schedule")}</strong><span>{scheduleLabel(scheduleValue(bulkForm) ?? "")}</span></div>}
 						{bulkForm.changeRetention && <div><strong>{t("ui.pages.protect.retention")}</strong><span>{retentionReviewSummary(bulkForm)}</span></div>}
-						{bulkForm.changeExcludes && <div><strong>{t("ui.pages.protect.exclude.patterns")}</strong><span className="mono review-verbatim">{bulkForm.excludes || t("ui.protect.none")}</span></div>}
+						{bulkChangesExcludes && <div><strong>{t("ui.pages.protect.exclude.patterns")}</strong><span className="mono review-verbatim">{bulkForm.excludes || t("ui.protect.none")}</span></div>}
 						{bulkForm.changeTag && <div><strong>{t("ui.pages.protect.tag")}</strong><span>{bulkForm.tag.trim() || t("ui.protect.none")}</span></div>}
 						{bulkForm.changeScripts && <div><strong>{t("ui.pages.protect.scripts")}</strong><span>{t("ui.protect.bulkScriptSummary", { before: bulkForm.beforeScriptPath || t("ui.protect.none"), beforeRequirement: bulkForm.beforeScriptMustSucceed ? t("ui.protect.mustSucceed") : "", after: bulkForm.afterScriptPath || t("ui.protect.none"), afterRequirement: bulkForm.afterScriptMustSucceed ? t("ui.protect.mustSucceed") : "" })}</span></div>}
 						{bulkForm.replaceDestinations && <div><strong>{t("ui.pages.protect.destination.vaults")}</strong><span>{bulkForm.repositoryIds.map((id) => repos?.find((repo) => repo.id === id)?.name ?? id).join(", ")} · {t("ui.protect.alreadyIdentical", { count: selectedJobs.filter((job) => sameStringSet(job.targets.map((target) => target.repositoryId), bulkForm.repositoryIds)).length })}</span></div>}

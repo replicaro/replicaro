@@ -1796,6 +1796,11 @@ button.protection-ring { cursor: pointer; }
     transform: translateY(0);
 }
 
+/* A FloatingTooltip in a dialog opens above the modal overlay (z-index 70). */
+.floating-tooltip.in-modal {
+    z-index: 80;
+}
+
 .flow-vault > .flow-vault-status {
     display: block !important;
     overflow: visible !important;
@@ -2619,6 +2624,14 @@ select option {
 	margin-bottom: 14px;
 }
 
+/* The exclude patterns and marker-file boxes of a single-file job source,
+   greyed out in one block that carries the explanation. The block keeps the
+   advanced panel's spacing between the two. */
+.single-file-settings {
+	display: grid;
+	gap: 14px;
+}
+
 .marker-file-fields .advanced-setting > input {
 	display: block;
 	box-sizing: border-box;
@@ -2952,6 +2965,11 @@ select option {
 
 .directory-list > button:hover {
     background: var(--surface);
+}
+
+/* The file chosen in the job-source picker's file mode. */
+.directory-list > button[aria-pressed="true"] {
+    background: color-mix(in srgb, var(--accent) 7%, transparent);
 }
 
 .directory-list > .directory-up {
@@ -4261,6 +4279,14 @@ select option {
     color: var(--text);
     font-size: 13px;
     font-weight: 600;
+}
+
+/* The two test buttons' labels are longer than the notification channel on
+   narrow screens in several languages (French, Greek, Russian and others), so
+   they wrap inside the button instead of pushing the page sideways. */
+.notification-channel .btn {
+    white-space: normal;
+    text-align: center;
 }
 
 .save-settings {

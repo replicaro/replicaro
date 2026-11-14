@@ -543,6 +543,13 @@ type kopiaSnapshotRow struct {
 	Stats struct {
 		TotalSize int64 `json:"totalSize"`
 	} `json:"stats"`
+	// fileRootEntry is the native rootEntry object of a file-root snapshot,
+	// kept as Kopia printed it. It is decoded only when that snapshot is
+	// indexed (kopiaFileRootEntry), so an unusual field in one file root can
+	// fail only that snapshot and never the inventory every other snapshot,
+	// including every folder snapshot, is read from. Directory rows leave it
+	// empty.
+	fileRootEntry json.RawMessage
 }
 
 func kopiaSnapshotTags(tags map[string]string) []string {
@@ -602,6 +609,15 @@ func parseKopiaSnapshotRowsReader(reader io.Reader) ([]kopiaSnapshotRow, error) 
 		// establish exact contents when the summary is unavailable.
 		if ambiguousCount {
 			row.RootEntry.Summary = nil
+		}
+		if row.RootEntry.Type == "f" {
+			var root struct {
+				RootEntry json.RawMessage `json:"rootEntry"`
+			}
+			if err := json.Unmarshal(encoded, &root); err != nil {
+				return nil, fmt.Errorf("parse kopia snapshots: %w", err)
+			}
+			row.fileRootEntry = root.RootEntry
 		}
 		rows = append(rows, row)
 	}
@@ -669,9 +685,14 @@ func (e *kopiaEngine) listPath(ctx context.Context, repo models.Repository, id, 
 				return nil, snapshotOutput, kopiaPreparationFailure(fmt.Errorf("snapshot %q has an invalid root object identity", row.ID))
 			}
 			if recursive && path == "" && row.RootEntry.Type == "f" {
-				// Entry-only resume/retry has no index session. Validate the
-				// fresh native header but never issue list/show for file payload.
-				return []models.SnapshotEntry{}, snapshotOutput, nil
+				// Entry-only resume/retry has no index session. The one entry
+				// comes from the fresh native header, exactly as in the index
+				// session; never issue list/show for file payload.
+				entry, err := kopiaFileRootEntry(row.fileRootEntry)
+				if err != nil {
+					return nil, snapshotOutput, kopiaOutputProcessingFailure(err)
+				}
+				return []models.SnapshotEntry{entry}, snapshotOutput, nil
 			}
 			if row.RootEntry.Type != "d" {
 				return nil, snapshotOutput, kopiaPreparationFailure(fmt.Errorf("Kopia snapshot root is not a directory"))
@@ -803,6 +824,66 @@ type kopiaSnapshotIndexSession struct {
 	repository *kopiaRepositorySession
 	snapshots  []SnapshotIndexItem
 	summaries  map[string]json.RawMessage
+	// fileRoots holds the native rootEntry of each file-root snapshot, by
+	// snapshot ID, for kopiaFileRootEntry.
+	fileRoots map[string]json.RawMessage
+}
+
+// kopiaFileRootEntry builds the single index entry of a file-root snapshot
+// from the rootEntry that `snapshot list --json` printed for it: the file's
+// mode and size, with an empty path because the file is the root itself. The
+// cache stores no modified time and no name for a root entry, so mtime and
+// the name are only validated.
+//
+// The entry can't come from a listing: `kopia list <file object>` fails with
+// "is not a directory object", and `show` on a file object would read the
+// backed-up payload. The snapshot list already carries every field the cache
+// stores, so no extra native command runs. The name checked here is the one
+// Kopia recorded (rootEntry.name), not one derived from the job's source
+// path. Because the cache does not keep it, a restore reads it again from the
+// snapshot list, while search and the restore duplicate check use the last
+// element of the recorded source.
+func kopiaFileRootEntry(raw json.RawMessage) (models.SnapshotEntry, error) {
+	var entry kopiaDirectoryEntry
+	if err := json.Unmarshal(raw, &entry); err != nil {
+		return models.SnapshotEntry{}, fmt.Errorf("parse Kopia file root entry: %w", err)
+	}
+	if entry.Type != "f" {
+		return models.SnapshotEntry{}, fmt.Errorf("parse Kopia file root entry: root is not a regular file")
+	}
+	if entry.Name == "" || entry.Name == "." || entry.Name == ".." || strings.ContainsAny(entry.Name, "/\x00") {
+		return models.SnapshotEntry{}, fmt.Errorf("parse Kopia file root entry: invalid name")
+	}
+	// The same converter as directory entries, because Kopia prints the
+	// root entry's mode in the same octal form.
+	converted, err := entry.snapshotEntry("")
+	if err != nil {
+		return models.SnapshotEntry{}, err
+	}
+	converted.Path = ""
+	return converted, nil
+}
+
+// kopiaFileRootIdentity is the entry-set reuse key of a file-root snapshot:
+// the root object plus the native mode. Kopia keeps the same object ID when
+// only the file's permissions change, so the object alone would reuse an
+// entry set carrying the old mode. The name is not part of the key because
+// the cache does not store it. A missing mode gives an empty mode here, and
+// kopiaFileRootEntry indexes that file with mode 0. A mode that isn't a JSON
+// string also gives an empty mode here, and a string that isn't octal is kept
+// as it is; kopiaFileRootEntry refuses both, so indexing that snapshot fails.
+//
+// The key also never equals the "f:<object>" key that file-root snapshots
+// indexed by earlier versions were stored under (with no entry), so a new
+// snapshot of an unchanged file gets its entry instead of reusing that empty
+// set. Those earlier snapshots keep their ready, empty sets; nothing
+// re-indexes them.
+func kopiaFileRootIdentity(object string, raw json.RawMessage) string {
+	var root struct {
+		Mode string `json:"mode"`
+	}
+	_ = json.Unmarshal(raw, &root)
+	return "f:" + object + ":" + root.Mode
 }
 
 func (s *kopiaSnapshotIndexSession) Snapshots() []SnapshotIndexItem { return s.snapshots }
@@ -812,10 +893,19 @@ func (s *kopiaSnapshotIndexSession) ListPathRecursive(ctx context.Context, snaps
 	if !ok || strings.TrimSpace(object) == "" {
 		return nil, "", kopiaPreparationFailure(fmt.Errorf("kopia snapshot %q has no reusable root object", snapshot.Snapshot.ID))
 	}
-	// File roots have no browsable directory content. They participate in the
-	// ordinary ready/complete cache state and remain whole-snapshot restorable.
+	// A file root has no directory content to list. Its one entry is the
+	// file itself, built from the snapshot list (kopiaFileRootEntry). It stays
+	// whole-snapshot restorable and is never browsed.
 	if snapshot.Snapshot.NativeRootType == "f" {
-		return []models.SnapshotEntry{}, "", nil
+		if path != "" {
+			return nil, "", kopiaPreparationFailure(fmt.Errorf("Kopia snapshot root is not a directory"))
+		}
+		entry, err := kopiaFileRootEntry(s.fileRoots[snapshot.Snapshot.ID])
+		if err != nil {
+			return nil, "", kopiaOutputProcessingFailure(err)
+		}
+		entry.SourceRoot = snapshot.Snapshot.Source
+		return []models.SnapshotEntry{entry}, "", nil
 	}
 	if snapshot.Snapshot.NativeRootType != "d" {
 		return nil, "", kopiaPreparationFailure(fmt.Errorf("Kopia snapshot has an unsupported root type"))
@@ -853,6 +943,7 @@ func (e *kopiaEngine) BeginSnapshotIndex(ctx context.Context, repo models.Reposi
 	}
 	items := make([]SnapshotIndexItem, 0, len(rows))
 	summaries := make(map[string]json.RawMessage, len(rows))
+	fileRoots := map[string]json.RawMessage{}
 	for _, row := range rows {
 		snapshot := models.SnapshotWithTags(models.Snapshot{NativeRootType: row.RootEntry.Type, ID: row.ID, Timestamp: row.StartTime, Source: row.Source.Path,
 			SourceRoots:    []models.SnapshotSourceRoot{{Path: row.Source.Path, User: row.Source.UserName, Host: row.Source.Host}},
@@ -865,9 +956,14 @@ func (e *kopiaEngine) BeginSnapshotIndex(ctx context.Context, repo models.Reposi
 		if strings.TrimSpace(identity) == "" || strings.TrimSpace(identity) != identity {
 			return nil, out, kopiaOutputProcessingFailure(fmt.Errorf("snapshot %q has an invalid root object identity", row.ID))
 		}
-		items = append(items, SnapshotIndexItem{Snapshot: snapshot, NativeContentIdentity: row.RootEntry.Type + ":" + identity, NativeReference: identity})
+		contentIdentity := row.RootEntry.Type + ":" + identity
+		if row.RootEntry.Type == "f" {
+			contentIdentity = kopiaFileRootIdentity(identity, row.fileRootEntry)
+			fileRoots[row.ID] = row.fileRootEntry
+		}
+		items = append(items, SnapshotIndexItem{Snapshot: snapshot, NativeContentIdentity: contentIdentity, NativeReference: identity})
 	}
-	return &kopiaSnapshotIndexSession{repository: session, snapshots: items, summaries: summaries}, statusOutput + "\n" + out, nil
+	return &kopiaSnapshotIndexSession{repository: session, snapshots: items, summaries: summaries, fileRoots: fileRoots}, statusOutput + "\n" + out, nil
 }
 func (e *kopiaEngine) Restore(ctx context.Context, repo models.Repository, id string, options RestoreOptions) (output string, err error) {
 	concurrency, err := kopiaConcurrency(repo)
@@ -883,12 +979,20 @@ func (e *kopiaEngine) Restore(ctx context.Context, repo models.Repository, id st
 		return "", kopiaPreparationFailure(err)
 	}
 	source := ""
+	var fileRoot json.RawMessage
 	for _, row := range rows {
 		if row.ID == id {
 			source = row.RootEntry.Obj
 			if selection != "" && row.RootEntry.Type != "d" {
 				return "", kopiaPreparationFailure(fmt.Errorf("Kopia snapshot root is not a directory"))
 			}
+			// The cache said this snapshot recorded a file; the fresh native
+			// root has to say so too, or a whole-snapshot restore of a folder
+			// would run in its place.
+			if options.FileRootVersion && row.RootEntry.Type != "f" {
+				return "", kopiaPreparationFailure(fmt.Errorf("Kopia snapshot root is not a regular file"))
+			}
+			fileRoot = row.fileRootEntry
 			break
 		}
 	}
@@ -904,7 +1008,35 @@ func (e *kopiaEngine) Restore(ctx context.Context, repo models.Repository, id st
 	// Selected-entry metadata traversal below still needs the content object.
 	restoreSource := id
 	destination := options.Destination
-	if selection != "" {
+	if options.FileRootVersion {
+		// A single-file snapshot is restored whole, by its manifest ID, but to
+		// <destination>/<name> like a selected file, so it gets the same
+		// naming and the same "destination folder must exist" rule. The name
+		// is the one the fresh root entry carries, which for a source alias
+		// can differ from the last element of the recorded path.
+		if selection != "" {
+			return "", kopiaPreparationFailure(fmt.Errorf("kopia file version restore cannot also select a path"))
+		}
+		entry, entryErr := kopiaFileRootEntry(fileRoot)
+		if entryErr != nil {
+			return "", kopiaPreparationFailure(&command.OutputProcessingFailure{Err: entryErr})
+		}
+		if RestoreDestinationMissing(options.Destination) {
+			return "", kopiaPreparationFailure(ErrKopiaSelectedFileDestinationMissing)
+		}
+		basename := kopiaDestinationBasename(entry.Name, runtime.GOOS)
+		if options.KopiaFileNames != nil {
+			basename = options.KopiaFileNames.assign(basename)
+		}
+		var destinationErr error
+		destination, destinationErr = kopiaSelectedFileDestination(options.Destination, basename)
+		if destinationErr != nil {
+			return "", kopiaPreparationFailure(destinationErr)
+		}
+		if basename != entry.Name && options.ReportDestination != nil {
+			options.ReportDestination(fmt.Sprintf("Replicaro destination naming: selected file %q will use %q. Native overwrite policy remains %q.", entry.Name, destination, options.ConflictMode))
+		}
+	} else if selection != "" {
 		// Pass the archived spelling unchanged. Source separator interpretation
 		// belongs to Kopia, including its Windows literal-backslash limitation.
 		restoreSource = source + "/" + selection

@@ -47,6 +47,7 @@ import (
 )
 
 var applyDesktopSettings = desktop.ApplySettings
+var desktopCapabilities = desktop.Capabilities
 
 // Credential activation checks native access here; its callers also require
 // the same physical vault address and matching protected root/profile records
@@ -308,6 +309,15 @@ func writeRetiredBackupOptionError(w http.ResponseWriter, err error) {
 	})
 }
 
+// writeFileSourceOptionsUnavailable answers a single-file job saved with
+// exclusion or skip-folder options. It is a 400 like any other refused input;
+// "error" keeps the English text for API clients and the code lets the page
+// show its own translated text.
+func writeFileSourceOptionsUnavailable(w http.ResponseWriter) {
+	markSupportResponseError(w, database.ErrFileSourceExclusions, true)
+	writeCodedError(w, http.StatusBadRequest, "file_source_options_unavailable", database.ErrFileSourceExclusions.Error())
+}
+
 func badRequest(w http.ResponseWriter, message string) {
 	markSupportResponseError(w, errors.New(message), true)
 	w.Header().Set("Content-Type", "application/json")
@@ -556,7 +566,29 @@ func handlerForExecutionInstanceWithReader(
 	})
 
 	handle(mux, "/api/filesystem/directories", func(w http.ResponseWriter, r *http.Request) {
-		listing, err := browseDirectoriesBounded(r.Context(), r.URL.Query().Get("path"), containerPackage)
+		// Two opt-ins for the job source picker and form, each only with the
+		// exact value "1": kind=1 answers {"kind":"file"|"folder"|"neither"} for
+		// the path, and files=1 adds "files" to the listing. Without them the
+		// request is the folders-only listing the other pickers use.
+		query := r.URL.Query()
+		if query.Get("kind") == "1" {
+			kind, err := lookupPickerKindBounded(r.Context(), query.Get("path"), containerPackage)
+			if errors.Is(err, errDirectoryNotResponding) {
+				writeCodedError(w, http.StatusGatewayTimeout, "directory_not_responding", err.Error())
+				return
+			}
+			if err != nil {
+				writeError(w, http.StatusBadRequest, err)
+				return
+			}
+			writeJSON(w, pickerKindAnswer{Kind: kind})
+			return
+		}
+		mode := pickerModeFolders
+		if query.Get("files") == "1" {
+			mode = pickerModeFiles
+		}
+		listing, err := browseDirectoriesBounded(r.Context(), query.Get("path"), containerPackage, mode)
 		if errors.Is(err, errDirectoryNotResponding) {
 			writeCodedError(w, http.StatusGatewayTimeout, "directory_not_responding", err.Error())
 			return
@@ -1499,10 +1531,29 @@ func handlerForExecutionInstanceWithReader(
 			type responseSnapshot struct {
 				models.Snapshot
 				MachineLabel string `json:"machineLabel,omitempty"`
+				// FileRootIDs names the roots this snapshot recorded as a
+				// single file, so Restore can offer restore without Browse for
+				// them. It comes from the indexed entries, not from the header:
+				// Restic headers don't say whether a path was a file. Folder
+				// snapshots, and snapshots not indexed yet, leave it out.
+				FileRootIDs []string `json:"fileRootIds,omitempty"`
+			}
+			var fileRoots map[string]map[string]models.SnapshotSourceRoot
+			if len(snapshots) != 0 {
+				// Browse of a file root is refused on its own request too, so a
+				// lookup that fails only costs the hint; the list still answers.
+				fileRoots, _ = database.MetadataSnapshotFileRootsForAuthority(r.Context(), readDB, authority, nil)
 			}
 			response := make([]responseSnapshot, 0, len(snapshots))
 			for _, snapshot := range snapshots {
-				response = append(response, responseSnapshot{Snapshot: snapshot, MachineLabel: snapshot.PresentationMachineLabel})
+				item := responseSnapshot{Snapshot: snapshot, MachineLabel: snapshot.PresentationMachineLabel}
+				for _, root := range snapshot.SourceRoots {
+					identity := models.WithSnapshotNativeRootIdentity(root).Identity
+					if _, file := fileRoots[snapshot.ID][identity]; file {
+						item.FileRootIDs = append(item.FileRootIDs, identity)
+					}
+				}
+				response = append(response, item)
 			}
 			writeJSON(w, response)
 		}
@@ -1576,6 +1627,7 @@ func handlerForExecutionInstanceWithReader(
 		hidden := false
 		var nativeRoot models.SnapshotSourceRoot
 		var rootErr error
+		fileRoot := false
 		_, entries, ready, cacheErr := database.ReadyMetadataSnapshotRootEntriesPageForAuthority(
 			r.Context(), readDB, authority, snapshotID, browsePath, metadataPageSize+1, offset,
 			func(cachedSnapshot models.Snapshot) (string, bool) {
@@ -1585,7 +1637,10 @@ func handlerForExecutionInstanceWithReader(
 					return "", false
 				}
 				nativeRoot, rootErr = exactRestoreNativeRoot(cachedSnapshot, r.URL.Query().Get("nativeRootId"), true)
-				return nativeRoot.Path, rootErr == nil
+				// Kopia's header says when its only root is a file. Restic's
+				// header doesn't; see the entry check below.
+				fileRoot = cachedSnapshot.NativeRootType == "f"
+				return nativeRoot.Path, rootErr == nil && !fileRoot
 			},
 		)
 		if cacheErr != nil {
@@ -1606,6 +1661,17 @@ func handlerForExecutionInstanceWithReader(
 		}
 		if rootErr != nil {
 			writeError(w, http.StatusUnprocessableEntity, rootErr)
+			return
+		}
+		// A single-file root has no folder to browse; Restore restores it
+		// whole. The listing of a root's top level holds an entry with an
+		// empty path only when that root is itself a file, so this needs no
+		// extra query and costs folder roots nothing.
+		for _, entry := range entries {
+			fileRoot = fileRoot || entry.Path == ""
+		}
+		if fileRoot {
+			writeCodedError(w, http.StatusUnprocessableEntity, "snapshot_root_is_file", "this snapshot source is a single file; it can be restored but not browsed")
 			return
 		}
 		hasMore := len(entries) > metadataPageSize
@@ -2110,6 +2176,12 @@ func handlerForExecutionInstanceWithReader(
 						writeJobDefinitionChanged(w)
 						return
 					}
+					if errors.Is(err, database.ErrFileSourceExclusions) {
+						// The user's input, not a server fault: a file job can't
+						// keep exclusions or marker-file options.
+						writeFileSourceOptionsUnavailable(w)
+						return
+					}
 					if errors.Is(err, database.ErrJobRunActive) ||
 						errors.Is(err, database.ErrJobConnectionReserved) ||
 						errors.Is(err, database.ErrJobSourceChanged) || errors.Is(err, database.ErrJobSourceImmutable) ||
@@ -2126,6 +2198,12 @@ func handlerForExecutionInstanceWithReader(
 				var err error
 				id, err = database.CreateJob(db, job)
 				if err != nil {
+					if errors.Is(err, database.ErrFileSourceExclusions) {
+						// Only known once the probe has found a file: the same
+						// request for a folder is a valid job.
+						writeFileSourceOptionsUnavailable(w)
+						return
+					}
 					if errors.Is(err, database.ErrJobNameExists) ||
 						strings.Contains(err.Error(), "conflicting Kopia") {
 						writeError(w, http.StatusConflict, err)
@@ -2513,18 +2591,30 @@ func handlerForExecutionInstanceWithReader(
 				}
 				notificationURLs = checked
 			}
-			err := database.SaveSettings(db, models.Settings{
-				DefaultEngine:                req.DefaultEngine,
-				LogRetentionDays:             req.LogRetentionDays,
-				Theme:                        req.Theme,
-				Language:                     language,
-				NotificationURLs:             notificationURLs,
-				NotifyWindowsOnSuccess:       req.NotifyWindowsOnSuccess || req.NativeNotificationsOnSuccess,
-				NotifyWindowsOnFailure:       req.NotifyWindowsOnFailure || req.NativeNotificationsOnFailure,
-				NativeNotificationsOnSuccess: req.NativeNotificationsOnSuccess || req.NotifyWindowsOnSuccess,
-				NativeNotificationsOnFailure: req.NativeNotificationsOnFailure || req.NotifyWindowsOnFailure,
-				NotifyWebhookOnSuccess:       req.NotifyWebhookOnSuccess,
-				NotifyWebhookOnFailure:       req.NotifyWebhookOnFailure,
+			desktopTitlePrefix, err := cleanSentTitlePrefix(req.DesktopNotificationTitlePrefix)
+			if err != nil {
+				badRequest(w, err.Error())
+				return
+			}
+			urlTitlePrefix, err := cleanSentTitlePrefix(req.NotificationURLTitlePrefix)
+			if err != nil {
+				badRequest(w, err.Error())
+				return
+			}
+			err = database.SaveSettings(db, models.Settings{
+				DefaultEngine:                  req.DefaultEngine,
+				LogRetentionDays:               req.LogRetentionDays,
+				Theme:                          req.Theme,
+				Language:                       language,
+				NotificationURLs:               notificationURLs,
+				DesktopNotificationTitlePrefix: desktopTitlePrefix,
+				NotificationURLTitlePrefix:     urlTitlePrefix,
+				NotifyWindowsOnSuccess:         req.NotifyWindowsOnSuccess || req.NativeNotificationsOnSuccess,
+				NotifyWindowsOnFailure:         req.NotifyWindowsOnFailure || req.NativeNotificationsOnFailure,
+				NativeNotificationsOnSuccess:   req.NativeNotificationsOnSuccess || req.NotifyWindowsOnSuccess,
+				NativeNotificationsOnFailure:   req.NativeNotificationsOnFailure || req.NotifyWindowsOnFailure,
+				NotifyWebhookOnSuccess:         req.NotifyWebhookOnSuccess,
+				NotifyWebhookOnFailure:         req.NotifyWebhookOnFailure,
 				// In headless service mode a request cannot turn Start at login off;
 				// see keepStartAtLogin above.
 				StartWithWindows:             req.StartWithWindows || req.StartAtLogin || keepStartAtLogin,
@@ -2555,11 +2645,13 @@ func handlerForExecutionInstanceWithReader(
 	})
 
 	// Sends a test notification to the URLs as typed in the settings box,
-	// before they are saved. It ignores the success/failure switches and
-	// writes no operation or log entry; the page shows each URL's outcome.
+	// before they are saved, with the URL title prefix as typed too. It
+	// ignores the success/failure switches and writes no operation or log
+	// entry; the page shows each URL's outcome.
 	handle(mux, "/api/settings/notification-urls/test", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			URLs []string `json:"urls"`
+			URLs        []string `json:"urls"`
+			TitlePrefix string   `json:"titlePrefix"`
 		}
 		if err := decodeRequest(r, &req); err != nil {
 			writeError(w, http.StatusBadRequest, err)
@@ -2569,12 +2661,46 @@ func handlerForExecutionInstanceWithReader(
 		if settings, err := database.GetSettings(readDB); err == nil {
 			language = settings.Language
 		}
-		results, err := notifications.SendTest(r.Context(), req.URLs, locale.Effective(language))
+		results, err := notifications.SendTest(r.Context(), req.URLs, req.TitlePrefix, locale.Effective(language))
 		if err != nil {
 			badRequest(w, err.Error())
 			return
 		}
 		writeJSON(w, map[string]any{"results": results})
+	})
+
+	// Shows the test notification on the desktop with the desktop title
+	// prefix as typed in the settings box, before it is saved. Like the URL
+	// test it ignores the success/failure switches and writes no operation or
+	// log entry. The page only offers the button where desktop notifications
+	// work, but the check is repeated here: they can stop working while the
+	// page is open (the tray icon going away on Windows, the notification
+	// service on Linux), and the native call can then return without an error
+	// although nothing was shown.
+	handle(mux, "/api/settings/desktop-notification/test", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			TitlePrefix string `json:"titlePrefix"`
+		}
+		if err := decodeRequest(r, &req); err != nil {
+			writeError(w, http.StatusBadRequest, err)
+			return
+		}
+		if !desktopCapabilities()["nativeNotifications"] {
+			badRequest(w, "Desktop notifications are not available on this computer.")
+			return
+		}
+		language := ""
+		if settings, err := database.GetSettings(readDB); err == nil {
+			language = settings.Language
+		}
+		// A prefix that is too long and a failure of the desktop notification
+		// itself are both the answer to the test, shown as given; like the URL
+		// test's failures, neither is recorded in the log.
+		if err := notifications.SendDesktopTest(req.TitlePrefix, locale.Effective(language)); err != nil {
+			badRequest(w, err.Error())
+			return
+		}
+		w.WriteHeader(http.StatusOK)
 	})
 
 	handle(mux, "/api/vault-profile-sync", func(w http.ResponseWriter, r *http.Request) {

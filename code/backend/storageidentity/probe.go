@@ -10,24 +10,45 @@ import (
 	"unicode"
 )
 
-const HelperVersion = "storage_probe_v5"
+const HelperVersion = "storage_probe_v6"
 
 // Probe kinds. A source probe also reads one directory entry, because a
 // backup needs a readable folder and an empty folder is still readable. A
 // vault_create probe walks up to the deepest existing parent and reports the
 // missing tail; the vault folder itself is created later by the native engine.
+//
+// A source can also be a single file. source_file is the before-run probe of
+// a job whose source is known to be a file. source_any is for the moments
+// when the kind isn't known yet (a new job, the first binding of a recovered
+// or imported job, Update job source): a folder there gets exactly the
+// source probe, and anything else goes through the file rules. Folder jobs
+// that are already bound keep using "source" and never pay for an extra call.
 const (
 	ProbeSource      = "source"
 	ProbeVault       = "vault"
 	ProbeVaultCreate = "vault_create"
+	ProbeSourceFile  = "source_file"
+	ProbeSourceAny   = "source_any"
 )
 
 // Access results.
 const (
 	AccessOK      = "ok"
-	AccessMissing = "missing" // not found, or not a directory
+	AccessMissing = "missing" // not found, or not the kind of entry the probe expects
 	AccessDenied  = "denied"
 	AccessFailed  = "failed" // any other OS error; the storage is treated as temporarily unreachable
+	// AccessUnsupported is only ever answered to a source_any probe: the path
+	// exists but is a symbolic link to a file, a device, a pipe or a socket,
+	// none of which can be a job source. A bound file job whose path turns into
+	// one of these gets "missing" instead, so the before-run decision never
+	// sees this value.
+	AccessUnsupported = "unsupported"
+)
+
+// Kinds of source a successful source_file or source_any probe found.
+const (
+	PathKindFolder = "folder"
+	PathKindFile   = "file"
 )
 
 // Recorded mount point states reported when the folder itself is missing.
@@ -47,6 +68,9 @@ const (
 	StepMountPoint      = "mount_point"
 	StepFilesystemType  = "filesystem_type"
 	StepMountPointCheck = "mount_point_check"
+	// StepOpenFile labels every failure of the file branch. Code 0 there means
+	// no OS call failed: the path exists but isn't a regular file.
+	StepOpenFile = "open_file"
 )
 
 type HelperRequest struct {
@@ -84,6 +108,18 @@ type HelperResponse struct {
 	FactFailures  []FactFailure `json:"fact_failures,omitempty"`
 	MissingTail   string        `json:"missing_tail,omitempty"`
 	RecordedMount *MountCheck   `json:"recorded_mount,omitempty"`
+	// Kind and MountRoot are answered only to the source_file and source_any
+	// probes, and only on success. Kind is what was found (PathKindFolder or
+	// PathKindFile). MountRoot says the file is itself the root of a mount,
+	// which is what a single-file Docker bind mount looks like inside the
+	// container. Such a file must not become a job source: when an editor on
+	// the host saves by writing a new file and renaming it over the old one,
+	// the bind mount keeps pointing at the old file, so the container goes on
+	// reading the old content and backups would silently store stale data.
+	// The folder probes never carry these fields, so their responses look
+	// exactly as they did before file sources existed.
+	Kind      string `json:"kind,omitempty"`
+	MountRoot bool   `json:"mount_root,omitempty"`
 }
 
 // Facts returns the facts observed for the opened folder.
@@ -109,17 +145,116 @@ func ExecuteRequest(request HelperRequest) (HelperResponse, error) {
 		return HelperResponse{}, err
 	}
 	var response HelperResponse
-	if request.Kind == ProbeVaultCreate {
+	switch request.Kind {
+	case ProbeVaultCreate:
 		response = probeCreationParent(request.Path)
-	} else {
+	case ProbeSourceAny:
+		response = probeSourceAny(request.Path)
+	case ProbeSourceFile:
+		response = probeSourceFile(request.Path, false)
+	default:
 		response = probeFolder(request.Path, request.Kind == ProbeSource)
-		if response.Access == AccessMissing && request.MountPoint != "" {
-			check := checkRecordedMount(request.MountPoint)
-			response.RecordedMount = &check
-		}
+	}
+	// A missing file is told apart from an unplugged drive exactly as a
+	// missing folder is. source_any and vault_create never carry a mount
+	// point (validateHelperRequest), so this only runs for bound storage.
+	if request.Kind != ProbeVaultCreate && response.Access == AccessMissing && request.MountPoint != "" {
+		check := checkRecordedMount(request.MountPoint)
+		response.RecordedMount = &check
 	}
 	response.Version = HelperVersion
 	return response, nil
+}
+
+// probeSourceAny probes a source whose kind isn't known yet.
+//
+// It follows the path with os.Stat first and sends anything that turns out to
+// be a folder to probeFolder, unchanged. That order is deliberate: a
+// symlinked folder, a Windows junction, or a mapped folder reached through a
+// link must be probed exactly as the folder probe always has, and checking
+// with Lstat first would see the link instead of the folder. A Stat error is
+// classified as the folder probe's open error would be (missing, denied, or
+// failed), with the same step label, so a missing or unreachable path reads
+// the same whatever kind of source the user meant.
+//
+// Only a path that exists and isn't a folder goes on to the file branch.
+func probeSourceAny(path string) HelperResponse {
+	info, err := os.Stat(path)
+	if err != nil {
+		return failedAccess(StepOpenFolder, err)
+	}
+	if info.IsDir() {
+		response := probeFolder(path, true)
+		if response.Access == AccessOK {
+			response.Kind = PathKindFolder
+		}
+		return response
+	}
+	return probeSourceFile(path, true)
+}
+
+// probeSourceFile probes a single-file source. anyKind is set for source_any,
+// where a path that can never be a source is reported as unsupported; for a
+// bound file job (source_file) every path that isn't a regular file is
+// "missing", the mirror of a folder job whose folder became a file. Reusing
+// "missing" means the before-run decision, its texts and its pause rules stay
+// exactly as they are: a type change is an error while the drive is present
+// and a pause while the recorded mount point is gone.
+//
+// The path is classified with Lstat before anything is opened:
+//   - a symbolic link (on Windows, any name-surrogate reparse point) is never
+//     followed. Following it would back up whatever the link points at today,
+//     and the engines also disagree on links: Restic stores the link itself,
+//     Kopia stores the target;
+//   - devices, pipes and sockets are never opened at all. Opening a FIFO
+//     blocks until a writer appears, which would hang the helper until its
+//     deadline and read as unreachable storage;
+//   - everything else must be a regular file. On Windows a reparse point that
+//     isn't a link, such as a OneDrive placeholder or a deduplicated file,
+//     counts as a regular file; the engine reports any read problem itself.
+//
+// The file itself is then opened for metadata only (observeSourceFile) and
+// its type is checked again on that handle, in case it changed in between.
+func probeSourceFile(path string, anyKind bool) HelperResponse {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return failedAccess(StepOpenFile, err)
+	}
+	if !sourceFileCandidate(info.Mode()) {
+		return notRegularFile(anyKind && !info.IsDir())
+	}
+	observed, err := observeSourceFile(path)
+	if err != nil {
+		return failedAccess(StepOpenFile, err)
+	}
+	if !observed.regular {
+		return notRegularFile(anyKind && !observed.directory)
+	}
+	facts, failures := sanitizeFacts(observed.facts, observed.failures)
+	return HelperResponse{Access: AccessOK, MountPoint: facts.MountPoint, Filesystem: facts.Filesystem,
+		FactFailures: failures, Kind: PathKindFile, MountRoot: observed.mountRoot}
+}
+
+// sourceFileObservation is what observeSourceFile learned from the opened
+// file. regular reports the type seen on the handle (on Windows a non-link
+// reparse file counts as regular); directory is set when it is a folder.
+type sourceFileObservation struct {
+	regular   bool
+	directory bool
+	facts     Facts
+	failures  []FactFailure
+	mountRoot bool
+}
+
+// notRegularFile answers a path that exists but isn't a regular file. No OS
+// call failed, so the code is 0. unsupported is only set for source_any, and
+// never for a folder: a folder found here appeared after the Stat above, and
+// "missing" is the safe answer to that race.
+func notRegularFile(unsupported bool) HelperResponse {
+	if unsupported {
+		return HelperResponse{Access: AccessUnsupported, Step: StepOpenFile}
+	}
+	return HelperResponse{Access: AccessMissing, Step: StepOpenFile}
 }
 
 func probeFolder(path string, readEntry bool) HelperResponse {
@@ -291,7 +426,7 @@ func validateHelperRequest(request HelperRequest) error {
 		return fmt.Errorf("unsupported storage helper request")
 	}
 	switch request.Kind {
-	case ProbeSource, ProbeVault, ProbeVaultCreate:
+	case ProbeSource, ProbeVault, ProbeVaultCreate, ProbeSourceFile, ProbeSourceAny:
 	default:
 		return fmt.Errorf("unsupported storage probe kind")
 	}
@@ -299,7 +434,8 @@ func validateHelperRequest(request HelperRequest) error {
 		return fmt.Errorf("storage probe path is invalid: %w", err)
 	}
 	if request.MountPoint != "" {
-		if request.Kind == ProbeVaultCreate {
+		// Nothing has been recorded yet for storage whose kind isn't known.
+		if request.Kind == ProbeVaultCreate || request.Kind == ProbeSourceAny {
 			return fmt.Errorf("a creation probe has no recorded mount point")
 		}
 		if len(request.MountPoint) > maxFactBytes || strings.IndexFunc(request.MountPoint, unicode.IsControl) >= 0 ||
@@ -329,14 +465,32 @@ func ValidateHelperResponse(request HelperRequest, response HelperResponse) erro
 	if response.MissingTail != "" && (request.Kind != ProbeVaultCreate || response.Access != AccessOK) {
 		return fmt.Errorf("storage helper returned an unexpected missing tail")
 	}
+	fileKinds := request.Kind == ProbeSourceFile || request.Kind == ProbeSourceAny
+	if !fileKinds && (response.Kind != "" || response.MountRoot) {
+		// The folder probes answer in exactly the shape they always had.
+		return fmt.Errorf("storage helper returned a source kind to a folder probe")
+	}
 	switch response.Access {
 	case AccessOK:
 		if response.Step != "" || response.Code != 0 || response.RecordedMount != nil {
 			return fmt.Errorf("storage helper success response is inconsistent")
 		}
-	case AccessMissing, AccessDenied, AccessFailed:
-		if response.Step != StepOpenFolder && response.Step != StepReadEntry {
+		switch {
+		case request.Kind == ProbeSourceFile && response.Kind != PathKindFile,
+			request.Kind == ProbeSourceAny && response.Kind != PathKindFile && response.Kind != PathKindFolder,
+			response.MountRoot && response.Kind != PathKindFile:
+			return fmt.Errorf("storage helper source kind is inconsistent")
+		}
+	case AccessMissing, AccessDenied, AccessFailed, AccessUnsupported:
+		if response.Access == AccessUnsupported && request.Kind != ProbeSourceAny {
+			return fmt.Errorf("storage helper access result is invalid")
+		}
+		if !validFailureStep(request.Kind, response.Step) ||
+			response.Access == AccessUnsupported && (response.Step != StepOpenFile || response.Code != 0) {
 			return fmt.Errorf("storage helper failure step is invalid")
+		}
+		if response.Kind != "" || response.MountRoot {
+			return fmt.Errorf("storage helper failure response contains a source kind")
 		}
 		if !facts.Empty() || len(response.FactFailures) != 0 {
 			return fmt.Errorf("storage helper failure response contains facts")
@@ -363,4 +517,19 @@ func ValidateHelperResponse(request HelperRequest, response HelperResponse) erro
 		return fmt.Errorf("storage helper access result is invalid")
 	}
 	return nil
+}
+
+// validFailureStep lists the steps each probe kind can fail at. source_any
+// fails at open_folder when the path can't be reached at all or is a folder,
+// at read_entry for a folder that can't be listed, and at open_file in the
+// file branch.
+func validFailureStep(kind, step string) bool {
+	switch kind {
+	case ProbeSourceFile:
+		return step == StepOpenFile
+	case ProbeSourceAny:
+		return step == StepOpenFolder || step == StepReadEntry || step == StepOpenFile
+	default:
+		return step == StepOpenFolder || step == StepReadEntry
+	}
 }

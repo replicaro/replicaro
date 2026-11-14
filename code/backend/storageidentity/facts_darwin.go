@@ -18,6 +18,13 @@ func observeFacts(file *os.File, _ string) (Facts, []FactFailure) {
 		code, _ := osErrorCode(err)
 		return Facts{}, []FactFailure{{Step: StepMountPoint, Code: code}, {Step: StepFilesystemType, Code: code}}
 	}
+	return factsFromStatfs(stat)
+}
+
+// factsFromStatfs turns one statfs result into the two facts. A folder gets it
+// from fstatfs on the opened folder, a single-file source from statfs on its
+// path (see observeSourceFile).
+func factsFromStatfs(stat unix.Statfs_t) (Facts, []FactFailure) {
 	facts := Facts{
 		MountPoint: unix.ByteSliceToString(stat.Mntonname[:]),
 		Filesystem: NormalizeFilesystem(unix.ByteSliceToString(stat.Fstypename[:])),

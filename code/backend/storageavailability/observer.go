@@ -447,7 +447,7 @@ func checkSourcePath(ctx context.Context, job models.BackupJob, path string) Che
 	case err != nil || path != SourceLocation(job):
 		check = errorCheck(database.AvailabilityReasonIdentityMismatch, stepBinding, 0)
 	default:
-		response, probeErr := probe(ctx, path, storageidentity.ProbeSource, recorded.MountPoint)
+		response, probeErr := probe(ctx, path, sourceProbeKind(job), recorded.MountPoint)
 		if errors.Is(probeErr, context.Canceled) {
 			return canceledCheck()
 		}
@@ -457,6 +457,19 @@ func checkSourcePath(ctx context.Context, job models.BackupJob, path string) Che
 		recordDecision("source:"+job.ID, "source_before_run", check)
 	}
 	return check
+}
+
+// sourceProbeKind picks the before-run probe for a bound job. A file job's
+// probe answers in the folder probe's vocabulary (a path that is no longer a
+// regular file is "missing"), so decide applies the same table to both. A
+// file that has become a single-file mount since it was bound isn't refused
+// here: its mount point then differs from the recorded one, which pauses the
+// job as a changed storage identity, exactly as a remounted folder does.
+func sourceProbeKind(job models.BackupJob) string {
+	if job.IsFileSource() {
+		return storageidentity.ProbeSourceFile
+	}
+	return storageidentity.ProbeSource
 }
 
 // CheckRepository probes a filesystem vault's registered location.
@@ -666,39 +679,87 @@ func ResolutionStep(err error) (string, int64) {
 	return stepHelper, 0
 }
 
+// The two ways a job source can be refused even though the path is there.
+// Their text is shown to the user as it is (the API passes exactly these two
+// through instead of its fixed "could not be observed" text), so it must stay
+// free of paths and OS messages. The UI and its documentation quote the
+// wording, so don't reword it casually.
+var (
+	// ErrSourceNotFileOrFolder: the path is a symbolic link to a file, a
+	// device, a pipe or a socket. A link isn't followed because the engines
+	// disagree on links (Restic stores the link, Kopia the target) and
+	// because it would back up whatever the link points at later; a device or
+	// pipe can't be backed up as a file at all.
+	ErrSourceNotFileOrFolder = errors.New("Replicaro can back up a file or a folder, but not a symbolic link, device, pipe, or socket. Choose a different path.")
+	// ErrSourceFileMountedAlone: the file is itself the root of a mount,
+	// which is what a single-file Docker bind mount looks like inside the
+	// container. When an editor on the host saves by replacing the file, the
+	// mount keeps the old one, so backups would silently store stale data.
+	ErrSourceFileMountedAlone = errors.New("This file is mounted on its own (for example, as a single-file Docker bind mount). After the file is saved on the host, the mount can keep showing the old version, so Replicaro could back up outdated data. Mount the folder that holds the file instead, then choose the file inside that folder.")
+)
+
+// SourceRefusal returns ErrSourceNotFileOrFolder or ErrSourceFileMountedAlone
+// when err is one of them, and nil for every other error.
+func SourceRefusal(err error) error {
+	for _, refusal := range []error{ErrSourceNotFileOrFolder, ErrSourceFileMountedAlone} {
+		if errors.Is(err, refusal) {
+			return refusal
+		}
+	}
+	return nil
+}
+
 // bindFilesystem records the facts of one folder being saved. It never
 // refuses a readable folder because a fact is missing: the folder is saved
 // without that fact and a support diagnostic records why. Only a folder that
 // cannot be opened at all (for a new vault: no existing parent can be opened)
 // fails.
 func bindFilesystem(ctx context.Context, path, kind, stage string) (Binding, error) {
+	binding, _, err := bindObserved(ctx, path, kind, stage)
+	return binding, err
+}
+
+// bindObserved is bindFilesystem that also returns what the probe found, for
+// the source probes that report a kind. The "unsupported" case and the
+// mount-root check can only trigger for a source_any probe: the helper
+// response check refuses "unsupported" and mount_root for every other probe
+// kind, so folder and vault bindings never reach them.
+func bindObserved(ctx context.Context, path, kind, stage string) (Binding, string, error) {
 	if err := storageidentity.ValidateBindingPath(path); err != nil {
 		// Never reached the helper, so the support label is "path", not
 		// "helper". The validation text itself stays in the wrapped cause.
-		return Binding{}, &bindingError{reason: database.AvailabilityReasonObservationFailed, step: stepPath, cause: err}
+		return Binding{}, "", &bindingError{reason: database.AvailabilityReasonObservationFailed, step: stepPath, cause: err}
 	}
 	response, err := probe(ctx, path, kind, "")
 	if err != nil {
 		if errors.Is(err, context.Canceled) {
-			return Binding{}, context.Canceled
+			return Binding{}, "", context.Canceled
 		}
 		if errors.Is(err, storageidentity.ErrHelperSlotsExhausted) {
-			return Binding{}, &bindingError{reason: database.AvailabilityReasonObservationSlotsExhausted, step: stepHelper}
+			return Binding{}, "", &bindingError{reason: database.AvailabilityReasonObservationSlotsExhausted, step: stepHelper}
 		}
 		if errors.Is(err, context.DeadlineExceeded) {
-			return Binding{}, &bindingError{reason: database.AvailabilityReasonObservationTimeout, step: stepHelper, timeout: true}
+			return Binding{}, "", &bindingError{reason: database.AvailabilityReasonObservationTimeout, step: stepHelper, timeout: true}
 		}
-		return Binding{}, &bindingError{reason: database.AvailabilityReasonObservationFailed, step: stepHelper}
+		return Binding{}, "", &bindingError{reason: database.AvailabilityReasonObservationFailed, step: stepHelper}
 	}
 	switch response.Access {
 	case storageidentity.AccessOK:
 	case storageidentity.AccessMissing:
-		return Binding{}, &bindingError{reason: database.AvailabilityReasonStorageMissing, step: response.Step, code: response.Code}
+		return Binding{}, "", &bindingError{reason: database.AvailabilityReasonStorageMissing, step: response.Step, code: response.Code}
 	case storageidentity.AccessDenied:
-		return Binding{}, &bindingError{reason: database.AvailabilityReasonObservationFailed,
+		return Binding{}, "", &bindingError{reason: database.AvailabilityReasonObservationFailed,
 			step: response.Step, code: response.Code, permissionDenied: true}
+	case storageidentity.AccessUnsupported:
+		return Binding{}, "", ErrSourceNotFileOrFolder
 	default:
-		return Binding{}, &bindingError{reason: database.AvailabilityReasonObservationFailed, step: response.Step, code: response.Code}
+		return Binding{}, "", &bindingError{reason: database.AvailabilityReasonObservationFailed, step: response.Step, code: response.Code}
+	}
+	if response.MountRoot {
+		// Only a file is reported as a mount root; a folder that is a mount
+		// point (a mounted drive, a Docker folder bind mount) is an ordinary
+		// source and never gets here.
+		return Binding{}, "", ErrSourceFileMountedAlone
 	}
 	for _, failure := range response.FactFailures {
 		recordSupport("Support diagnostic: stage=" + stage + " reason=fact_unavailable step=" + failure.Step +
@@ -706,9 +767,58 @@ func bindFilesystem(ctx context.Context, path, kind, stage string) (Binding, err
 	}
 	encoded, err := storageidentity.EncodeBinding(response.Facts())
 	if err != nil {
-		return Binding{}, &bindingError{reason: database.AvailabilityReasonObservationFailed, step: stepHelper}
+		return Binding{}, "", &bindingError{reason: database.AvailabilityReasonObservationFailed, step: stepHelper}
 	}
-	return Binding{Version: storageidentity.BindingVersion, Key: path, DescriptorJSON: encoded}, nil
+	return Binding{Version: storageidentity.BindingVersion, Key: path, DescriptorJSON: encoded}, response.Kind, nil
+}
+
+// bindSourcePath binds a job source with the probe its recorded kind calls
+// for and returns the kind to store with the binding ("" for a folder).
+//
+//   - "" is a folder job: the folder probe, the same one its before-run
+//     checks use. That includes every job recovered from a profile or dormant
+//     definition that names no kind, so a recovered folder job whose path has
+//     become a file is refused as a missing source, never quietly turned into
+//     a file job.
+//   - SourceKindUnknown means "find out": a new job, or an adopted import
+//     binding for the first time. source_any sends a folder to the same
+//     folder probe and anything else to the file rules.
+//   - SourceKindFile is a recovered file job: source_any, and it has to find
+//     a file. A folder there is refused as a missing source, the mirror image
+//     of a folder job whose path is now a file.
+//
+// Do not let a recorded kind other than unknown change here: the kind decides
+// which snapshots share the job's native retention group, so a folder job
+// that silently became a file job (or the reverse) would let retention expire
+// the other kind's snapshots.
+func bindSourcePath(ctx context.Context, path, recordedKind, stage string) (Binding, string, error) {
+	switch recordedKind {
+	case "":
+		binding, err := bindFilesystem(ctx, path, storageidentity.ProbeSource, stage)
+		return binding, "", err
+	case models.SourceKindUnknown, models.SourceKindFile:
+	default:
+		return Binding{}, "", fmt.Errorf("unsupported backup job source kind")
+	}
+	binding, found, err := bindObserved(ctx, path, storageidentity.ProbeSourceAny, stage)
+	if err != nil {
+		return Binding{}, "", err
+	}
+	switch found {
+	case storageidentity.PathKindFile:
+		return binding, models.SourceKindFile, nil
+	case storageidentity.PathKindFolder:
+		if recordedKind == models.SourceKindFile {
+			// The same answer a bound file job's before-run probe gives for a
+			// folder: missing, at the file step, with no OS error behind it.
+			return Binding{}, "", &bindingError{reason: database.AvailabilityReasonStorageMissing, step: storageidentity.StepOpenFile}
+		}
+		return binding, "", nil
+	default:
+		// ValidateHelperResponse already requires a kind on a source_any
+		// success; this only keeps a malformed answer from binding anything.
+		return Binding{}, "", &bindingError{reason: database.AvailabilityReasonObservationFailed, step: stepHelper}
+	}
 }
 
 // Support stages used for binding diagnostics. The API's failure records
@@ -775,6 +885,11 @@ func bindRepository(ctx context.Context, repo models.Repository, creation bool) 
 // BindJobSource records the source facts when a job is created
 // (StageJobCreateSource) or when an imported job is first bound here
 // (StageJobBindSource); stage only labels support diagnostics.
+//
+// The probe follows job.SourceKind (see bindSourcePath): a caller creating a
+// new job sets it to SourceKindUnknown so the path decides between a folder
+// and a file, while a recovered job keeps the kind it was saved with. The
+// returned job carries the kind to store, "" for a folder or SourceKindFile.
 func BindJobSource(ctx context.Context, job models.BackupJob, stage string) (models.BackupJob, error) {
 	configured, err := storageidentity.NormalizeConfiguredPath(job.Source)
 	if err != nil {
@@ -783,11 +898,12 @@ func BindJobSource(ctx context.Context, job models.BackupJob, stage string) (mod
 	// Keep the entered spelling after lexical validation. Once saved, this path
 	// is also native source scope (notably Kopia SourceInfo); recorded facts and
 	// later availability checks never rewrite it.
-	binding, err := bindFilesystem(ctx, configured, storageidentity.ProbeSource, stage)
+	binding, kind, err := bindSourcePath(ctx, configured, job.SourceKind, stage)
 	if err != nil {
 		return models.BackupJob{}, err
 	}
 	job.Source = configured
+	job.SourceKind = kind
 	job.SourceStorageVersion, job.SourceStorageKey, job.SourceStorageDescriptorJSON =
 		binding.Version, binding.Key, binding.DescriptorJSON
 	return job, nil
@@ -803,6 +919,13 @@ func BindJobSource(ctx context.Context, job models.BackupJob, stage string) (mod
 // Choosing the immutable source itself clears the alias. The source is never
 // replaced: it is native retention and File History scope, see
 // database.UpdateJobSourceAlias.
+//
+// The alias must be the same kind of source as the job: a folder job's alias
+// goes through the folder probe, and a file job's alias must be a file
+// (bindSourcePath). The returned job carries the kind the probe found, so
+// database.UpdateJobSourceAlias compares it with the stored kind. An unbound
+// job of unknown kind takes first binding instead: the handler refuses it
+// before calling this, and the guard below is the backstop.
 func BindJobSourceAlias(ctx context.Context, job models.BackupJob, location string) (models.BackupJob, error) {
 	configured, err := storageidentity.NormalizeConfiguredPath(location)
 	if err != nil {
@@ -811,10 +934,14 @@ func BindJobSourceAlias(ctx context.Context, job models.BackupJob, location stri
 	if err := storageidentity.ValidateBindingPath(job.Source); err != nil {
 		return models.BackupJob{}, err
 	}
-	binding, err := bindFilesystem(ctx, configured, storageidentity.ProbeSource, StageJobSourceUpdate)
+	if job.SourceKind == models.SourceKindUnknown {
+		return models.BackupJob{}, database.ErrJobSourceUnbound
+	}
+	binding, kind, err := bindSourcePath(ctx, configured, job.SourceKind, StageJobSourceUpdate)
 	if err != nil {
 		return models.BackupJob{}, err
 	}
+	job.SourceKind = kind
 	job.ResolvedSourcePath = configured
 	if configured == job.Source {
 		job.ResolvedSourcePath = ""

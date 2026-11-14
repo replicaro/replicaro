@@ -457,6 +457,7 @@ func markRequired(db *sql.DB, repositoryID, source string, notify bool) {
 	event := notifications.Event{
 		Event: "reconnect", Status: status, Locale: effective, MessageKey: MessageKey, MessageValues: values,
 	}
+	event.DesktopTitlePrefix, event.URLTitlePrefix = settings.TitlePrefixes()
 	dispatchNotification(settings.NotificationURLs, native, webhook, event, func(err error) {
 		if err != nil {
 			_ = database.LogError(db, "Notification failed: "+err.Error())
@@ -470,7 +471,8 @@ func markRequired(db *sql.DB, repositoryID, source string, notify bool) {
 // general out-of-space note, since the note itself doesn't say which vault is
 // full. The notification is in the UI language and uses OutOfSpaceMessageKey,
 // which names the vault itself. The webhook carries the same title and message
-// as the desktop notification, under event "kopia_policy" and status "failed".
+// as the desktop notification, each title with its own channel's prefix if
+// set, under event "kopia_policy" and status "failed".
 // It doesn't set or clear the reconnect state.
 func reportOutOfSpace(db *sql.DB, repositoryID string) {
 	name := vaultName(db, repositoryID)
@@ -493,6 +495,7 @@ func reportOutOfSpace(db *sql.DB, repositoryID string) {
 		Event: "kopia_policy", Status: status, Locale: locale.Effective(settings.Language),
 		MessageKey: OutOfSpaceMessageKey, MessageValues: map[string]string{"vaultName": name},
 	}
+	event.DesktopTitlePrefix, event.URLTitlePrefix = settings.TitlePrefixes()
 	dispatchNotification(settings.NotificationURLs, native, webhook, event, func(err error) {
 		if err != nil {
 			_ = database.LogError(db, "Notification failed: "+err.Error())

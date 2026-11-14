@@ -86,6 +86,49 @@ func JobSourcesForRepository(db *sql.DB, repositoryID string) (map[string]string
 	return result, rows.Err()
 }
 
+// MetadataKnownFileJobSnapshot reports whether a snapshot carries the exact
+// marker of a single-file job known on this computer for this vault profile.
+// It applies the same rules as MetadataGroupingRoot (Restic only, one root, a
+// valid marker for this profile, a job targeting this vault) and additionally
+// requires that job to be a file job. fileJobs comes from
+// FileJobIDsForRepository.
+//
+// Its only use is deciding whether a header-only Restic listing may be
+// checked against the file's parent folder (see confirmEmptyResticFileRoot in
+// the metadata package). Indexing itself never depends on the job's kind: it
+// follows what each snapshot's native listing shows.
+func MetadataKnownFileJobSnapshot(engine, profileUUID string, snapshot models.Snapshot, fileJobs map[string]bool) bool {
+	if engine != "restic" || len(metadataSnapshotRoots(snapshot)) != 1 {
+		return false
+	}
+	marker := snapshot.OwnershipMarker
+	if marker.Status != models.SnapshotOwnershipValid || marker.ProfileID == "" || marker.ProfileID != profileUUID {
+		return false
+	}
+	return fileJobs[marker.JobID]
+}
+
+// FileJobIDsForRepository returns the IDs of the single-file jobs targeting
+// the vault: the subset of JobSourcesForRepository whose stored source kind is
+// file.
+func FileJobIDsForRepository(db *sql.DB, repositoryID string) (map[string]bool, error) {
+	rows, err := db.Query(`SELECT j.id FROM backup_job_targets t
+		JOIN backup_jobs j ON j.id=t.job_id WHERE t.repository_id=? AND j.source_kind=?`, repositoryID, models.SourceKindFile)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := map[string]bool{}
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		result[id] = true
+	}
+	return result, rows.Err()
+}
+
 // RefreshStaleMetadataGrouping is called after a committed local job change
 // that can move a vault's Restic snapshots between grouping roots: a job
 // becoming known or unknown to a vault (creation with an existing job UUID,

@@ -14,6 +14,7 @@ import type {
     Settings,
     IntegrationCatalog,
     DirectoryListing,
+	SourcePathKind,
     FileSearchResult,
 	FileBrowseEntry,
     FileVersion,
@@ -92,10 +93,21 @@ function codedErrorMessage(code: string | undefined, body: unknown): string | un
 		case RESTORE_SELECTION_NAME_INVALID: return t("ui.restore.selectionNameInvalid");
 		case "restore_kopia_folder_selection": return t("ui.restore.kopiaFolderSelection");
 		case "restore_kopia_destination_missing": return t("ui.restore.kopiaDestinationMissing");
+		// Browse of a snapshot root that is a single file. The Restore page
+		// disables Browse for these, but a snapshot list read before the root
+		// was indexed doesn't know yet, so the server's refusal can still reach
+		// a toast.
+		case "snapshot_root_is_file": return t("ui.restore.fileSourceBrowseUnavailable");
 		// The vault's backup data is being rebuilt; the request can be retried shortly.
 		case "metadata_not_ready": return t("ui.restore.metadataNotReady");
 		// A job edit made from an outdated copy of the job; nothing was saved.
 		case "job_definition_changed": return t("ui.protect.jobDefinitionChanged");
+		// Creating, editing or bulk editing a single-file job with exclusion or
+		// skip-folder options. The page sends them empty for a source it knows
+		// is a file, so this comes back only when it didn't know yet (a typed
+		// path whose kind lookup hadn't answered, or a job list read before an
+		// adopted job's kind settled); nothing was saved.
+		case "file_source_options_unavailable": return t("ui.protect.singleFileFiltersUnavailable");
 		// Creating, copying, editing or bulk editing a job with a retired flag
 		// in Advanced options; nothing was saved.
 		case "retired_backup_option": return retiredBackupOptionMessage(body);
@@ -585,11 +597,19 @@ export const getIntegrations = () =>
 export const getEngines = () =>
     request<{ engines: EngineDescriptor[]; replicaroVersion: string }>("/api/engines");
 
-export const browseDirectories = (path = "", signal?: AbortSignal) =>
-    request<DirectoryListing>(
-        `/api/filesystem/directories${path ? `?path=${encodeURIComponent(path)}` : ""}`,
-        { signal }
-    );
+// withFiles is the job-source picker's file mode: the listing also carries the
+// folder's files, and a path that is a file opens the folder that holds it.
+// Every other picker leaves it off and sends the plain folders-only request.
+export const browseDirectories = (path = "", signal?: AbortSignal, withFiles = false) => {
+	const query = [path ? `path=${encodeURIComponent(path)}` : "", withFiles ? "files=1" : ""].filter(Boolean).join("&");
+	return request<DirectoryListing>(`/api/filesystem/directories${query ? `?${query}` : ""}`, { signal });
+};
+
+// Whether a typed job source is a file, a folder or neither. The new-job form
+// uses the answer only to grey out the settings a single file can't use;
+// whether the path can be a job source is decided when the job is saved.
+export const lookupSourcePathKind = (path: string, signal?: AbortSignal) =>
+	request<{ kind: SourcePathKind }>(`/api/filesystem/directories?path=${encodeURIComponent(path)}&kind=1`, { signal });
 
 // Vault removal runs in the background: the answer is the queued operation.
 // discardRecoveryProfile is the explicit Remove anyway after a removal failed
@@ -933,10 +953,18 @@ export interface NotificationUrlTestResult {
 	error?: string;
 }
 
-// The URLs go as typed, unsaved; the server cleans and checks them the same
-// way it does on save and answers 400 when the list itself is invalid.
-export const testNotificationUrls = (urls: string[]) =>
-	post<{ results: NotificationUrlTestResult[] }>("/api/settings/notification-urls/test", { urls });
+// The URLs and the URL title prefix go as typed, unsaved; the server cleans
+// and checks them the same way it does on save and answers 400 when the list
+// or the prefix itself is invalid.
+export const testNotificationUrls = (urls: string[], titlePrefix: string) =>
+	post<{ results: NotificationUrlTestResult[] }>("/api/settings/notification-urls/test", { urls, titlePrefix });
+
+// The desktop title prefix goes as typed, unsaved, and is cleaned and checked
+// as on save. The server answers 400 with its English error text when desktop
+// notifications aren't available, the prefix is too long, or the desktop
+// refused the notification.
+export const testDesktopNotification = (titlePrefix: string) =>
+	post<void>("/api/settings/desktop-notification/test", { titlePrefix });
 
 export const getAppUpdateStatus = () => request<AppUpdateStatus>("/api/app-update/status");
 

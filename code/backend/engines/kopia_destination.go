@@ -89,7 +89,15 @@ type KopiaRestoreFileNames struct {
 func NewKopiaRestoreFileNames(selections []string) *KopiaRestoreFileNames {
 	names := &KopiaRestoreFileNames{operatingSystem: runtime.GOOS}
 	for _, selection := range selections {
-		names.reserved = append(names.reserved, kopiaDestinationBasename(path.Base(selection), runtime.GOOS))
+		// An empty selection is a single-file source's version. Its name is
+		// only known from the fresh root entry when that item restores, so it
+		// reserves nothing here (path.Base would make it "."); it still counts
+		// as one of the request's items for the folder check.
+		reserved := ""
+		if selection != "" {
+			reserved = kopiaDestinationBasename(path.Base(selection), runtime.GOOS)
+		}
+		names.reserved = append(names.reserved, reserved)
 	}
 	return names
 }

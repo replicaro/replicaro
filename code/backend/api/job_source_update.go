@@ -34,6 +34,12 @@ import (
 // backing that up under the job would let native retention expire the real
 // snapshots. Nothing in it calls an engine; the snapshot side comes from
 // Replicaro's metadata cache.
+//
+// A job whose source is a single file is updated the same way with a file:
+// the binding probe requires a file (storageavailability.BindJobSourceAlias)
+// and checkJobSourceFile replaces the folder check. Do not route a folder job
+// through the file check or the reverse: their warnings answer different
+// questions, and the dialog picks its texts by the job's kind.
 
 // jobSourceFolderReadTimeout bounds the in-process read of the chosen folder's
 // top-level names. It matches the directory picker's bound. The OS call itself
@@ -46,8 +52,8 @@ var jobSourceFolderReadTimeout = 60 * time.Second
 type jobSourceUpdateRequest struct {
 	ID   string `json:"id"`
 	Path string `json:"path"`
-	// Confirmed skips the folder check after the user chose "Continue with the
-	// selected folder" in the warning.
+	// Confirmed skips the folder (or file) check after the user chose
+	// "Continue with the selected folder" (or file) in the warning.
 	Confirmed bool `json:"confirmed"`
 }
 
@@ -244,6 +250,71 @@ func checkJobSourceFolder(ctx context.Context, db *sql.DB, job models.BackupJob,
 	return nil, nil
 }
 
+// readJobSourceFileSize reads the chosen file's size in-process, under the
+// same bound and with the same cancellation as readFolderTopLevelNames. It
+// uses Lstat: the binding probe has just found a regular file there, and the
+// size is metadata only, so nothing is opened or read. A variable only so
+// tests can stand in for a file that never answers.
+var readJobSourceFileSize = func(ctx context.Context, path string) (int64, error) {
+	type result struct {
+		size int64
+		err  error
+	}
+	done := make(chan result, 1)
+	go func() {
+		info, err := os.Lstat(path)
+		if err != nil {
+			done <- result{err: err}
+			return
+		}
+		done <- result{size: info.Size()}
+	}()
+	timer := time.NewTimer(jobSourceFolderReadTimeout)
+	defer timer.Stop()
+	select {
+	case read := <-done:
+		return read.size, read.err
+	case <-timer.C:
+		return 0, context.DeadlineExceeded
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+}
+
+// checkJobSourceFile is the file job's counterpart of checkJobSourceFolder,
+// answered in the same shape so the dialog handles both alike (it picks the
+// file texts from the job's sourceKind). It warns, first match only, when the
+// chosen file is empty (zero bytes) or its name differs from the current
+// file's name, folded the same way as folder names.
+//
+// There is no "items" check, because a file has no top-level names to compare
+// with the latest backup; that is the same as a folder job without a ready
+// backup. The drive-or-share-root exemption of the name check doesn't apply
+// either: a file is never a drive or share root.
+func checkJobSourceFile(ctx context.Context, job models.BackupJob, chosen string) (*jobSourceFolderCheck, error) {
+	fold := folderNameFold(runtime.GOOS)
+	current := storageavailability.SourceLocation(job)
+	// folderDisplayName is the last path component, which for a file is its
+	// name.
+	check := &jobSourceFolderCheck{
+		Chosen: chosen, Current: current,
+		ChosenName: folderDisplayName(chosen), SourceName: folderDisplayName(current),
+	}
+	size, err := readJobSourceFileSize(ctx, chosen)
+	if err != nil {
+		return nil, err
+	}
+	if size == 0 {
+		check.Reason = "empty"
+		return check, nil
+	}
+	if fold(check.ChosenName) != fold(check.SourceName) {
+		check.Reason = "name"
+		return check, nil
+	}
+	return nil, nil
+}
+
 func handleJobSourceUpdate(db *sql.DB) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -294,7 +365,13 @@ func handleJobSourceUpdate(db *sql.DB) http.HandlerFunc {
 			return
 		}
 		if !req.Confirmed {
-			check, checkErr := checkJobSourceFolder(r.Context(), db, job, storageavailability.SourceLocation(bound))
+			var check *jobSourceFolderCheck
+			var checkErr error
+			if job.IsFileSource() {
+				check, checkErr = checkJobSourceFile(r.Context(), job, storageavailability.SourceLocation(bound))
+			} else {
+				check, checkErr = checkJobSourceFolder(r.Context(), db, job, storageavailability.SourceLocation(bound))
+			}
 			if checkErr != nil {
 				if errors.Is(checkErr, context.Canceled) {
 					return

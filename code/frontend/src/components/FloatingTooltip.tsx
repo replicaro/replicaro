@@ -13,13 +13,17 @@ import { createPortal } from "react-dom";
 // overflow: hidden (it keeps the rounded corners and long rows tidy), so the
 // popup has to leave the box instead.
 //
-// Don't use it inside a Modal: the popup's z-index sits below the modal
-// overlay, so it would open behind the dialog.
+// Inside a Modal, pass inModal: the popup's usual z-index sits below the
+// modal overlay, so it would open behind the dialog. The usual z-index stays
+// below the overlay so that a popup of the page underneath never shows on top
+// of a dialog.
 export function FloatingTooltip({
 	content,
 	label,
 	className,
 	title,
+	role,
+	inModal = false,
 	children,
 }: {
 	content: string;
@@ -27,6 +31,10 @@ export function FloatingTooltip({
 	label: string;
 	className: string;
 	title?: string;
+	// A trigger that wraps a block of controls (rather than a label) is a
+	// "group", so screen readers announce its name and description with them.
+	role?: string;
+	inModal?: boolean;
 	children: ReactNode;
 }) {
 	const id = useId();
@@ -91,6 +99,7 @@ export function FloatingTooltip({
 		<span
 			ref={triggerRef}
 			className={`${className} tooltip-trigger`}
+			role={role}
 			tabIndex={0}
 			aria-label={label}
 			aria-describedby={id}
@@ -109,7 +118,7 @@ export function FloatingTooltip({
 				<span
 					ref={tooltipRef}
 					id={id}
-					className={`tooltip-popup floating-tooltip${open ? " open" : ""}`}
+					className={`tooltip-popup floating-tooltip${inModal ? " in-modal" : ""}${open ? " open" : ""}`}
 					role="tooltip"
 					style={open && position
 						? { left: position.left, top: position.top, visibility: "visible" }

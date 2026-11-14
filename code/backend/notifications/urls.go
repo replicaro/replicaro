@@ -208,11 +208,12 @@ type TestResult struct {
 	Error string `json:"error,omitempty"`
 }
 
-// SendTest sends the test notification to each URL of the unsaved list. It
-// ignores the success/failure switches and creates no operation or log entry;
-// the caller gets every URL's outcome. The returned error is a validation
-// error meant for the user.
-func SendTest(ctx context.Context, lines []string, locale string) ([]TestResult, error) {
+// SendTest sends the test notification to each URL of the unsaved list, with
+// the URL title prefix as typed in the settings box. It ignores the
+// success/failure switches and creates no operation or log entry; the caller
+// gets every URL's outcome. The prefix is cleaned and checked exactly as a
+// save does. The returned error is a validation error meant for the user.
+func SendTest(ctx context.Context, lines []string, titlePrefix, locale string) ([]TestResult, error) {
 	if len(CleanURLs(lines)) == 0 {
 		return nil, errors.New("Add at least one notification URL")
 	}
@@ -220,8 +221,13 @@ func SendTest(ctx context.Context, lines []string, locale string) ([]TestResult,
 	if err != nil {
 		return nil, err
 	}
-	event := Event{Event: testEvent, Status: "success", Success: true, Locale: locale, MessageKey: "notifications.test.message"}
-	prepare(&event)
+	prefix, err := CleanTitlePrefix(titlePrefix)
+	if err != nil {
+		return nil, err
+	}
+	event := testNotification(locale)
+	event.URLTitlePrefix = prefix
+	event = forURLs(event)
 	results := make([]TestResult, 0, len(urls))
 	for i, outcome := range deliver(ctx, urls, event) {
 		result := TestResult{Index: i + 1, Type: outcome.kind, OK: outcome.err == nil}
@@ -231,6 +237,14 @@ func SendTest(ctx context.Context, lines []string, locale string) ([]TestResult,
 		results = append(results, result)
 	}
 	return results, nil
+}
+
+// testNotification is the prepared test notification of both test buttons,
+// without any prefix.
+func testNotification(locale string) Event {
+	event := Event{Event: testEvent, Status: "success", Success: true, Locale: locale, MessageKey: "notifications.test.message"}
+	prepare(&event)
+	return event
 }
 
 // request is one HTTP call of a sender.

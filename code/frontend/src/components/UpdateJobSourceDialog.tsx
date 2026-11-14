@@ -16,6 +16,12 @@ import { Modal } from "./ui";
 // lets native retention expire the real snapshots; but the user may really
 // have reorganized their data, and only they can tell. Cancel is the default
 // action of the warning.
+//
+// A job whose source is a single file goes through the same dialog and flow
+// with a file: the picker only returns files, the backend checks the file
+// (empty means zero bytes, and there is no "items" check), and the warning
+// uses the file texts. The folder texts and picker stay exactly as they are
+// for every other job, including an imported job whose kind isn't known yet.
 export function UpdateJobSourceDialog({
 	job,
 	onClose,
@@ -35,6 +41,8 @@ export function UpdateJobSourceDialog({
 	const [path, setPath] = useState("");
 	const [busy, setBusy] = useState(false);
 	const [check, setCheck] = useState<JobSourceFolderCheck | null>(null);
+	// The backend sends a file job only "empty" or "name", never "items".
+	const fileSource = job.sourceKind === "file";
 	// A response that arrives after the dialog closed must not reopen it or
 	// apply a result the user walked away from.
 	const open = useRef(true);
@@ -72,22 +80,27 @@ export function UpdateJobSourceDialog({
 	};
 
 	if (check) {
-		const reason = check.reason === "empty"
-			? t("ui.protect.sourceCheck.empty")
-			: check.reason === "name"
-				? renderMessage("ui.protect.sourceCheck.nameDiffers", { chosenName: <strong key="chosen">{check.chosenName}</strong>, sourceName: <strong key="source">{check.sourceName}</strong> })
-				: t("ui.protect.sourceCheck.items", { matched: check.matched, total: check.total });
+		const names = { chosenName: <strong key="chosen">{check.chosenName}</strong>, sourceName: <strong key="source">{check.sourceName}</strong> };
+		const reason = fileSource
+			? check.reason === "empty"
+				? t("ui.protect.sourceCheck.fileEmpty")
+				: renderMessage("ui.protect.sourceCheck.fileNameDiffers", names)
+			: check.reason === "empty"
+				? t("ui.protect.sourceCheck.empty")
+				: check.reason === "name"
+					? renderMessage("ui.protect.sourceCheck.nameDiffers", names)
+					: t("ui.protect.sourceCheck.items", { matched: check.matched, total: check.total });
 		return (
-			<Modal title={t("ui.protect.sourceCheck.title")} onClose={close}>
+			<Modal title={fileSource ? t("ui.protect.sourceCheck.fileTitle") : t("ui.protect.sourceCheck.title")} onClose={close}>
 				<p className="modal-intro">{renderMessage("ui.protect.sourceCheck.selected", {
 					chosen: <strong key="chosen" className="mono">{check.chosen}</strong>,
 					current: <strong key="current" className="mono">{check.current}</strong>,
 				})}</p>
 				<p className="modal-intro">{reason}</p>
-				<p className="muted">{t("ui.protect.sourceCheck.guidance")}</p>
+				<p className="muted">{fileSource ? t("ui.protect.sourceCheck.fileGuidance") : t("ui.protect.sourceCheck.guidance")}</p>
 				<div className="modal-footer">
 					<button ref={cancelWarning} className="btn" disabled={busy} onClick={close}>{t("ui.pages.protect.cancel")}</button>
-					<button className="btn primary" disabled={busy} onClick={() => void submit(true)}>{busy && <span className="spinner" />}{t("ui.protect.sourceCheck.continue")}</button>
+					<button className="btn primary" disabled={busy} onClick={() => void submit(true)}>{busy && <span className="spinner" />}{fileSource ? t("ui.protect.sourceCheck.fileContinue") : t("ui.protect.sourceCheck.continue")}</button>
 				</div>
 			</Modal>
 		);
@@ -96,7 +109,7 @@ export function UpdateJobSourceDialog({
 	return (
 		<Modal title={t("ui.protect.updateJobSource")} onClose={close}>
 			<fieldset className="modal-workflow-fields" disabled={busy}>
-				<label className="field"><span>{t("ui.pages.protect.source.data")}</span><DirectoryField ariaLabel={t("ui.pages.protect.source.data")} value={path} onChange={setPath} /></label>
+				<label className="field"><span>{t("ui.pages.protect.source.data")}</span><DirectoryField ariaLabel={t("ui.pages.protect.source.data")} value={path} onChange={setPath} pick={fileSource ? "file" : "folder"} /></label>
 			</fieldset>
 			<div className="modal-footer">
 				<button className="btn" disabled={busy} onClick={close}>{t("ui.pages.protect.cancel")}</button>

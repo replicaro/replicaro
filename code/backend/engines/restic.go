@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -281,11 +282,74 @@ func decodeResticSnapshotRowsReader(reader io.Reader) ([]resticSnapshotRow, erro
 }
 
 func (e *resticEngine) listSnapshots(ctx context.Context, repo models.Repository, ids ...string) ([]models.Snapshot, string, error) {
-	result, _, output, err := e.listSnapshotRows(ctx, repo, ids...)
+	result, _, output, _, err := e.listSnapshotRows(ctx, repo, ids...)
 	return result, output, err
 }
 
-func (e *resticEngine) listSnapshotRows(ctx context.Context, repo models.Repository, ids ...string) ([]models.Snapshot, []resticSnapshotRow, string, error) {
+// Pinned Restic (0.19.1) still exits 0 from `restic snapshots` when it can't
+// load some snapshots, lists only what it could load, and may print one of
+// these lines on stderr:
+//
+//	could not load snapshots: <error>
+//	Ignoring "<full snapshot id>": failed to load snapshot <short id>: <error>
+//
+// With a local repository, an unreadable snapshots folder gives the first line
+// and an unreadable snapshot file that Restic has no cached copy of gives the
+// second. With rclone's `local` backend (pinned rclone 1.75.1), an unreadable
+// snapshot file gives the second line after Restic's own load retries, but an
+// unreadable snapshots folder gives `[]` with only rclone's own error on
+// stderr, which these lines don't cover. Other rclone backends may report
+// these failures differently.
+//
+// These are Restic's own texts, matched exactly. The real-engine test
+// TestRealResticSnapshotListingPremises pins them; if a Restic update changes
+// the wording, that test must fail before this match is changed.
+const (
+	resticCouldNotLoadSnapshots = "could not load snapshots"
+	resticIgnoringSnapshot      = `Ignoring "`
+	resticFailedToLoadSnapshot  = `": failed to load snapshot`
+)
+
+// resticIgnoredSnapshotLine reads the snapshot ID from an `Ignoring` line.
+// Restic quotes the full ID in the same lowercase 64-character form that
+// `snapshots --json` lists, so it can be compared with listed IDs as it is.
+var resticIgnoredSnapshotLine = regexp.MustCompile(`^Ignoring "([0-9a-f]{64})": failed to load snapshot `)
+
+// ResticIgnoredSnapshotID returns the full snapshot ID that one of Restic's
+// `Ignoring "<id>": failed to load snapshot …` lines names. It returns false
+// for every other line, including an `Ignoring` line in a shape it doesn't
+// know, so callers must treat false as "this warning names no snapshot".
+func ResticIgnoredSnapshotID(line string) (string, bool) {
+	match := resticIgnoredSnapshotLine.FindStringSubmatch(line)
+	if match == nil {
+		return "", false
+	}
+	return match[1], true
+}
+
+// resticSnapshotLoadWarnings returns, unchanged, the stderr lines of one
+// `restic snapshots` run in which Restic said it skipped snapshots it could
+// not load. Other stderr lines (lock and retry messages) are left out.
+func resticSnapshotLoadWarnings(stderr io.Reader) (string, error) {
+	var warnings []string
+	reader := bufio.NewReader(stderr)
+	for {
+		line, err := reader.ReadString('\n')
+		line = strings.TrimRight(line, "\r\n")
+		if strings.Contains(line, resticCouldNotLoadSnapshots) ||
+			(strings.Contains(line, resticIgnoringSnapshot) && strings.Contains(line, resticFailedToLoadSnapshot)) {
+			warnings = append(warnings, line)
+		}
+		if err == io.EOF {
+			return strings.Join(warnings, "\n"), nil
+		}
+		if err != nil {
+			return "", err
+		}
+	}
+}
+
+func (e *resticEngine) listSnapshotRows(ctx context.Context, repo models.Repository, ids ...string) ([]models.Snapshot, []resticSnapshotRow, string, string, error) {
 	args := []string{"snapshots", "--json"}
 	args = append(args, ids...)
 	capture, out, err := e.runRepoCommandCaptured(ctx, repo, nil, args, command.NoTotalDeadline)
@@ -293,40 +357,51 @@ func (e *resticEngine) listSnapshotRows(ctx context.Context, repo models.Reposit
 		defer capture.Close()
 	}
 	if err != nil {
-		return nil, nil, out, err
+		return nil, nil, out, "", err
 	}
 	stdout, openErr := capture.OpenStdout()
 	if openErr != nil {
 		failure := &command.OutputProcessingFailure{Err: fmt.Errorf("parse restic snapshots: %w", openErr)}
-		return nil, nil, out, resticCommandFailure(failure, true)
+		return nil, nil, out, "", resticCommandFailure(failure, true)
 	}
 	rows, err := decodeResticSnapshotRowsReader(stdout)
 	_ = stdout.Close()
 	if err != nil {
 		failure := &command.OutputProcessingFailure{Err: fmt.Errorf("parse restic snapshots: %w", err)}
-		return nil, nil, out, resticCommandFailure(failure, true)
+		return nil, nil, out, "", resticCommandFailure(failure, true)
 	}
 	outputFailure := func(err error) error {
 		return resticCommandFailure(&command.OutputProcessingFailure{Err: err}, true)
+	}
+	// Read the complete captured stderr rather than the bounded diagnostic
+	// excerpt in out, which also mixes in stdout (snapshot paths and tags).
+	stderr, openErr := capture.OpenStderr()
+	if openErr != nil {
+		return nil, nil, out, "", outputFailure(fmt.Errorf("read restic snapshots warnings: %w", openErr))
+	}
+	loadWarnings, warningsErr := resticSnapshotLoadWarnings(stderr)
+	_ = stderr.Close()
+	if warningsErr != nil {
+		return nil, nil, out, "", outputFailure(fmt.Errorf("read restic snapshots warnings: %w", warningsErr))
 	}
 	result := make([]models.Snapshot, 0, len(rows))
 	seen := map[string]bool{}
 	for _, row := range rows {
 		if strings.TrimSpace(row.ID) == "" || strings.TrimSpace(row.Time) == "" || len(row.Paths) == 0 {
-			return nil, nil, out, outputFailure(fmt.Errorf("parse restic snapshots: snapshot is missing id, time, or source"))
+			return nil, nil, out, "", outputFailure(fmt.Errorf("parse restic snapshots: snapshot is missing id, time, or source"))
 		}
 		if !resticSnapshotIDPattern.MatchString(row.ID) {
-			return nil, nil, out, outputFailure(fmt.Errorf("parse restic snapshots: snapshot id %q is not a full canonical ID", row.ID))
+			return nil, nil, out, "", outputFailure(fmt.Errorf("parse restic snapshots: snapshot id %q is not a full canonical ID", row.ID))
 		}
 		parsedTime, parseErr := time.Parse(time.RFC3339Nano, row.Time)
 		if parseErr != nil {
-			return nil, nil, out, outputFailure(fmt.Errorf("parse restic snapshots: snapshot %q has malformed time", row.ID))
+			return nil, nil, out, "", outputFailure(fmt.Errorf("parse restic snapshots: snapshot %q has malformed time", row.ID))
 		}
 		roots := make([]models.SnapshotSourceRoot, 0, len(row.Paths))
 		rootSeen := map[string]bool{}
 		for _, path := range row.Paths {
 			if path == "" {
-				return nil, nil, out, outputFailure(fmt.Errorf("parse restic snapshots: snapshot %q has an empty source path", row.ID))
+				return nil, nil, out, "", outputFailure(fmt.Errorf("parse restic snapshots: snapshot %q has an empty source path", row.ID))
 			}
 			if !rootSeen[path] {
 				rootSeen[path] = true
@@ -335,12 +410,12 @@ func (e *resticEngine) listSnapshotRows(ctx context.Context, repo models.Reposit
 		}
 		source := row.Paths[0]
 		if seen[row.ID] {
-			return nil, nil, out, outputFailure(fmt.Errorf("parse restic snapshots: duplicate snapshot id %q", row.ID))
+			return nil, nil, out, "", outputFailure(fmt.Errorf("parse restic snapshots: duplicate snapshot id %q", row.ID))
 		}
 		seen[row.ID] = true
 		result = append(result, models.SnapshotWithTags(models.Snapshot{ID: row.ID, Timestamp: parsedTime.UTC().Format(time.RFC3339Nano), Source: source, SourceRoots: roots, NativeSourceHost: row.Hostname, TotalFileCount: optionalNativeFileCount(row.Size.TotalFilesProcessed), Size: formatBytes(row.Size.TotalBytesProcessed)}, row.Tags))
 	}
-	return result, rows, out, nil
+	return result, rows, out, loadWarnings, nil
 }
 
 func (e *resticEngine) ListPath(ctx context.Context, repo models.Repository, id, path string) ([]models.SnapshotEntry, string, error) {
@@ -422,9 +497,26 @@ func (e *resticEngine) listPathFromSource(ctx context.Context, repo models.Repos
 }
 
 type resticSnapshotIndexSession struct {
-	engine    *resticEngine
-	repo      models.Repository
-	snapshots []SnapshotIndexItem
+	engine       *resticEngine
+	repo         models.Repository
+	snapshots    []SnapshotIndexItem
+	loadWarnings string
+}
+
+// SnapshotLoadWarnings returns the "could not load snapshots" and
+// `Ignoring "…": failed to load snapshot` lines Restic printed while producing
+// this session's listing, or "" when there were none.
+func (s *resticSnapshotIndexSession) SnapshotLoadWarnings() string { return s.loadWarnings }
+
+// ResticSnapshotLoadWarnings returns the snapshot load warnings of a Restic
+// header listing session (see resticSnapshotLoadWarnings). It returns "" for
+// any other session, including Kopia's.
+func ResticSnapshotLoadWarnings(session SnapshotIndexSession) string {
+	reporter, ok := session.(interface{ SnapshotLoadWarnings() string })
+	if !ok {
+		return ""
+	}
+	return reporter.SnapshotLoadWarnings()
 }
 
 type resticSnapshotIndexReference struct {
@@ -459,7 +551,7 @@ func (s *resticSnapshotIndexSession) ListPathRecursive(ctx context.Context, snap
 }
 
 func (e *resticEngine) BeginSnapshotIndex(ctx context.Context, repo models.Repository) (SnapshotIndexSession, string, error) {
-	snapshots, rows, output, err := e.listSnapshotRows(ctx, repo)
+	snapshots, rows, output, loadWarnings, err := e.listSnapshotRows(ctx, repo)
 	if err != nil {
 		return nil, output, err
 	}
@@ -497,7 +589,7 @@ func (e *resticEngine) BeginSnapshotIndex(ctx context.Context, repo models.Repos
 			NativeReference: resticSnapshotIndexReference{Sources: sources, Tree: tree},
 		})
 	}
-	return &resticSnapshotIndexSession{engine: e, repo: repo, snapshots: items}, output, nil
+	return &resticSnapshotIndexSession{engine: e, repo: repo, snapshots: items, loadWarnings: loadWarnings}, output, nil
 }
 func (e *resticEngine) Restore(ctx context.Context, repo models.Repository, id string, options RestoreOptions) (output string, err error) {
 	if err := ValidateSnapshotIDArgument(id); err != nil {
@@ -518,7 +610,20 @@ func (e *resticEngine) Restore(ctx context.Context, repo models.Repository, id s
 	// resticRestoreCompletedWithErrors before removing it or reading the text
 	// output instead.
 	args := []string{"restore", "--json"}
-	if selection != "" {
+	if options.FileRootVersion {
+		if selection != "" {
+			return "", resticPreparationFailure(fmt.Errorf("restic file version restore cannot also select a path"))
+		}
+		parent, name, rootErr := resticFileRootParentAndName(options.NativeRoot.Path)
+		if rootErr != nil {
+			return "", resticPreparationFailure(rootErr)
+		}
+		restoreID, rootErr = resticRestoreSnapshotID(id, parent)
+		if rootErr != nil {
+			return "", resticPreparationFailure(rootErr)
+		}
+		args = append(args, restoreID, "--target", options.Destination, "--include", resticLiteralIncludePath(name))
+	} else if selection != "" {
 		source := options.NativeRoot.Path
 		if source == "" {
 			return "", resticPreparationFailure(fmt.Errorf("restic selected restore requires an exact native source root"))
@@ -628,6 +733,41 @@ func parseResticSnapshotSourceReader(reader io.Reader, id string) (string, error
 		return "", fmt.Errorf("restic snapshot %q is an unsupported multi-root snapshot (expected exactly one source path)", id)
 	}
 	return "", fmt.Errorf("restic snapshot %q has no recorded source path", id)
+}
+
+// resticFileRootParentAndName splits a single-file root into the archive tree
+// folder that holds it and the file's name. Restic can't restore a file by
+// naming it as the snapshot subfolder (<id>:/home/me/report.txt fails with
+// "not a directory"), so the file is restored from its parent folder with the
+// file as the only include, which writes <target>/<name> just like a selected
+// file inside a folder.
+//
+// The split is on the archive tree path, where "/" is the only separator: a
+// backslash in a POSIX name stays part of the name, a drive root becomes
+// /C/..., and a UNC root keeps its /\\server\share volume component in the
+// parent, which then goes through resticRestoreSnapshotID like any other
+// UNC subfolder. The name gets the same check as a selected name, because an
+// include that matches nothing still exits 0 having restored nothing.
+func resticFileRootParentAndName(root string) (parent, name string, err error) {
+	if root == "" {
+		return "", "", fmt.Errorf("restic file version restore requires an exact native source root")
+	}
+	tree, err := resticSnapshotTreePath(root)
+	if err != nil {
+		return "", "", err
+	}
+	index := strings.LastIndexByte(tree, '/')
+	parent, name = tree[:index], tree[index+1:]
+	if name == "" {
+		return "", "", fmt.Errorf("restic file version restore requires a root that names a file")
+	}
+	if parent == "" {
+		parent = "/"
+	}
+	if err := validateRestoreSelectionName(ResticID, name, runtime.GOOS); err != nil {
+		return "", "", err
+	}
+	return parent, name, nil
 }
 
 func resticRestoreSnapshotID(id, source string) (string, error) {
@@ -1442,6 +1582,30 @@ func parseResticEntriesForSnapshotReader(output io.Reader, expectedSnapshotID, s
 		}
 		matchedNodes = true
 		if path == "" {
+			// The node at the exact requested root. For a directory root it is
+			// only the container: its contents are the entries, and the root
+			// itself stays out of the result (an empty saved folder still counts
+			// as matched above). A single-file job's snapshot has nothing below
+			// its root, so its root node is the only native evidence of the
+			// file's version and is returned as the one entry with an empty
+			// path, carrying the name, permissions and size Restic recorded.
+			// Only a regular file qualifies: a symlink or any other node type
+			// at the root gives no entry, and the archive root "/" of an
+			// untagged snapshot is never a file.
+			if row.Type != "file" || sourceRoot == "" || sourceRoot == "/" {
+				continue
+			}
+			if row.Name == "" || row.Name == "." || row.Name == ".." || strings.Contains(row.Name, "/") {
+				return nil, fmt.Errorf("parse restic listing: file root node has an invalid name")
+			}
+			entry := models.SnapshotEntry{Name: row.Name, Mode: row.Permissions, Size: formatBytes(row.Size)}
+			if previous, exists := seen[path]; exists && previous != entry {
+				return nil, fmt.Errorf("parse restic listing: conflicting duplicate file root node")
+			}
+			if _, exists := seen[path]; !exists {
+				seen[path] = entry
+				result = append(result, entry)
+			}
 			continue
 		}
 		name := pathpkg.Base(path)
@@ -1469,9 +1633,145 @@ func parseResticEntriesForSnapshotReader(output io.Reader, expectedSnapshotID, s
 	// omitted from presentation. Requiring that positive native evidence keeps
 	// an unmatched filter from becoming a falsely ready empty cache.
 	if !matchedNodes {
+		if !nodesSeen {
+			return nil, errResticHeaderOnlyListing
+		}
 		return nil, fmt.Errorf("parse restic listing: exact snapshot filter matched no nodes")
 	}
 	return result, nil
+}
+
+// errResticHeaderOnlyListing is the failure for an exact-root listing that
+// printed the snapshot header and no node at all. It keeps the wording of the
+// general "matched no nodes" failure; only its identity is distinct, so the
+// metadata coordinator can tell this exact case apart (see
+// ResticSnapshotOmitsFileRoot). A listing that printed only ancestors of the
+// root returns the general error instead.
+var errResticHeaderOnlyListing = errors.New("parse restic listing: exact snapshot filter matched no nodes")
+
+// IsResticHeaderOnlyListing reports whether err is a Restic exact-root content
+// listing that succeeded but printed only the snapshot header. It is still a
+// failure: Restic prints the same thing for a filter that matches nothing.
+func IsResticHeaderOnlyListing(err error) bool {
+	return errors.Is(err, errResticHeaderOnlyListing)
+}
+
+// ResticSnapshotOmitsFileRoot asks Restic whether a snapshot whose recorded
+// source is a single file holds the folder around that file but not the file
+// itself. That is what Restic saves when it can't read the file during a
+// backup: it exits 3 ("at least one source file could not be read"), still
+// saves a snapshot, and an exact `ls <id> <file>` of that snapshot prints only
+// the header.
+//
+// A header-only exact listing is otherwise treated as an unmatched filter and
+// stays a failure, because a wrong filter must never be published as an empty
+// snapshot. This check replaces that ambiguity with positive native evidence:
+// one non-recursive `ls --json <id> <parent folder>` must show the parent
+// folder's node and no entry with the file's name. It returns true only in
+// that case. Anything else (a parent that isn't there, the name being there,
+// unexpected output, a root with no parent folder node such as "/x", or an
+// engine that isn't Restic) returns false and the caller keeps the original
+// failure. There is no retry. The caller decides which snapshots may be
+// checked at all; this function only reads native output.
+func ResticSnapshotOmitsFileRoot(ctx context.Context, engine Engine, repo models.Repository, snapshotID, source string) (bool, string, error) {
+	target := engine
+	if public, ok := engine.(*publicEngine); ok {
+		target = public.Engine
+	}
+	restic, ok := target.(*resticEngine)
+	if !ok {
+		return false, "", nil
+	}
+	if err := ValidateSnapshotIDArgument(snapshotID); err != nil {
+		return false, "", err
+	}
+	tree, err := resticSnapshotTreePath(source)
+	if err != nil {
+		return false, "", err
+	}
+	separator := strings.LastIndex(tree, "/")
+	if separator <= 0 || separator == len(tree)-1 {
+		return false, "", nil
+	}
+	parent, name := tree[:separator], tree[separator+1:]
+	capture, out, err := restic.runRepoCommandCaptured(ctx, repo, nil, []string{"ls", "--json", snapshotID, resticPathFilter(parent)}, command.NoTotalDeadline)
+	if capture != nil {
+		defer capture.Close()
+	}
+	if err != nil {
+		return false, out, err
+	}
+	stdout, err := capture.OpenStdout()
+	if err != nil {
+		return false, out, resticCommandFailure(&command.OutputProcessingFailure{Err: err}, true)
+	}
+	omitted, err := parseResticParentListing(stdout, snapshotID, source, parent, name)
+	_ = stdout.Close()
+	if err != nil {
+		return false, out, resticCommandFailure(&command.OutputProcessingFailure{Err: err}, true)
+	}
+	return omitted, out, nil
+}
+
+// parseResticParentListing reads the non-recursive listing of a file root's
+// parent folder. Only the snapshot header (for this snapshot and file root),
+// the parent folder's own node and its direct children may appear; anything
+// else is unexpected and refused. It reports whether the parent node is there
+// and no child carries the file's name.
+func parseResticParentListing(output io.Reader, snapshotID, source, parent, name string) (bool, error) {
+	scanner := bufio.NewScanner(output)
+	scanner.Buffer(make([]byte, 64*1024), 8*1024*1024)
+	headerSeen, parentSeen, nameSeen := false, false, false
+	childPrefix := parent + "/"
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		var row struct {
+			MessageType string   `json:"message_type"`
+			ID          string   `json:"id"`
+			Paths       []string `json:"paths"`
+			Path        string   `json:"path"`
+			Type        string   `json:"type"`
+		}
+		if err := json.Unmarshal([]byte(line), &row); err != nil {
+			return false, fmt.Errorf("parse restic parent listing: malformed JSON: %w", err)
+		}
+		switch row.MessageType {
+		case "snapshot":
+			if headerSeen || row.ID != snapshotID || !slices.Contains(row.Paths, source) {
+				return false, fmt.Errorf("parse restic parent listing: unexpected snapshot header")
+			}
+			headerSeen = true
+		case "node":
+			if !headerSeen {
+				return false, fmt.Errorf("parse restic parent listing: node appeared before snapshot header")
+			}
+			switch {
+			case row.Path == parent:
+				if row.Type != "dir" {
+					return false, fmt.Errorf("parse restic parent listing: parent is not a directory")
+				}
+				parentSeen = true
+			case strings.HasPrefix(row.Path, childPrefix) && !strings.Contains(row.Path[len(childPrefix):], "/"):
+				if row.Path[len(childPrefix):] == name {
+					nameSeen = true
+				}
+			default:
+				return false, fmt.Errorf("parse restic parent listing: node outside the parent folder")
+			}
+		default:
+			return false, fmt.Errorf("parse restic parent listing: unexpected record type %q", row.MessageType)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return false, fmt.Errorf("parse restic parent listing: %w", err)
+	}
+	if !headerSeen {
+		return false, fmt.Errorf("parse restic parent listing: snapshot header is missing")
+	}
+	return parentSeen && !nameSeen, nil
 }
 
 func parseResticDirectoryEntries(output, expectedSnapshotID, source, requestedPath string, recursive bool) ([]models.SnapshotEntry, error) {
@@ -1490,6 +1790,13 @@ func parseResticDirectoryEntriesReader(output io.Reader, expectedSnapshotID, sou
 	}
 	result := make([]models.SnapshotEntry, 0, len(entries))
 	for _, entry := range entries {
+		// The root entry of a file root (see parseResticEntriesForSnapshotReader)
+		// is kept only for the recursive listing of the whole snapshot, which is
+		// what indexing asks for. Browse lists never show the root itself.
+		if entry.Path == "" && !entry.IsDir && requestedPath == "" && recursive {
+			result = append(result, entry)
+			continue
+		}
 		if entry.Path == "" || entry.Name == "" || entry.Name == "." || entry.Path == requestedPath {
 			continue
 		}

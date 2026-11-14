@@ -15,10 +15,19 @@ import { markerFileNameError, type MarkerFileValues } from "./markerFileName";
 // save was tried (showErrors), not as soon as the box is ticked with the
 // field still empty. Saving with an invalid name is refused either way, by
 // the form and by the backend.
-export function MarkerFileFields({ value, usesKopia, showErrors = false, onChange }: {
+//
+// singleFile greys out every box for a job whose source is a single file:
+// marker files only work inside folders, and the backend refuses to save a
+// file job with any of them set. The caller passes the cleared values, and the
+// boxes show exactly those, so the Kopia ones show unticked too instead of
+// locked on. The surrounding block carries the explanation. The two Kopia
+// notes are left out for a single file, because they describe the boxes as
+// always on with a Kopia vault.
+export function MarkerFileFields({ value, usesKopia, showErrors = false, singleFile = false, onChange }: {
 	value: MarkerFileValues;
 	usesKopia: boolean;
 	showErrors?: boolean;
+	singleFile?: boolean;
 	onChange: (next: MarkerFileValues) => void;
 }) {
 	const [nameEdited, setNameEdited] = useState(false);
@@ -32,23 +41,23 @@ export function MarkerFileFields({ value, usesKopia, showErrors = false, onChang
 	// is left out on purpose, so don't "correct" the wording.
 	return <div className="marker-file-fields">
 		<div className="advanced-setting">
-			<label className="check"><input type="checkbox" checked={value.skipNoBackupFolders} onChange={(event) => onChange({ ...value, skipNoBackupFolders: event.target.checked })} />{t("ui.protect.markerFiles.noBackupLabel")}</label>
+			<label className="check"><input type="checkbox" checked={value.skipNoBackupFolders} disabled={singleFile} onChange={(event) => onChange({ ...value, skipNoBackupFolders: event.target.checked })} />{t("ui.protect.markerFiles.noBackupLabel")}</label>
 			<small>{t("ui.protect.markerFiles.noBackupHelp")}</small>
 		</div>
 		<div className="advanced-setting">
-			<label className="check"><input type="checkbox" checked={usesKopia || value.skipCacheDirFolders} disabled={usesKopia} onChange={(event) => onChange({ ...value, skipCacheDirFolders: event.target.checked })} />{t("ui.protect.markerFiles.cacheDirLabel")}</label>
+			<label className="check"><input type="checkbox" checked={(usesKopia && !singleFile) || value.skipCacheDirFolders} disabled={usesKopia || singleFile} onChange={(event) => onChange({ ...value, skipCacheDirFolders: event.target.checked })} />{t("ui.protect.markerFiles.cacheDirLabel")}</label>
 			<small>{t("ui.protect.markerFiles.cacheDirHelp")}</small>
-			{usesKopia && <small>{t("ui.protect.markerFiles.cacheDirLocked")}</small>}
+			{usesKopia && !singleFile && <small>{t("ui.protect.markerFiles.cacheDirLocked")}</small>}
 		</div>
 		<div className="advanced-setting">
-			<label className="check"><input type="checkbox" checked={value.skipCustomMarker} onChange={(event) => onChange({ ...value, skipCustomMarker: event.target.checked })} />{t("ui.protect.markerFiles.customLabel")}</label>
-			<input className="mono" aria-label={t("ui.protect.markerFiles.customLabel")} value={value.skipMarkerFileName} placeholder={t("ui.protect.markerFiles.customPlaceholder")} disabled={!value.skipCustomMarker} aria-invalid={customError ? true : undefined} aria-describedby={customError ? `${errorID} ${helpID}` : helpID} onChange={(event) => { setNameEdited(true); onChange({ ...value, skipMarkerFileName: event.target.value }); }} />
+			<label className="check"><input type="checkbox" checked={value.skipCustomMarker} disabled={singleFile} onChange={(event) => onChange({ ...value, skipCustomMarker: event.target.checked })} />{t("ui.protect.markerFiles.customLabel")}</label>
+			<input className="mono" aria-label={t("ui.protect.markerFiles.customLabel")} value={value.skipMarkerFileName} placeholder={t("ui.protect.markerFiles.customPlaceholder")} disabled={singleFile || !value.skipCustomMarker} aria-invalid={customError ? true : undefined} aria-describedby={customError ? `${errorID} ${helpID}` : helpID} onChange={(event) => { setNameEdited(true); onChange({ ...value, skipMarkerFileName: event.target.value }); }} />
 			{customError && <small id={errorID} className="inline-error" role="alert">{customError}</small>}
 			<small id={helpID}>{t("ui.protect.markerFiles.customHelp")}</small>
 		</div>
 		{usesKopia && <div className="advanced-setting">
-			<label className="check"><input type="checkbox" checked disabled />{t("ui.protect.markerFiles.kopiaIgnoreLabel")}</label>
-			<small>{t("ui.protect.markerFiles.kopiaIgnoreHelp")}</small>
+			<label className="check"><input type="checkbox" checked={!singleFile} disabled />{t("ui.protect.markerFiles.kopiaIgnoreLabel")}</label>
+			{!singleFile && <small>{t("ui.protect.markerFiles.kopiaIgnoreHelp")}</small>}
 		</div>}
 	</div>;
 }

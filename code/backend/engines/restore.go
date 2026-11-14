@@ -7,6 +7,8 @@ import (
 	"runtime"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/local/replicaro/models"
 )
 
 // ErrRestoreDestinationNotAbsolute refuses a destination that is not an
@@ -66,6 +68,23 @@ func validateRestoreSelectionName(engineID, selection, goos string) error {
 		return ErrRestoreSelectionNameInvalid
 	}
 	return nil
+}
+
+// ValidateFileRootVersionRestore checks, before any work is queued, that the
+// engine can name the file a single-file root recorded. For Restic that is the
+// last element of its archive tree path, with the same name rule as a selected
+// item. Kopia restores under the name its fresh root entry reports, and checks
+// that entry when it restores.
+func ValidateFileRootVersionRestore(engineID string, root models.SnapshotSourceRoot) error {
+	switch engineID {
+	case ResticID:
+		_, _, err := resticFileRootParentAndName(root.Path)
+		return err
+	case KopiaID:
+		return nil
+	default:
+		return fmt.Errorf("%w: restoring a single-file source version is unavailable", ErrUnsupported)
+	}
 }
 
 func validateRestoreOptions(options RestoreOptions) (string, error) {

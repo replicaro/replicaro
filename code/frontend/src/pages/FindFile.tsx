@@ -54,6 +54,20 @@ const browseRootKey = "\u0000browse-root";
 const allVaultsValue = "__all_vaults__";
 const SNAPSHOT_HISTORY_TOOLTIP = () => t("ui.snapshotHistory.refreshHelp");
 
+// refusedFileSourceVersion reports whether the refused item must be a version
+// of a single-file source. Such an item is sent with the empty path, so its
+// name is not in the request; when no item's path has a name the backend
+// could refuse, the refused name is that of a single-file source's recorded
+// root. The backend refuses U+FFFD everywhere and a backslash only on Windows;
+// the page can't tell which system the backend runs on, so any backslash in an
+// item's path counts and the folder text is shown. A single-file source has
+// no containing folder to offer: only the whole snapshot, from the Restore
+// page, restores it.
+function refusedFileSourceVersion(items: ReviewedRestoreItem[]) {
+	return items.some((item) => item.path === "") &&
+		!items.some((item) => item.path.includes("\u{FFFD}") || item.path.includes("\\"));
+}
+
 // containingFolderRestoreItems replaces each item whose name the backend
 // refused with its nearest clean folder from the same snapshot, and drops
 // items that folder now contains. folders lists the replacement folders so the
@@ -103,6 +117,55 @@ function canonicalSelectionPath(result: FileSearchResult) {
 	return result.path.replace(/^\/+|\/+$/g, "");
 }
 
+// A single-file source comes back as a file at the empty path: the source
+// itself. It restores to <destination>/<name>, like a selected file at the top
+// of a folder source, so its name stands in for its path wherever a path is
+// shown or compared for the restore. The request still sends the empty path.
+function isFileSourceResult(result: FileSearchResult) {
+	return result.path === "" && !result.isDir;
+}
+
+function shownResultPath(result: FileSearchResult) {
+	return isFileSourceResult(result) ? result.name : result.path;
+}
+
+// The name the restore request's duplicate check uses for a version of a
+// single-file source: the last element of the root the engine recorded for
+// that snapshot (FileVersion.source). With Restic that is the name the file
+// restores under. A Kopia version backed up through "Update job source" from
+// a differently named file records the job's source but restores under its
+// root entry's name, which is not in the cache (Kopia reads it again at
+// restore), so neither this page nor the check can use it; Kopia's numbering
+// keeps two items from landing on one name. A root that starts with "/" is a
+// POSIX path, where a backslash is an ordinary character in a name, so only
+// "/" separates; any other root is a Windows drive or UNC path, where either
+// slash does.
+//
+// This must give the same name as database.MetadataFileRootName in the
+// backend, which the duplicate check uses. Change both together.
+function recordedFileRootName(root: string) {
+	const separator = root.startsWith("/") ? root.lastIndexOf("/") : Math.max(root.lastIndexOf("/"), root.lastIndexOf("\\"));
+	return root.slice(separator + 1);
+}
+
+// The path an item is checked at for duplicates and nesting: where it lands
+// under the destination, apart from the Kopia case below. Two single-file
+// sources with the same name would land on the same file, and one named
+// "docs" next to a selected docs/a.txt would be nested, exactly like folder
+// items with those paths.
+//
+// A single-file source counts under the name recorded for the chosen version,
+// which is what the backend compares (see recordedFileRootName for the Kopia
+// version that lands under another name). It can differ from the search
+// result's name when the job was backed up through "Update job source" with a
+// file of another name (a rename, or only a change of case), so don't use
+// result.name once a version is chosen. Before that the result's name stands
+// in.
+function restoreLandingPath(result: FileSearchResult, version: FileVersion | undefined) {
+	if (!isFileSourceResult(result)) return canonicalSelectionPath(result);
+	return version ? recordedFileRootName(version.source) : result.name;
+}
+
 function selectionSourceIdentity(result: FileSearchResult) {
 	return result.source;
 }
@@ -114,11 +177,11 @@ function isSelectionDescendant(result: FileSearchResult, ancestor: FileSearchRes
 	return resultPath.startsWith(`${ancestorPath}/`);
 }
 
-function selectionConflict(results: FileSearchResult[]) {
+function selectionConflict(results: FileSearchResult[], versionOf: (result: FileSearchResult) => FileVersion | undefined) {
 	for (let left = 0; left < results.length; left++) {
-		const leftPath = canonicalSelectionPath(results[left]);
+		const leftPath = restoreLandingPath(results[left], versionOf(results[left]));
 		for (let right = left + 1; right < results.length; right++) {
-			const rightPath = canonicalSelectionPath(results[right]);
+			const rightPath = restoreLandingPath(results[right], versionOf(results[right]));
 			if (leftPath === rightPath) return t("ui.findFile.sameRestorePathConflict");
 			if (leftPath.startsWith(`${rightPath}/`) || rightPath.startsWith(`${leftPath}/`)) {
 				return t("ui.findFile.nestedRestorePathConflict");
@@ -200,17 +263,22 @@ function splitDisplayPath(value: string, windows = false) {
 // list) render the tooltip with FloatingTooltip, because both boxes clip a
 // popup rendered inside the label. The other callers are in a Modal and keep
 // the shared Tooltip, which opens above the dialog.
-function FilePathLabel({ value, source, tooltipPath: nativeTooltipPath, withinJob = false, floating = false }: { value: string; source?: string; tooltipPath?: string; withinJob?: boolean; floating?: boolean }) {
+//
+// fileSource: the row is a single-file source, whose value is the file's name
+// rather than a path inside the snapshot, so the hover title names only the
+// backup source.
+function FilePathLabel({ value, source, tooltipPath: nativeTooltipPath, withinJob = false, floating = false, fileSource = false }: { value: string; source?: string; tooltipPath?: string; withinJob?: boolean; floating?: boolean; fileSource?: boolean }) {
     const path = displayFilePath(value, source);
 	const tooltipPath = withinJob && nativeTooltipPath !== undefined ? pathWithinJob(value, source ?? "") : nativeTooltipPath;
     const parts = splitDisplayPath(path, path.startsWith("\\") && !value.includes("\\"));
     const text = <><span className="file-path-parent">{parts.parent}</span><span className="file-path-name">{parts.name}</span></>;
+	const sourceTitle = t("ui.restore.backupSourceTooltip", { source: source ?? "" });
     if (tooltipPath) return (
         <FloatingTooltip
             className="file-path-label"
             content={tooltipPath}
             label={tooltipPath}
-            title={withinJob ? undefined : `${t("ui.restore.backupSourceTooltip", { source: source ?? "" })}\n${t("ui.restore.snapshotPathTooltip", { path: value })}`}
+            title={withinJob ? undefined : fileSource ? sourceTitle : `${sourceTitle}\n${t("ui.restore.snapshotPathTooltip", { path: value })}`}
         >{text}</FloatingTooltip>
     );
     const content = withinJob ? pathWithinJob(value, source ?? "") : path;
@@ -491,7 +559,8 @@ function VaultFileHistory({
     const [reviewedRestore, setReviewedRestore] = useState<ReviewedRestore | null>(null);
 	// Set when the backend refused a selected item's name. offer is the
 	// request to send instead, or null when no containing folder can be offered.
-	const [nameRefusal, setNameRefusal] = useState<{ offer: ReturnType<typeof containingFolderRestoreItems> } | null>(null);
+	// fileSource is set when the refused item is a single-file source's version.
+	const [nameRefusal, setNameRefusal] = useState<{ offer: ReturnType<typeof containingFolderRestoreItems>; fileSource: boolean } | null>(null);
     const [error, setError] = useState("");
     const [indexing, setIndexing] = useState(false);
 	const [indexState, setIndexState] = useState<MetadataIndexState | null>(null);
@@ -711,7 +780,6 @@ function VaultFileHistory({
 	const allIndividualVersionsChosen = selectedResults.every((result) =>
 		Boolean(fileVersionForKey(histories[resultKey(result)], chosenVersions[resultKey(result)]))
 	);
-	const restoreSelectionConflict = selectionConflict(selectedResults);
     const effectiveSingleSnapshot = commonSnapshots.some((snapshot) => snapshot.id === singleSnapshot)
         ? singleSnapshot
         : commonSnapshots[0]?.id ?? "";
@@ -733,6 +801,7 @@ function VaultFileHistory({
 			? exactSnapshotVersion(histories[key], effectiveSingleSnapshot)
 			: fileVersionForKey(histories[key], chosenVersions[key]);
 	};
+	const restoreSelectionConflict = selectionConflict(selectedResults, selectedVersion);
 	// Kopia restores a selected folder's contents straight into the
 	// destination, so several items that include a folder would merge there.
 	// The backend refuses such a request; this shows the same text before
@@ -1004,7 +1073,9 @@ function VaultFileHistory({
 				const version = fileVersionForKey(histories[resultKey(result)], fileVersionKey(restoreItem));
 				return {
 					key: resultKey(result),
-					path: result.path,
+					// A single-file source shows the name the duplicate check
+					// compared (recordedFileRootName).
+					path: isFileSourceResult(result) ? restoreLandingPath(result, version) : shownResultPath(result),
 					isDir: version?.isDir ?? result.isDir,
 					timestamp: (mode === "single"
 						? commonSnapshots.find((item) => item.id === restoreItem.snapshotId)?.timestamp
@@ -1051,7 +1122,8 @@ function VaultFileHistory({
         } catch (reason) {
 			if (!ownsSubmission()) return;
 			if (reason instanceof APIError && reason.code === RESTORE_SELECTION_NAME_INVALID) {
-				setNameRefusal({ offer: containingFolderRestoreItems(items) });
+				const fileSource = refusedFileSourceVersion(items);
+				setNameRefusal({ offer: fileSource ? null : containingFolderRestoreItems(items), fileSource });
 				return;
 			}
 			toast("error", (reason as Error).message);
@@ -1066,14 +1138,21 @@ function VaultFileHistory({
 	const renderBrowseRows = (items: FileBrowseEntry[], depth: number): ReactNode => items.map((item) => {
 		const key = browseNodeKey(item);
 		const expanded = expandedBrowseKeys.includes(key);
-		const expandable = item.isSource || Boolean(item.canExpand) || item.isDir;
-		const checked = !item.isSource && Boolean(selectedItems[resultKey(item)]);
+		// A single-file source is a source row that is a file: it has nothing
+		// to expand and is selected like any file.
+		const fileSource = item.isSource && isFileSourceResult(item);
+		const selectable = !item.isSource || fileSource;
+		const expandable = (item.isSource && !fileSource) || Boolean(item.canExpand) || item.isDir;
+		const checked = selectable && Boolean(selectedItems[resultKey(item)]);
 		const childPage = browsePages[key];
 		const childError = browseErrors[key];
 		const job = sourceJob(item.source);
 		const source = job ? job.name : displayPath(item.source);
 		const label = item.isSource ? source : item.name;
-		const selectionLabel = checked
+		// A single-file source row is its own source, so it is announced by
+		// its label alone, like a search result.
+		const fileSourceSelectionLabel = checked ? t("ui.fileHistory.deselectNamed", { name: label }) : t("ui.fileHistory.selectNamed", { name: label });
+		const selectionLabel = fileSource ? fileSourceSelectionLabel : checked
             ? t("ui.fileHistory.deselectFromSource", { item: item.isSource ? label : displayFilePath(item.path, item.source), source })
             : t("ui.fileHistory.selectFromSource", { item: item.isSource ? label : displayFilePath(item.path, item.source), source });
 		const disabledMessage = item.isSource ? "" : parentSelectionMessage(item);
@@ -1086,7 +1165,7 @@ function VaultFileHistory({
 		return <div className="browse-tree-node" key={key} role="listitem">
 			<div className={`browse-tree-row${checked ? " selected" : ""}`} style={{ paddingLeft: 10 + depth * 22 } as CSSProperties}>
 				{expandable ? <button type="button" className="browse-disclosure" aria-expanded={expanded} aria-label={expanded ? t("ui.fileHistory.collapseNamed", { name: label }) : t("ui.fileHistory.expandNamed", { name: label })} onClick={() => toggleBrowseNode(item)}>{expanded ? "▾" : "▸"}</button> : <span className="browse-disclosure-spacer" />}
-				{item.isSource ? <span className="browse-checkbox-spacer" /> : <SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={disabledMessage} onChange={() => toggleResult(item)} />}
+				{!selectable ? <span className="browse-checkbox-spacer" /> : <SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={disabledMessage} onChange={() => toggleResult(item)} />}
 				<Icon name={item.isDir ? "folder" : "file"} size={17} />
 				{expandable
 					? <button type="button" className="browse-tree-main browse-tree-label-button" aria-expanded={expanded} aria-label={t("ui.fileHistory.toggleNamedFromName", { name: label })} onClick={() => toggleBrowseNode(item)}>{rowLabel}</button>
@@ -1111,10 +1190,10 @@ function VaultFileHistory({
 			{selectedResults.map((result) => {
 				const key = resultKey(result);
 				const versions = presentVersions(histories[key]).sort(newestVersionFirst);
-					return <label className="field find-version-row" key={key}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} withinJob={Boolean(sourceJob(result.source))} /><select value={chosenVersions[key] ?? ""} onChange={(event) => setChosenVersions((current) => ({ ...current, [key]: event.target.value }))} disabled={!versions.length}><option value="">{versions.length ? t("ui.pages.findfile.choose.a.version") : t("ui.pages.findfile.loading.history")}</option>{versions.map((version) => <option key={fileVersionKey(version)} value={fileVersionKey(version)}>{versionChoiceLabel(version)}</option>)}</select></label>;
+					return <label className="field find-version-row" key={key}><FilePathLabel value={shownResultPath(result)} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} withinJob={Boolean(sourceJob(result.source))} fileSource={isFileSourceResult(result)} /><select value={chosenVersions[key] ?? ""} onChange={(event) => setChosenVersions((current) => ({ ...current, [key]: event.target.value }))} disabled={!versions.length}><option value="">{versions.length ? t("ui.pages.findfile.choose.a.version") : t("ui.pages.findfile.loading.history")}</option>{versions.map((version) => <option key={fileVersionKey(version)} value={fileVersionKey(version)}>{versionChoiceLabel(version)}</option>)}</select></label>;
 			})}
 		</div>}
-		<div className="find-selected-items"><span className="modal-section-label">{t("ui.pages.findfile.selected.items")}</span>{selectedResults.map((result) => { const key = resultKey(result); const version = selectedVersion(result); const isDir = version?.isDir ?? result.isDir; return <div className="find-selected-item" key={key}><Icon name={isDir ? "folder" : "file"} size={14} /><span style={{ display: "flex", minWidth: 0, flex: 1, flexDirection: "column", gap: 3 }}><FilePathLabel value={result.path} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} withinJob={Boolean(sourceJob(result.source))} />{isDir && <span className="mono faint">{t("ui.pages.findfile.all.files.and.folders.inside")}</span>}</span><span className="mono faint">{versionTypeLabel(version, result.isDir)}</span><button onClick={() => toggleResult(result)} aria-label={t("ui.fileHistory.removeNamed", { name: displayFilePath(result.path, result.source) })}>{t("ui.pages.findfile.remove")}</button></div>; })}</div>
+		<div className="find-selected-items"><span className="modal-section-label">{t("ui.pages.findfile.selected.items")}</span>{selectedResults.map((result) => { const key = resultKey(result); const version = selectedVersion(result); const isDir = version?.isDir ?? result.isDir; return <div className="find-selected-item" key={key}><Icon name={isDir ? "folder" : "file"} size={14} /><span style={{ display: "flex", minWidth: 0, flex: 1, flexDirection: "column", gap: 3 }}><FilePathLabel value={shownResultPath(result)} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} withinJob={Boolean(sourceJob(result.source))} fileSource={isFileSourceResult(result)} />{isDir && <span className="mono faint">{t("ui.pages.findfile.all.files.and.folders.inside")}</span>}</span><span className="mono faint">{versionTypeLabel(version, result.isDir)}</span><button onClick={() => toggleResult(result)} aria-label={t("ui.fileHistory.removeNamed", { name: displayFilePath(shownResultPath(result), result.source) })}>{t("ui.pages.findfile.remove")}</button></div>; })}</div>
 		{restoreSelectionConflict && <div className="inline-error" role="alert">{restoreSelectionConflict}</div>}
 		{kopiaFolderSelectionConflict && <div className="inline-error" role="alert">{kopiaFolderSelectionConflict}</div>}
 		<label className="field"><span>{t("ui.pages.findfile.restore.destination")}</span><DirectoryField value={effectiveTargetPath} onChange={setTargetPath} placeholder={kopiaSelectionIncludesFile ? t("ui.restore.chooseExistingFolder") : t("ui.pages.findfile.choose.a.new.or.existing.destination")} /></label>
@@ -1143,9 +1222,9 @@ function VaultFileHistory({
 							<div className="find-results-list">{results.map((result) => {
 								const key = resultKey(result);
 								const checked = Boolean(selectedItems[key]);
-								const path = displayFilePath(result.path, result.source);
+								const path = displayFilePath(shownResultPath(result), result.source);
 								const selectionLabel = checked ? t("ui.fileHistory.deselectNamed", { name: path }) : t("ui.fileHistory.selectNamed", { name: path });
-								return <label key={key} className={`find-result${checked ? " selected" : ""}`}><SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={parentSelectionMessage(result)} onChange={() => toggleResult(result)} /><Icon name={result.isDir ? "folder" : "file"} size={18} /><span className="find-result-main"><strong><FilePathLabel value={result.path} source={result.source} withinJob={Boolean(sourceJob(result.source))} floating /></strong>{(() => { const job = sourceJob(result.source); return job
+								return <label key={key} className={`find-result${checked ? " selected" : ""}`}><SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={parentSelectionMessage(result)} onChange={() => toggleResult(result)} /><Icon name={result.isDir ? "folder" : "file"} size={18} /><span className="find-result-main"><strong><FilePathLabel value={shownResultPath(result)} source={result.source} withinJob={Boolean(sourceJob(result.source))} floating /></strong>{(() => { const job = sourceJob(result.source); return job
 									? <span className="mono job-source-line">{t("ui.fileHistory.sourceLabel")} <JobSourceLabel job={job} /></span>
 									: <span className="mono">{t("ui.fileHistory.sourceLabel")} {sourceLabel(result)}</span>; })()}</span></label>;
 							})}</div>
@@ -1183,7 +1262,7 @@ function VaultFileHistory({
 					? <p className="muted">{restoreCapability(selectedRepository, engines)?.conflictModes[0]?.description}</p>
 					: <label className="field"><span>{t("ui.pages.findfile.should.existing.files.be.overwritten")}</span><select value={reviewedRestore.conflictMode} onChange={(event) => setReviewedRestore((current) => current ? { ...current, conflictMode: event.target.value } : current)}>{restoreCapability(selectedRepository, engines)?.conflictModes.map((mode) => <option key={mode.id} value={mode.id}>{restoreConflictModeLabel(mode)}</option>)}</select></label>}
 				</fieldset>
-				{nameRefusal && <div className="inline-error" role="alert">{t("ui.restore.selectionNameInvalid")}{nameRefusal.offer && <> <button type="button" className="btn" disabled={restoring} onClick={() => void doRestore(nameRefusal.offer?.items)}>{t("ui.restore.restoreContainingFolder")}</button>{nameRefusal.offer.folders.map((folder) => <span key={folder}> <strong><FilePathLabel value={folder} /></strong></span>)}</>}</div>}
+				{nameRefusal && <div className="inline-error" role="alert">{nameRefusal.fileSource ? t("ui.restore.selectionNameInvalidSingleFile") : t("ui.restore.selectionNameInvalid")}{nameRefusal.offer && <> <button type="button" className="btn" disabled={restoring} onClick={() => void doRestore(nameRefusal.offer?.items)}>{t("ui.restore.restoreContainingFolder")}</button>{nameRefusal.offer.folders.map((folder) => <span key={folder}> <strong><FilePathLabel value={folder} /></strong></span>)}</>}</div>}
 				<div className="modal-footer"><button className="btn" disabled={restoring} onClick={dismissReviewedRestore}>{t("ui.findFile.back")}</button><button className="btn primary" disabled={restoring} onClick={() => void doRestore()}>{restoring && <span className="spinner" />}<Icon name="restore" size={14} />{t("ui.pages.findfile.restore.selected")}</button></div>
 			</Modal>}
 

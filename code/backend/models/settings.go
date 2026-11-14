@@ -55,10 +55,33 @@ type Settings struct {
 	// this list so an older build keeps its webhook after a downgrade.
 	NotificationURLs []string `json:"notificationUrls"`
 
+	// DesktopNotificationTitlePrefix and NotificationURLTitlePrefix are the
+	// optional texts put in front of the title of desktop notifications and of
+	// notifications sent to the URLs above, exactly as typed (cleaned and
+	// length-checked by notifications.CleanTitlePrefix before they are saved).
+	// They are pointers so a save can tell "not sent" from "cleared":
+	// GetSettings always sets both, "" when unset, while SaveSettings leaves
+	// the stored value alone when one is nil. A settings page opened before
+	// these existed doesn't send them, and its save mustn't clear them.
+	DesktopNotificationTitlePrefix *string `json:"desktopNotificationTitlePrefix"`
+	NotificationURLTitlePrefix     *string `json:"notificationUrlTitlePrefix"`
+
 	StartWithWindows             bool `json:"startWithWindows"`
 	StartAtLogin                 bool `json:"startAtLogin"`
 	MaxConcurrentJobRuns         int  `json:"maxConcurrentJobRuns"`
 	DisableAutomaticUpdateChecks bool `json:"disableAutomaticUpdateChecks"`
+}
+
+// TitlePrefixes returns the desktop and notification URL title prefixes, ""
+// for one that isn't set.
+func (settings Settings) TitlePrefixes() (desktop, urls string) {
+	if settings.DesktopNotificationTitlePrefix != nil {
+		desktop = *settings.DesktopNotificationTitlePrefix
+	}
+	if settings.NotificationURLTitlePrefix != nil {
+		urls = *settings.NotificationURLTitlePrefix
+	}
+	return desktop, urls
 }
 
 // NotificationChannels picks the channels for one finished operation status:

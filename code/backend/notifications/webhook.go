@@ -44,10 +44,27 @@ type Event struct {
 	Color                 string            `json:"color"`
 	Icon                  string            `json:"icon"`
 	Timestamp             string            `json:"timestamp"`
+
+	// DesktopTitlePrefix and URLTitlePrefix are the title prefixes to use for
+	// the two channels (see models.Settings.TitlePrefixes). Each goes in front
+	// of the localized title for its own channel only, when the event is sent.
+	// The JSON webhook gets the URL one inside its title field; neither is
+	// sent as a field of its own.
+	DesktopTitlePrefix string `json:"-"`
+	URLTitlePrefix     string `json:"-"`
 }
 
 var dispatchWG sync.WaitGroup
 var showDesktopNotification = desktop.ShowNotification
+
+// SetDesktopNotificationForTests replaces the desktop notification call and
+// returns the function that puts the real one back, so tests in other
+// packages never show a real notification.
+func SetDesktopNotificationForTests(show func(title, message, operationID, status string) error) func() {
+	previous := showDesktopNotification
+	showDesktopNotification = show
+	return func() { showDesktopNotification = previous }
+}
 
 const maxWebhookMessageBytes = 16 << 10
 const maxWebhookResponseBytes = 64 << 10
@@ -137,6 +154,7 @@ func PrepareOperation(
 	if !ShouldNotify(notification) {
 		return nil
 	}
+	notification.DesktopTitlePrefix, notification.URLTitlePrefix = settings.TitlePrefixes()
 	if err := database.StartOperationStep(db, operationID, "application", "notification", time.Now()); err != nil {
 		_ = database.LogError(db, "Notification step could not be registered: "+err.Error())
 		return nil
@@ -179,10 +197,10 @@ func SendAll(urls []string, nativeEnabled, urlsEnabled bool, event Event) error 
 	prepare(&event)
 	var failures []error
 	if nativeEnabled {
-		failures = append(failures, showDesktopNotification(event.Title, event.Message, event.OperationID, notificationStatus(event)))
+		failures = append(failures, showDesktopNotification(event.DesktopTitlePrefix+event.Title, event.Message, event.OperationID, notificationStatus(event)))
 	}
 	if urlsEnabled {
-		for _, outcome := range deliver(context.Background(), CleanURLs(urls), event) {
+		for _, outcome := range deliver(context.Background(), CleanURLs(urls), forURLs(event)) {
 			failures = append(failures, outcome.err)
 		}
 	}
@@ -240,9 +258,36 @@ func prepare(event *Event) {
 	event.Title = localizedNotificationTitle(*event)
 }
 
-// testEvent is the event name of the settings page's "Send test"
-// notification. Its JSON webhook body has event "test" and status "success".
+// forURLs returns a prepared event the way the notification URLs get it: the
+// URL title prefix in front of the title. It's the title every sender starts
+// from, so the JSON webhook's title field carries it, services without a title
+// field show it on the first line, and a URL's own title option still replaces
+// the whole title.
+func forURLs(event Event) Event {
+	event.Title = event.URLTitlePrefix + event.Title
+	return event
+}
+
+// testEvent is the event name of the settings page's test notifications, the
+// desktop one and the one sent to the notification URLs. Its JSON webhook
+// body has event "test" and status "success".
 const testEvent = "test"
+
+// SendDesktopTest shows the test notification on the desktop, with the
+// desktop title prefix as typed in the settings box, before it is saved. Like
+// the URL test it ignores the success/failure switches and creates no
+// operation or log entry. The prefix is cleaned and checked exactly as a save
+// does, so a prefix that is too long returns ErrTitlePrefixTooLong; any other
+// error comes from the desktop notification itself. The caller checks that
+// desktop notifications are available first.
+func SendDesktopTest(titlePrefix, locale string) error {
+	prefix, err := CleanTitlePrefix(titlePrefix)
+	if err != nil {
+		return err
+	}
+	event := testNotification(locale)
+	return showDesktopNotification(prefix+event.Title, event.Message, event.OperationID, notificationStatus(event))
+}
 
 func localizedNotificationTitle(event Event) string {
 	if event.Event == testEvent {
@@ -310,7 +355,7 @@ func SendContext(ctx context.Context, notificationURL string, event Event) error
 		return nil
 	}
 	prepare(&event)
-	return deliver(ctx, []string{notificationURL}, event)[0].err
+	return deliver(ctx, []string{notificationURL}, forURLs(event))[0].err
 }
 
 // The JSON webhook. http:// and https:// URLs get the Event JSON as it is:

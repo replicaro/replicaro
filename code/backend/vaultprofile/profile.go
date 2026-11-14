@@ -123,6 +123,7 @@ type BackupJob struct {
 	JobUUID          string `json:"job_uuid"`
 	Name             string `json:"name"`
 	Source           string `json:"source"`
+	SourceKind       string `json:"sourceKind,omitempty"` // see the note below
 	Schedule         string `json:"schedule"`
 	Retention        int    `json:"retention"`
 	RetentionHourly  *int   `json:"retentionHourly,omitempty"`
@@ -134,7 +135,10 @@ type BackupJob struct {
 	// The marker-file choices are optional and written only when set, so a
 	// profile of a job that doesn't use them stays readable by versions that
 	// predate them (their parser refuses unknown fields). Don't drop the
-	// omitempty.
+	// omitempty. SourceKind above follows the same rule: it is written only
+	// for a source that isn't a folder ("file", or "unknown" for a recovered
+	// job not yet bound anywhere), so a folder job's entry is byte-for-byte
+	// what it was before file sources existed.
 	SkipNoBackupFolders     bool                  `json:"skipNoBackupFolders,omitempty"`
 	SkipCacheDirFolders     bool                  `json:"skipCacheDirFolders,omitempty"`
 	SkipMarkerFileName      string                `json:"skipMarkerFileName,omitempty"`
@@ -220,7 +224,7 @@ func BuildProfile(repo models.Repository, jobs []models.BackupJob, dormant []Bac
 			return Profile{}, fmt.Errorf("job %q engine settings: %w", job.Name, err)
 		}
 		profile.Jobs = append(profile.Jobs, BackupJob{
-			JobUUID: job.ID, Name: job.Name, Source: job.Source, Schedule: job.Schedule,
+			JobUUID: job.ID, Name: job.Name, Source: job.Source, SourceKind: job.SourceKind, Schedule: job.Schedule,
 			Retention: job.Retention, RetentionHourly: job.RetentionHourly, RetentionDaily: job.RetentionDaily,
 			RetentionWeekly: job.RetentionWeekly, RetentionMonthly: job.RetentionMonthly, RetentionYearly: job.RetentionYearly,
 			Exclusions: job.Excludes, Tag: job.Tag, BeforeScriptPath: job.BeforeScriptPath,
@@ -336,6 +340,11 @@ func (p Profile) Validate() error {
 		}
 		if err := models.ValidateSkipMarkerFileName(job.SkipMarkerFileName); err != nil {
 			return fmt.Errorf("vault profile job %q has an invalid marker file name: %w", job.JobUUID, err)
+		}
+		switch job.SourceKind {
+		case "", models.SourceKindFile, models.SourceKindUnknown:
+		default:
+			return fmt.Errorf("vault profile job %q has an unsupported source kind", job.JobUUID)
 		}
 		if (job.BeforeScriptMustSucceed && job.BeforeScriptPath == "") || (job.AfterScriptMustSucceed && job.AfterScriptPath == "") {
 			return fmt.Errorf("vault profile job %q requires an absent script", job.JobUUID)

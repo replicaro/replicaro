@@ -265,9 +265,38 @@ func fileHistory(writerDB, readDB *sql.DB, w http.ResponseWriter, r *http.Reques
 		return
 	}
 	path := rawPath
+	writeIndexing := func(revision int64, state database.MetadataIndexState) {
+		writeJSON(w, map[string]any{"items": []models.FileVersion{}, "indexing": true, "index": state,
+			"revision": revision, "offset": offset, "nextOffset": offset, "hasMore": false})
+	}
+	// An empty path is the source itself. A single-file source has one version
+	// per snapshot there. Any other source needs a path inside it and gets
+	// "missing file path" even while its snapshots are still being indexed,
+	// which is why this check runs before the readiness gate. The history read
+	// repeats the file-root check in its own transaction.
 	if path == "" {
-		badRequest(w, "missing file path")
-		return
+		holdsFile, lookupErr := database.MetadataSourceHoldsFileVersionForAuthority(r.Context(), readDB, authority, source)
+		// While the cache is being rebuilt or closed it cannot say what kind of
+		// source this is, so a single-file source must not be told it needs a
+		// path. The request gets the indexing page that the history read gives
+		// when it cannot open the cache, with no revision or index state. A
+		// folder source asked for with an empty path gets the same answers in
+		// these two states, because nothing here can tell the two kinds apart;
+		// it gets "missing file path" again once the cache can be read. Do not
+		// fold lookup failures into "missing file path": the page would then
+		// show that error for a single-file source during every rebuild.
+		if errors.Is(lookupErr, database.ErrMetadataIndexingUnavailable) {
+			writeIndexing(0, database.MetadataIndexState{})
+			return
+		}
+		if lookupErr != nil {
+			writeError(w, http.StatusInternalServerError, lookupErr)
+			return
+		}
+		if !holdsFile {
+			badRequest(w, "missing file path")
+			return
+		}
 	}
 	history, revision, state, err := database.ReadyMetadataFileHistoryPageForAuthority(
 		r.Context(), readDB, authority, path, source, metadataPageSize+1, offset, expectedRevision,
@@ -277,8 +306,7 @@ func fileHistory(writerDB, readDB *sql.DB, w http.ResponseWriter, r *http.Reques
 		return
 	}
 	if errors.Is(err, database.ErrMetadataIndexingUnavailable) {
-		writeJSON(w, map[string]any{"items": []models.FileVersion{}, "indexing": true, "index": state,
-			"revision": revision, "offset": offset, "nextOffset": offset, "hasMore": false})
+		writeIndexing(revision, state)
 		return
 	}
 	if err != nil {
@@ -516,6 +544,69 @@ func refuseKopiaFileIntoMissingDestination(w http.ResponseWriter, r *http.Reques
 	return false
 }
 
+// confirmFileRootVersions accepts each empty-path item only when the metadata
+// cache shows that its snapshot recorded its native root as a single file, and
+// marks it with that root. An empty selection means a whole-snapshot restore to
+// both engines, so an item that isn't confirmed is refused exactly like any
+// other missing path, and a folder source can never be restored whole from
+// File History. When the snapshot is still being indexed the answer is the
+// retryable 409 that browsing gives. It reports whether the request may go on;
+// otherwise it has written the response.
+func confirmFileRootVersions(w http.ResponseWriter, r *http.Request, db *sql.DB, repositoryID string, items []RestoreSelectionItem) bool {
+	snapshotIDs := []string{}
+	for _, item := range items {
+		if item.Path == "" {
+			snapshotIDs = append(snapshotIDs, item.SnapshotID)
+		}
+	}
+	notReady := func() bool {
+		writeCodedError(w, http.StatusConflict, "metadata_not_ready", "backup data is still being prepared")
+		return false
+	}
+	authority, err := database.LoadMetadataReadAuthority(r.Context(), db, repositoryID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return false
+	}
+	fileRoots, err := database.MetadataSnapshotFileRootsForAuthority(r.Context(), db, authority, snapshotIDs)
+	if errors.Is(err, database.ErrMetadataIndexingUnavailable) {
+		return notReady()
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return false
+	}
+	for index := range items {
+		if items[index].Path != "" {
+			continue
+		}
+		root, confirmed := fileRoots[items[index].SnapshotID][strings.TrimSpace(items[index].NativeRootID)]
+		if !confirmed {
+			// Only a snapshot the cache knows but hasn't indexed yet is worth
+			// retrying. The ready check below reads no entries for it.
+			ready, readyErr := database.ReadyMetadataSnapshotIDsForAuthority(r.Context(), db, authority, []string{items[index].SnapshotID})
+			if readyErr == nil && !ready[items[index].SnapshotID] {
+				var cached models.Snapshot
+				cached, _, _, readyErr = database.ReadyMetadataSnapshotEntriesForAuthority(r.Context(), db, authority, items[index].SnapshotID, "")
+				if readyErr == nil && cached.ID != "" {
+					return notReady()
+				}
+			}
+			if errors.Is(readyErr, database.ErrMetadataIndexingUnavailable) {
+				return notReady()
+			}
+			if readyErr != nil {
+				writeError(w, http.StatusInternalServerError, readyErr)
+				return false
+			}
+			badRequest(w, "every restore item needs a snapshotId and path")
+			return false
+		}
+		items[index].fileRoot = &root
+	}
+	return true
+}
+
 func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		badRequest(w, "invalid method")
@@ -541,6 +632,7 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 		return
 	}
 	normalized := make([]RestoreSelectionItem, len(req.Items))
+	fileRootCandidates := false
 	for index, item := range req.Items {
 		snapshotID := item.SnapshotID
 		if item.Content != nil {
@@ -552,6 +644,14 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 			}
 			snapshotID = item.Content.SnapshotID
 		}
+		// An empty path can only be a version of a single-file source, which
+		// is always addressed by its exact native root. It stays a candidate
+		// until confirmFileRootVersions has checked the cached entry.
+		if item.Path == "" && snapshotID != "" && strings.TrimSpace(item.NativeRootID) != "" {
+			normalized[index] = RestoreSelectionItem{SnapshotID: snapshotID, NativeRootID: item.NativeRootID}
+			fileRootCandidates = true
+			continue
+		}
 		path, pathErr := canonicalRestoreSelectionPath(item.Path)
 		if snapshotID == "" || pathErr != nil {
 			badRequest(w, "every restore item needs a snapshotId and path")
@@ -559,10 +659,36 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 		}
 		normalized[index] = RestoreSelectionItem{SnapshotID: snapshotID, Path: path, NativeRootID: item.NativeRootID}
 	}
+	if fileRootCandidates && !confirmFileRootVersions(w, r, db, repoModel.ID, normalized) {
+		return
+	}
+	// A single-file source's version restores to <destination>/<name>, so for
+	// this check it counts as a top-level item named after the last element of
+	// the version's recorded source. Two same-named single-file sources then
+	// collide like two items with the same path, and a file named docs next to
+	// a selected docs/a.txt is caught as nested. Folder items compare by their
+	// own paths.
+	//
+	// With Restic the recorded name is where the file lands, and without this
+	// check Restic would overwrite or skip the second file and still report
+	// both as restored. A Kopia version backed up through Update job source
+	// from a differently named file records the job's source but lands under
+	// its root entry's name, so the check can refuse a pair that would not
+	// collide; two items that do land on one name are kept apart by Kopia's
+	// request-local destination numbering. The root entry's name is not in
+	// the cache (the engine reads it again at restore), so the check can't use
+	// it.
+	restorePaths := make([]string, len(normalized))
+	for index, item := range normalized {
+		restorePaths[index] = item.Path
+		if item.fileRoot != nil {
+			restorePaths[index] = database.MetadataFileRootName(item.fileRoot.Path)
+		}
+	}
 	for left := 0; left < len(normalized); left++ {
-		leftPath := normalized[left].Path
+		leftPath := restorePaths[left]
 		for right := left + 1; right < len(normalized); right++ {
-			rightPath := normalized[right].Path
+			rightPath := restorePaths[right]
 			if leftPath == rightPath || strings.HasPrefix(leftPath, rightPath+"/") || strings.HasPrefix(rightPath, leftPath+"/") {
 				badRequest(w, "restore selection contains duplicate or overlapping paths")
 				return
@@ -579,10 +705,16 @@ func restoreSelection(db *sql.DB, runtimeManager *operationruntime.Manager, w ht
 		descriptor.ID = manager.ID()
 	}
 	for _, item := range normalized {
-		options := engines.RestoreOptions{Destination: req.TargetPath, Selection: item.Path, ConflictMode: req.ConflictMode}
+		options := engines.RestoreOptions{Destination: req.TargetPath, Selection: item.Path, FileRootVersion: item.fileRoot != nil, ConflictMode: req.ConflictMode}
 		if validationErr := engines.ValidateRestoreRequest(descriptor, options); validationErr != nil {
 			writeRestoreRequestRefusal(w, validationErr)
 			return
+		}
+		if item.fileRoot != nil {
+			if validationErr := engines.ValidateFileRootVersionRestore(descriptor.ID, *item.fileRoot); validationErr != nil {
+				writeRestoreRequestRefusal(w, validationErr)
+				return
+			}
 		}
 	}
 	// These rules depend on the whole request and on the cached entry types,
@@ -681,14 +813,16 @@ func restoreSelectionInBackground(op *trackedOperation, repoModel models.Reposit
 		op.fail(visibilityErr)
 		return
 	}
-	nativeRoots := make(map[string]models.SnapshotSourceRoot, len(normalized))
-	for _, item := range normalized {
+	// One root per item, by position: two single-file sources of one Restic
+	// snapshot share the snapshot ID and the empty path, so neither can key it.
+	nativeRoots := make([]models.SnapshotSourceRoot, len(normalized))
+	for index, item := range normalized {
 		root, rootErr := exactRestoreNativeRoot(visibleSnapshots[item.SnapshotID], item.NativeRootID, true)
 		if rootErr != nil {
 			op.fail(rootErr)
 			return
 		}
-		nativeRoots[item.SnapshotID+"\x00"+item.Path] = root
+		nativeRoots[index] = root
 	}
 	operationCtx, closeCancelGate := op.ctx, op.closeGate
 
@@ -724,7 +858,7 @@ func restoreSelectionInBackground(op *trackedOperation, repoModel models.Reposit
 		}
 		destinationNotice := ""
 		options := engines.RestoreOptions{Destination: req.TargetPath, Selection: item.Path, KopiaFileNames: kopiaNames, ReportDestination: func(notice string) { destinationNotice = notice },
-			NativeRoot: nativeRoots[item.SnapshotID+"\x00"+item.Path], ConflictMode: req.ConflictMode}
+			NativeRoot: nativeRoots[itemIndex], FileRootVersion: item.fileRoot != nil, ConflictMode: req.ConflictMode}
 		nativeContext := command.ContextWithFinalCancellationAdmission(operationCtx)
 		output, restoreErr := manager.Restore(nativeContext, repoModel, item.SnapshotID, options)
 		operationStatus, processStarted, _, nativeStageErr, followupErr, stageKnown :=

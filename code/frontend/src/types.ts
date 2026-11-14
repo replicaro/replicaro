@@ -90,7 +90,14 @@ export interface DirectoryListing {
     parent: string;
     roots: Array<{ name: string; path: string }>;
     directories: Array<{ name: string; path: string }>;
+	// Only in the job-source picker's file mode (files=1), and left out when
+	// the folder has no files.
+	files?: Array<{ name: string; path: string }>;
 }
+
+// The new-job form's kind lookup for a typed source path (kind=1). It is a
+// hint for the form only; the backend decides when the job is saved.
+export type SourcePathKind = "file" | "folder" | "neither";
 
 export interface Snapshot {
     nativeRootType?: "d" | "f";
@@ -107,6 +114,9 @@ export interface Snapshot {
 		markers?: string[];
 	 };
 	 sourceRoots?: Array<{ path: string; user?: string; host?: string; nativeRootId: string }>;
+	 // Native roots this snapshot recorded as a single file, from its indexed
+	 // entries. Absent for folder snapshots and snapshots not indexed yet.
+	 fileRootIds?: string[];
 	 presentation?: "managed" | "unmanaged";
 	 managedJobId?: string;
 	 machineLabel?: string;
@@ -255,6 +265,10 @@ export interface BackupJob {
     name: string;
     source: string;
 	sourceBindingState?: "bound" | "unbound_imported";
+	// "file" for a job whose source is a single file. Folder jobs have no
+	// value, and an imported job that isn't bound yet has "unknown"; treat
+	// anything but "file" as a folder job.
+	sourceKind?: string;
 	// The job's alias, set only by "Update job source" (or kept from an
 	// earlier version). Backups read from it; `source` stays immutable.
 	resolvedSourcePath?: string;
@@ -336,7 +350,9 @@ export interface BackupJobTarget {
 
 // One folder-check warning from "Update job source". `reason` is the first
 // matching check: an empty folder, a different folder name, or fewer than half
-// of the latest backup's top-level items present.
+// of the latest backup's top-level items present. A job whose source is a
+// single file gets the same shape with only "empty" (a zero-byte file) and
+// "name".
 export interface JobSourceFolderCheck {
 	reason: "empty" | "name" | "items";
 	chosen: string;
@@ -556,6 +572,13 @@ export interface Settings {
     webhookUrl: string;
     /** http(s) entries go to the JSON webhook, other schemes are shoutrrr-style URLs. notifyWebhookOn* apply to all of them. */
     notificationUrls: string[];
+    /**
+     * Put in front of the desktop / notification URL titles exactly as typed.
+     * The server always sends both; a save that leaves one out keeps the
+     * stored value.
+     */
+    desktopNotificationTitlePrefix?: string;
+    notificationUrlTitlePrefix?: string;
     notifyWindowsOnSuccess: boolean;
     notifyWindowsOnFailure: boolean;
     nativeNotificationsOnSuccess?: boolean;

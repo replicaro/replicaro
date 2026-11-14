@@ -152,6 +152,7 @@ func Migrate(db *sql.DB) error {
 		id TEXT PRIMARY KEY,
 		name TEXT NOT NULL COLLATE NOCASE UNIQUE,
 		source TEXT NOT NULL,
+		source_kind TEXT NOT NULL DEFAULT '' CHECK (source_kind IN ('','file','unknown')),
 		source_storage_version TEXT NOT NULL,
 		source_storage_key TEXT NOT NULL,
 		source_storage_json TEXT NOT NULL,
@@ -542,6 +543,16 @@ func Migrate(db *sql.DB) error {
 		if err := addColumnIfMissing(tx, "backup_jobs", column.name, column.definition); err != nil {
 			return err
 		}
+	}
+	// A job's source can be a single file. The kind is its own column rather
+	// than part of the storage binding, so the binding format and every row
+	// that already exists stay exactly as they are. A folder has no kind (''),
+	// which is what every existing job gets here; only file sources and
+	// recovered jobs whose kind isn't known yet store a value. An older build
+	// opening the database ignores the column, and its inserts get ''.
+	if err := addColumnIfMissing(tx, "backup_jobs", "source_kind",
+		`TEXT NOT NULL DEFAULT '' CHECK (source_kind IN ('','file','unknown'))`); err != nil {
+		return err
 	}
 	// Vault Size measures without holding the vault lock, so a backup can
 	// mark the vault dirty while a measurement runs. The count lets the

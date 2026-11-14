@@ -75,9 +75,9 @@ func UpdateJobSourceAlias(db *sql.DB, expected, updated models.BackupJob, now ti
 	if active > 0 {
 		return ErrJobRunActive
 	}
-	var name, source, state, alias string
-	if err := tx.QueryRow(`SELECT name,source,source_binding_state,resolved_source_path FROM backup_jobs WHERE id=?`,
-		expected.ID).Scan(&name, &source, &state, &alias); err != nil {
+	var name, source, state, alias, kind string
+	if err := tx.QueryRow(`SELECT name,source,source_binding_state,resolved_source_path,source_kind FROM backup_jobs WHERE id=?`,
+		expected.ID).Scan(&name, &source, &state, &alias, &kind); err != nil {
 		return err
 	}
 	if normalizedJobSourceBindingState(state) != "bound" {
@@ -87,6 +87,14 @@ func UpdateJobSourceAlias(db *sql.DB, expected, updated models.BackupJob, now ti
 	}
 	if source != expected.Source || alias != expected.ResolvedSourcePath {
 		return ErrJobSourceChanged
+	}
+	// The alias was probed for the job's kind (a file for a file job, a folder
+	// otherwise). An alias of the other kind would back up something the job's
+	// native retention group was never meant to hold, so a mismatch is refused
+	// here too. The kind itself is never written by this function.
+	if err := validateJobSourceKindTransition(models.BackupJob{SourceKind: kind, SourceBindingState: state},
+		updated, false); err != nil {
+		return err
 	}
 	if updated.ResolvedSourcePath == source {
 		return fmt.Errorf("source alias must differ from the immutable source")

@@ -59,6 +59,10 @@ type RestoreSelectionItem struct {
 	Content      *RestoreContentReference `json:"content,omitempty"`
 	Path         string                   `json:"path"`
 	NativeRootID string                   `json:"nativeRootId,omitempty"`
+	// fileRoot is never decoded from a request. restoreSelection sets it to
+	// the item's native root when it has confirmed that an empty-path item is
+	// a version of a single-file source.
+	fileRoot *models.SnapshotSourceRoot
 }
 
 type RestoreSelectionRequest struct {

@@ -3,7 +3,7 @@ import { useLocation, useNavigate, useOutletContext } from "react-router-dom";
 
 import { preventNumberInputWheel } from "../components/numberInput";
 import { ConfirmDialog, Loading, Modal, SaveChangesDialog, useToast } from "../components/ui";
-import { checkForAppUpdate, getEngines, getPlatform, getSettings, getSupportReport, openAppUpdateDownload, saveSettings, testNotificationUrls } from "../services/api";
+import { checkForAppUpdate, getEngines, getPlatform, getSettings, getSupportReport, openAppUpdateDownload, saveSettings, testDesktopNotification, testNotificationUrls } from "../services/api";
 import type { AppUpdateStatus, EngineDescriptor, PlatformInfo, Settings as SettingsType } from "../types";
 import type { AppUpdateOutletContext } from "../layouts/MainLayout";
 import { applyThemePreference } from "../theme";
@@ -63,17 +63,36 @@ function cleanNotificationUrls(urls: string[]): string[] {
     return urls.map((url) => url.trim()).filter(Boolean);
 }
 
+// The longest notification title prefix, in UTF-16 code units. That's how
+// maxLength counts, and the server counts the same way, so the field and the
+// server always agree (an emoji uses 2 of the 50).
+const titlePrefixMaxLength = 50;
+
+// The server removes line breaks, U+2028, U+2029 and every other control
+// character (tab and U+0085 included) from a title prefix before storing it,
+// and keeps spaces exactly as typed. Doing the same here means the saved copy
+// matches what was stored. Don't trim: a trailing space is how the user
+// separates the prefix from the title.
+function cleanTitlePrefix(prefix: string | undefined): string | undefined {
+    return prefix?.replace(/[\p{Cc}\u2028\u2029]/gu, "");
+}
+
 // Used for the unsaved-changes check only. Blank lines, or a box cleared back
 // to empty when nothing was saved, change nothing that a save would store, so
-// they shouldn't trigger the prompt. The draft keeps the text exactly as typed.
+// they shouldn't trigger the prompt; nor do characters a save would remove
+// from a title prefix. The draft keeps the text exactly as typed.
 // webhookUrl is left out: it isn't editable here and save() derives it from
 // the list, so a draft typed during a save can hold an older value than the
 // saved copy even when the lists match.
 function sameStoredSettings(draft: SettingsType, saved: SettingsType): boolean {
-    return sameSettings(
-        { ...draft, notificationUrls: cleanNotificationUrls(draft.notificationUrls), webhookUrl: "" },
-        { ...saved, notificationUrls: cleanNotificationUrls(saved.notificationUrls), webhookUrl: "" },
-    );
+    const stored = (settings: SettingsType): SettingsType => ({
+        ...settings,
+        notificationUrls: cleanNotificationUrls(settings.notificationUrls),
+        webhookUrl: "",
+        desktopNotificationTitlePrefix: cleanTitlePrefix(settings.desktopNotificationTitlePrefix),
+        notificationUrlTitlePrefix: cleanTitlePrefix(settings.notificationUrlTitlePrefix),
+    });
+    return sameSettings(stored(draft), stored(saved));
 }
 
 export default function System() {
@@ -92,6 +111,7 @@ export default function System() {
     const [manualUpdateStatus, setManualUpdateStatus] = useState<AppUpdateStatus | null>(null);
     const [checkingForUpdate, setCheckingForUpdate] = useState(false);
     const [testingNotificationUrls, setTestingNotificationUrls] = useState(false);
+    const [testingDesktopNotification, setTestingDesktopNotification] = useState(false);
     const [supportOpen, setSupportOpen] = useState(false);
     const [supportLoading, setSupportLoading] = useState(false);
     const [supportCopying, setSupportCopying] = useState(false);
@@ -114,6 +134,8 @@ export default function System() {
     const languageMessageId = useId();
     const notificationUrlsId = useId();
     const notificationUrlsHelpId = useId();
+    const desktopTitlePrefixHelpId = useId();
+    const notificationUrlsTitlePrefixHelpId = useId();
     const supportGeneration = useRef(0);
     const supportAbort = useRef<AbortController | null>(null);
     const supportCopyAttempt = useRef(0);
@@ -155,6 +177,10 @@ export default function System() {
         // the saved copy and wrongly takes the failed save as committed.
         const webhookUrl = notificationUrls.find((url) => /^https?:\/\//i.test(url)) ?? "";
         const attemptedSettings: SettingsType = { ...draftSettings, notificationUrls, webhookUrl, ...(language === undefined ? {} : { language }) };
+        // The server cleans the title prefixes too, so the saved copy and the
+        // boxes show what it stores.
+        attemptedSettings.desktopNotificationTitlePrefix = cleanTitlePrefix(draftSettings.desktopNotificationTitlePrefix);
+        attemptedSettings.notificationUrlTitlePrefix = cleanTitlePrefix(draftSettings.notificationUrlTitlePrefix);
 		const previouslySavedSettings = savedSettings;
         setSaving(true);
         try {
@@ -198,14 +224,15 @@ export default function System() {
         }
     };
 
-    // Tests the lines as they are in the box, saved or not, and ignores the
-    // failure/success checkboxes. Results come back per URL; their error text
-    // is the server's English text and is shown as given.
+    // Tests the lines and the URL title prefix as they are in the boxes, saved
+    // or not, and ignores the failure/success checkboxes. Results come back
+    // per URL; their error text is the server's English text and is shown as
+    // given.
     const sendTestNotification = async () => {
         if (!settings || testingNotificationUrls) return;
         setTestingNotificationUrls(true);
         try {
-            const { results } = await testNotificationUrls(settings.notificationUrls);
+            const { results } = await testNotificationUrls(settings.notificationUrls, settings.notificationUrlTitlePrefix ?? "");
             const failures = results.filter((result) => !result.ok);
             if (failures.length === 0) toast("ok", t("ui.system.notificationTestSent", { count: results.length }));
             else toast("error", failures.map((result) => result.error).join("\n"));
@@ -213,6 +240,23 @@ export default function System() {
             toast("error", (error as Error).message);
         } finally {
             setTestingNotificationUrls(false);
+        }
+    };
+
+    // Shows the test notification on this desktop with the desktop title
+    // prefix as it is in the box, saved or not, and ignores the
+    // failure/success checkboxes. An error is the server's English text and
+    // is shown as given.
+    const sendDesktopTestNotification = async () => {
+        if (!settings || testingDesktopNotification) return;
+        setTestingDesktopNotification(true);
+        try {
+            await testDesktopNotification(settings.desktopNotificationTitlePrefix ?? "");
+            toast("ok", t("ui.system.desktopNotificationTestSent"));
+        } catch (error) {
+            toast("error", (error as Error).message);
+        } finally {
+            setTestingDesktopNotification(false);
         }
     };
 
@@ -522,7 +566,23 @@ export default function System() {
             {(platform?.capabilities.startAtLogin ?? true) && <><div className="system-label">{t("ui.pages.system.startup")}</div><section className="system-section"><label className="check"><input type="checkbox" checked={settings.startAtLogin ?? settings.startWithWindows} onChange={(event) => setSettings({ ...settings, startAtLogin: event.target.checked, startWithWindows: event.target.checked })} />{t("ui.system.startAtLogin")}</label></section></>}
             <div className="system-label">{t("ui.pages.system.housekeeping")}</div><section className="system-section"><label className="field compact-field"><span>{t("ui.pages.system.keep.logs.for.days")}</span><input type="number" min={1} value={settings.logRetentionDays} onWheel={preventNumberInputWheel} onChange={(event) => setSettings({ ...settings, logRetentionDays: parseInt(event.target.value, 10) || 30 })} /></label></section>
             <div className="system-label">{t("ui.pages.system.backup.admission")}</div><section className="system-section"><label className="field system-control-field"><span>{t("ui.pages.system.maximum.simultaneous.backup.runs")}</span><input type="number" min={1} max={32} value={settings.maxConcurrentJobRuns} onWheel={preventNumberInputWheel} onChange={(event) => setSettings({ ...settings, maxConcurrentJobRuns: Math.min(32, Math.max(1, parseInt(event.target.value, 10) || 2)) })} /></label></section>
-            <div className="system-label">{t("ui.pages.system.notifications")}</div><section className="system-section notifications-section">{(platform?.capabilities.nativeNotifications ?? true) && <div className="notification-channel"><div className="notification-channel-title">{t("ui.pages.system.desktop")}</div><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnFailure ?? settings.notifyWindowsOnFailure} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnFailure: event.target.checked, notifyWindowsOnFailure: event.target.checked })} />{t("ui.system.notifyFailures")}</label><label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnSuccess ?? settings.notifyWindowsOnSuccess} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnSuccess: event.target.checked, notifyWindowsOnSuccess: event.target.checked })} />{t("ui.system.notifySuccess")}</label></div>}
+            <div className="system-label">{t("ui.pages.system.notifications")}</div><section className="system-section notifications-section">
+                {/* Hidden where desktop notifications don't work, test button and
+                    prefix field included: the capability is also off on ordinary
+                    desktops that can't show one right now. */}
+                {(platform?.capabilities.nativeNotifications ?? true) && <div className="notification-channel">
+                    <div className="notification-channel-title">{t("ui.pages.system.desktop")}</div>
+                    <label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnFailure ?? settings.notifyWindowsOnFailure} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnFailure: event.target.checked, notifyWindowsOnFailure: event.target.checked })} />{t("ui.system.notifyFailures")}</label>
+                    <label className="check"><input type="checkbox" checked={settings.nativeNotificationsOnSuccess ?? settings.notifyWindowsOnSuccess} onChange={(event) => setSettings({ ...settings, nativeNotificationsOnSuccess: event.target.checked, notifyWindowsOnSuccess: event.target.checked })} />{t("ui.system.notifySuccess")}</label>
+                    <div>
+                        <label className="field system-control-field"><span>{t("ui.system.notificationTitlePrefix")}</span><input type="text" maxLength={titlePrefixMaxLength} spellCheck={false} autoComplete="off" aria-describedby={desktopTitlePrefixHelpId} value={settings.desktopNotificationTitlePrefix ?? ""} onChange={(event) => setSettings({ ...settings, desktopNotificationTitlePrefix: event.target.value })} /></label>
+                        <div id={desktopTitlePrefixHelpId} className="setting-hint system-control-hint">{t("ui.system.desktopTitlePrefixHelp")}</div>
+                    </div>
+                    {/* Its own name, distinct from the URL test button, so screen
+                        readers and anything that finds a button by the
+                        ui.system.sendTest text can tell them apart. */}
+                    <div><button type="button" className="btn" disabled={testingDesktopNotification} onClick={() => void sendDesktopTestNotification()}>{testingDesktopNotification && <span className="spinner" />}{t("ui.system.sendDesktopTest")}</button></div>
+                </div>}
                 {/* http:// and https:// lines go to the JSON webhook, so there's no separate
                     webhook field. The server fills the legacy webhookUrl from this list on
                     save (older builds still read it), and the one pair of checkboxes below
@@ -540,6 +600,10 @@ export default function System() {
                     </div>
                     <label className="check"><input type="checkbox" checked={settings.notifyWebhookOnFailure} onChange={(event) => setSettings({ ...settings, notifyWebhookOnFailure: event.target.checked })} />{t("ui.system.notifyFailures")}</label>
                     <label className="check"><input type="checkbox" checked={settings.notifyWebhookOnSuccess} onChange={(event) => setSettings({ ...settings, notifyWebhookOnSuccess: event.target.checked })} />{t("ui.system.notifySuccess")}</label>
+                    <div>
+                        <label className="field system-control-field"><span>{t("ui.system.notificationTitlePrefix")}</span><input type="text" maxLength={titlePrefixMaxLength} spellCheck={false} autoComplete="off" aria-describedby={notificationUrlsTitlePrefixHelpId} value={settings.notificationUrlTitlePrefix ?? ""} onChange={(event) => setSettings({ ...settings, notificationUrlTitlePrefix: event.target.value })} /></label>
+                        <div id={notificationUrlsTitlePrefixHelpId} className="setting-hint system-control-hint">{t("ui.system.notificationUrlsTitlePrefixHelp")}</div>
+                    </div>
                     <div><button type="button" className="btn" disabled={testingNotificationUrls} onClick={() => void sendTestNotification()}>{testingNotificationUrls && <span className="spinner" />}{t("ui.system.sendTest")}</button></div>
                 </div>
                 <button className="btn primary save-settings" disabled={saving} onClick={() => requestSave("save")}>{saving ? t("ui.system.saving") : t("ui.system.saveSettings")}</button></section>

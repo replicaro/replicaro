@@ -147,7 +147,7 @@ func StageRecoveredLocalJobAdmissions(
 		if reserved != 1 {
 			return fmt.Errorf("reviewed local job admission has no live connection reservation")
 		}
-		var name, source, sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
+		var name, source, sourceKind, sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
 		var schedule, excludes, tag, settingsJSON, portableJSON, nextRun string
 		var skipNoBackup, skipCacheDir bool
 		var skipMarkerName string
@@ -161,14 +161,14 @@ func StageRecoveredLocalJobAdmissions(
 				retention_weekly,retention_monthly,retention_yearly,excludes,
 				skip_nobackup_folders,skip_cachedir_folders,skip_marker_file_name,tag,
 				before_script_path,before_script_must_succeed,after_script_path,after_script_must_succeed,
-				engine_settings,portable_target_ids,enabled,COALESCE(next_run,'')
+				engine_settings,portable_target_ids,enabled,COALESCE(next_run,''),source_kind
 				FROM backup_jobs WHERE id=?`, reviewed.ID).Scan(
 			&name, &source, &sourceStorageVersion, &sourceStorageKey, &sourceStorageJSON,
 			&sourceBindingState, &schedule, &retention, &retentionHourly, &retentionDaily, &retentionWeekly,
 			&retentionMonthly, &retentionYearly, &excludes, &skipNoBackup, &skipCacheDir, &skipMarkerName,
 			&tag, &beforeScriptPath, &beforeScriptMustSucceed,
 			&afterScriptPath, &afterScriptMustSucceed,
-			&settingsJSON, &portableJSON, &enabled, &nextRun,
+			&settingsJSON, &portableJSON, &enabled, &nextRun, &sourceKind,
 		); err != nil {
 			return fmt.Errorf("reload reviewed local job %s: %w", reviewed.ID, err)
 		}
@@ -201,7 +201,8 @@ func StageRecoveredLocalJobAdmissions(
 			RetentionHourly: nullableRetentionValue(retentionHourly), RetentionDaily: nullableRetentionValue(retentionDaily),
 			RetentionWeekly: nullableRetentionValue(retentionWeekly), RetentionMonthly: nullableRetentionValue(retentionMonthly),
 			RetentionYearly: nullableRetentionValue(retentionYearly)}
-		if name != reviewed.Name || source != reviewed.Source || schedule != reviewed.Schedule ||
+		if name != reviewed.Name || source != reviewed.Source || sourceKind != reviewed.SourceKind ||
+			schedule != reviewed.Schedule ||
 			!equivalentSourceBinding(sourceStorageVersion, sourceStorageKey, sourceStorageJSON,
 				reviewed.SourceStorageVersion, reviewed.SourceStorageKey, reviewed.SourceStorageDescriptorJSON) ||
 			!models.RetentionPolicyEqual(loadedRetention, reviewed) || excludes != reviewed.Excludes || tag != reviewed.Tag ||
@@ -324,7 +325,7 @@ func normalizeRecoveredJobTargets(queryer recoveredJobQueryer, repositoryID stri
 			}
 		}
 
-		var name, source, sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
+		var name, source, sourceKind, sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
 		var schedule, excludes, tag, existingSettings, existingTargets string
 		var skipNoBackup, skipCacheDir bool
 		var skipMarkerName string
@@ -337,12 +338,12 @@ func normalizeRecoveredJobTargets(queryer recoveredJobQueryer, repositoryID stri
 			retention_weekly, retention_monthly, retention_yearly, excludes,
 			skip_nobackup_folders, skip_cachedir_folders, skip_marker_file_name, tag,
 			before_script_path,before_script_must_succeed,after_script_path,after_script_must_succeed,
-			engine_settings, portable_target_ids, enabled FROM backup_jobs WHERE id = ?`, job.ID).Scan(
+			engine_settings, portable_target_ids, enabled, source_kind FROM backup_jobs WHERE id = ?`, job.ID).Scan(
 			&name, &source, &sourceStorageVersion, &sourceStorageKey, &sourceStorageJSON,
 			&sourceBindingState, &schedule, &retention, &retentionHourly, &retentionDaily, &retentionWeekly,
 			&retentionMonthly, &retentionYearly, &excludes, &skipNoBackup, &skipCacheDir, &skipMarkerName,
 			&tag, &beforeScriptPath, &beforeScriptMustSucceed,
-			&afterScriptPath, &afterScriptMustSucceed, &existingSettings, &existingTargets, &enabled)
+			&afterScriptPath, &afterScriptMustSucceed, &existingSettings, &existingTargets, &enabled, &sourceKind)
 		if err == sql.ErrNoRows {
 			job.PortableTargetIDs = requestedTargets
 			continue
@@ -358,7 +359,7 @@ func normalizeRecoveredJobTargets(queryer recoveredJobQueryer, repositoryID stri
 		// vault attaches the new target to that definition and discards stale
 		// or unsupported profile differences instead of asking the user to
 		// choose between two definitions of the same ID.
-		job.Name, job.Source = name, source
+		job.Name, job.Source, job.SourceKind = name, source, sourceKind
 		job.SourceStorageVersion, job.SourceStorageKey, job.SourceStorageDescriptorJSON =
 			sourceStorageVersion, sourceStorageKey, sourceStorageJSON
 		job.SourceBindingState = sourceBindingState
@@ -713,20 +714,20 @@ func AttachRecoveredRepository(
 			var retention int
 			var retentionHourly, retentionDaily, retentionWeekly, retentionMonthly, retentionYearly sql.NullInt64
 			var enabled bool
-			var sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
+			var sourceKind, sourceStorageVersion, sourceStorageKey, sourceStorageJSON, sourceBindingState string
 			if err := tx.QueryRow(`SELECT name, source, source_storage_version, source_storage_key, source_storage_json,
 				source_binding_state, schedule, retention, retention_hourly, retention_daily, retention_weekly,
 				retention_monthly, retention_yearly, excludes,
 				skip_nobackup_folders, skip_cachedir_folders, skip_marker_file_name, tag,
 				before_script_path,before_script_must_succeed,after_script_path,after_script_must_succeed,
-				engine_settings, portable_target_ids, enabled
+				engine_settings, portable_target_ids, enabled, source_kind
 				FROM backup_jobs WHERE id = ?`, job.ID).Scan(&name, &source,
 				&sourceStorageVersion, &sourceStorageKey, &sourceStorageJSON,
 				&sourceBindingState, &schedule, &retention,
 				&retentionHourly, &retentionDaily, &retentionWeekly, &retentionMonthly, &retentionYearly,
 				&excludes, &skipNoBackup, &skipCacheDir, &skipMarkerName,
 				&tag, &beforeScriptPath, &beforeScriptMustSucceed,
-				&afterScriptPath, &afterScriptMustSucceed, &encoded, &existingTargets, &enabled); err != nil {
+				&afterScriptPath, &afterScriptMustSucceed, &encoded, &existingTargets, &enabled, &sourceKind); err != nil {
 				return "", nil, err
 			}
 			if _, ok := localAdmissions[job.ID]; !ok {
@@ -746,7 +747,7 @@ func AttachRecoveredRepository(
 				RetentionHourly: nullableRetentionValue(retentionHourly), RetentionDaily: nullableRetentionValue(retentionDaily),
 				RetentionWeekly: nullableRetentionValue(retentionWeekly), RetentionMonthly: nullableRetentionValue(retentionMonthly),
 				RetentionYearly: nullableRetentionValue(retentionYearly)}
-			if name != job.Name || source != job.Source ||
+			if name != job.Name || source != job.Source || sourceKind != job.SourceKind ||
 				!equivalentSourceBinding(sourceStorageVersion, sourceStorageKey, sourceStorageJSON,
 					job.SourceStorageVersion, job.SourceStorageKey, job.SourceStorageDescriptorJSON) ||
 				sourceBindingState != normalizedJobSourceBindingState(job.SourceBindingState) ||
@@ -786,21 +787,24 @@ func AttachRecoveredRepository(
 				return "", nil, err
 			}
 		} else {
+			if err := validateJobSourceKind(job); err != nil {
+				return "", nil, fmt.Errorf("portable job %s: %w", job.ID, err)
+			}
 			_, err = tx.Exec(`INSERT INTO backup_jobs
 				(id, name, source, source_storage_version, source_storage_key, source_storage_json,
 				 source_binding_state, schedule, enabled, next_run, last_run, retention, retention_hourly, retention_daily,
 				 retention_weekly, retention_monthly, retention_yearly, excludes,
 				 skip_nobackup_folders, skip_cachedir_folders, skip_marker_file_name, tag,
 				 before_script_path,before_script_must_succeed,after_script_path,after_script_must_succeed,
-				 engine_settings, portable_target_ids)
-				VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				 engine_settings, portable_target_ids, source_kind)
+				VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, '', '', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 				job.ID, job.Name, job.Source, job.SourceStorageVersion, job.SourceStorageKey,
 				job.SourceStorageDescriptorJSON, normalizedJobSourceBindingState(job.SourceBindingState), job.Schedule,
 				job.Retention, job.RetentionHourly,
 				job.RetentionDaily, job.RetentionWeekly, job.RetentionMonthly, job.RetentionYearly, job.Excludes,
 				job.SkipNoBackupFolders, job.SkipCacheDirFolders, job.SkipMarkerFileName,
 				job.Tag, job.BeforeScriptPath, job.BeforeScriptMustSucceed,
-				job.AfterScriptPath, job.AfterScriptMustSucceed, settings, string(portableJSON))
+				job.AfterScriptPath, job.AfterScriptMustSucceed, settings, string(portableJSON), job.SourceKind)
 			if err != nil {
 				return "", nil, err
 			}

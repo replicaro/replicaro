@@ -165,7 +165,7 @@ func ValidateRestoreCapability(descriptor Descriptor, options RestoreOptions) er
 	if !capability.FullSnapshot {
 		return fmt.Errorf("%w: native full-snapshot restore is unavailable", ErrUnsupported)
 	}
-	if options.Selection != "" && !capability.SinglePath {
+	if (options.Selection != "" || options.FileRootVersion) && !capability.SinglePath {
 		return fmt.Errorf("%w: native selected-path restore is unavailable", ErrUnsupported)
 	}
 	if options.OriginalLocation && !capability.OriginalLocation {
@@ -266,7 +266,15 @@ type RestoreOptions struct {
 	// that NativeRoot is the sole source root of a managed snapshot, so a whole
 	// restore may target it. NativeRoot by itself is rebuildable cache addressing
 	// and must never be used to narrow a whole-snapshot restore.
-	ExactSourceRoot  bool
+	ExactSourceRoot bool
+	// FileRootVersion restores the single file that NativeRoot recorded, to
+	// <Destination>/<its name>, the way a selected file inside a folder is
+	// restored. Selection stays empty: an empty selection otherwise means a
+	// whole-snapshot restore, and File History must never reach one. Set it
+	// only after the metadata cache has confirmed that this snapshot recorded
+	// NativeRoot as a file. Kopia checks its fresh root entry again before it
+	// restores anything.
+	FileRootVersion  bool
 	OriginalLocation bool
 	ConflictMode     string
 }

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1105,23 +1106,20 @@ func syncRepositoryLocked(ctx context.Context, db *sql.DB, repo models.Repositor
 		}
 		output := ""
 		headerListingPhase := beginIndexPhase("snapshot_header_listing")
-		if session, sessionOutput, supported, beginErr := engines.BeginSnapshotIndex(ctx, manager, repo); supported {
-			indexSession, output, err = session, sessionOutput, beginErr
-			if err == nil {
-				indexedSnapshots = indexSession.Snapshots()
-			}
-		} else {
-			var snapshots []models.Snapshot
-			snapshots, output, err = manager.ListSnapshots(ctx, repo)
-			for _, snapshot := range snapshots {
-				indexedSnapshots = append(indexedSnapshots, engines.SnapshotIndexItem{Snapshot: snapshot})
-			}
-		}
+		indexSession, indexedSnapshots, output, err = listSnapshotHeaders(ctx, manager, repo)
 		headerListingPhase.finish(IndexPhaseDiagnostic{
 			Snapshots: len(indexedSnapshots), NativeOutputBytes: len(output),
 		})
 		if err != nil {
 			return &repositoryRefreshError{err: &engineError{output: output, err: err}}
+		}
+		// Every header refresh (after a backup, Force, connect, access and the
+		// bucket check) passes here, before the listing can replace the cached
+		// snapshot list or start a cache rebuild below.
+		if repo.Engine == engines.ResticID {
+			if err := checkResticHeaderListing(ctx, db, repo, manager, indexSession, indexedSnapshots); err != nil {
+				return err
+			}
 		}
 		headerPublicationPhase := beginIndexPhase("snapshot_header_publication")
 		headerPublicationDiagnostic := IndexPhaseDiagnostic{}
@@ -1277,7 +1275,7 @@ func syncRepositoryLocked(ctx context.Context, db *sql.DB, repo models.Repositor
 				representatives = append(representatives, item)
 			}
 		}
-		results := listSnapshotIndexWindow(ctx, manager, indexSession, repo, representatives)
+		results := listSnapshotIndexWindow(ctx, db, manager, indexSession, repo, representatives)
 		entryDiagnostic.ListedSnapshots += len(representatives)
 		resultsByID := make(map[string]snapshotIndexResult, len(results))
 		for _, result := range results {
@@ -1311,7 +1309,7 @@ func syncRepositoryLocked(ctx context.Context, db *sql.DB, repo models.Repositor
 			result, listed := resultsByID[item.Snapshot.ID]
 			if !listed {
 				setCoordinatorStage(db, repo, "indexing_entries")
-				result = listSnapshotIndexWindow(ctx, manager, indexSession, repo, []engines.SnapshotIndexItem{item})[0]
+				result = listSnapshotIndexWindow(ctx, db, manager, indexSession, repo, []engines.SnapshotIndexItem{item})[0]
 				if err := ctx.Err(); err != nil {
 					return err
 				}
@@ -1407,6 +1405,7 @@ type snapshotIndexResult struct {
 // shape. Results stay in their input slots so publication remains newest-first.
 func listSnapshotIndexWindow(
 	ctx context.Context,
+	db *sql.DB,
 	manager engines.Engine,
 	session engines.SnapshotIndexSession,
 	repo models.Repository,
@@ -1422,6 +1421,9 @@ func listSnapshotIndexWindow(
 			result.entries, result.output, result.err = session.ListPathRecursive(ctx, snapshot, "")
 		} else {
 			result.entries, result.output, result.err = manager.ListPathRecursive(ctx, repo, snapshot.Snapshot.ID, "")
+		}
+		if result.err != nil && engines.IsResticHeaderOnlyListing(result.err) {
+			confirmEmptyResticFileRoot(ctx, db, manager, repo, &result)
 		}
 		return result
 	}
@@ -1442,6 +1444,59 @@ func listSnapshotIndexWindow(
 	return results
 }
 
+// confirmEmptyResticFileRoot handles one header-only Restic content listing.
+// It changes result only when the snapshot belongs to a single-file job and
+// Restic shows that the file is missing from it, and otherwise leaves the
+// listing's failure exactly as it was.
+//
+// When Restic can't read a single-file job's file during a backup (it is
+// locked, or its permissions changed), it exits 3 and still saves a snapshot,
+// one that holds the folders around the file but not the file. The exact-root
+// listing of that snapshot prints only the snapshot header, which is also what
+// Restic prints for a filter that matches nothing, so in general it must stay
+// a failure: publishing it as empty could hide a wrong listing. Left as a
+// failure here, though, that one snapshot keeps the whole vault's File History
+// and search unavailable, for every job, until retention removes it.
+//
+// So, only for a snapshot carrying the exact marker of a single-file job known
+// on this computer for this vault profile (the same local-job knowledge the
+// File History grouping root uses, see database.MetadataKnownFileJobSnapshot),
+// one extra non-recursive listing of the file's parent folder is run
+// (engines.ResticSnapshotOmitsFileRoot). The snapshot is indexed as ready and
+// empty, holding no version of the file, only when that listing shows the
+// parent folder and no entry with the file's name. Every other header-only
+// listing, including every folder root and every snapshot no local file job
+// owns (unmanaged, imported, another profile's or a deleted job's), keeps the
+// original failure without any extra command. A failed or inconclusive parent
+// listing also keeps it; there is no retry and nothing is stored.
+//
+// The jobs are read only here, after such a listing, so vaults without one
+// never run the query; if it fails, the original failure stands.
+func confirmEmptyResticFileRoot(ctx context.Context, db *sql.DB, manager engines.Engine, repo models.Repository, result *snapshotIndexResult) {
+	snapshot := result.snapshot.Snapshot
+	if repo.Engine != engines.ResticID || db == nil {
+		return
+	}
+	fileJobs, err := database.FileJobIDsForRepository(db, repo.ID)
+	if err != nil || !database.MetadataKnownFileJobSnapshot(repo.Engine, repo.ProfileUUID, snapshot, fileJobs) {
+		return
+	}
+	source := snapshot.Source
+	if len(snapshot.SourceRoots) == 1 {
+		source = snapshot.SourceRoots[0].Path
+	}
+	omitted, output, err := engines.ResticSnapshotOmitsFileRoot(ctx, manager, repo, snapshot.ID, source)
+	if output != "" {
+		result.output = strings.TrimSuffix(result.output+"\n"+output, "\n")
+	}
+	if err != nil || !omitted {
+		return
+	}
+	log.Printf("metadata refresh for %s (%s): snapshot %s of a single-file job does not contain the file (Restic could not read it during that backup); it is indexed with no version of the file",
+		repo.Name, repo.ID, snapshot.ID)
+	result.entries, result.err = []models.SnapshotEntry{}, nil
+}
+
 type engineError struct {
 	output string
 	err    error
@@ -1460,6 +1515,201 @@ type repositoryRefreshError struct{ err error }
 
 func (e *repositoryRefreshError) Error() string { return e.err.Error() }
 func (e *repositoryRefreshError) Unwrap() error { return e.err }
+
+// listSnapshotHeaders runs the engine's complete native header listing once,
+// through its reusable index session when it has one.
+func listSnapshotHeaders(ctx context.Context, manager engines.Engine, repo models.Repository) (engines.SnapshotIndexSession, []engines.SnapshotIndexItem, string, error) {
+	if session, output, supported, err := engines.BeginSnapshotIndex(ctx, manager, repo); supported {
+		if err != nil {
+			return session, []engines.SnapshotIndexItem{}, output, err
+		}
+		return session, session.Snapshots(), output, nil
+	}
+	snapshots, output, err := manager.ListSnapshots(ctx, repo)
+	items := make([]engines.SnapshotIndexItem, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		items = append(items, engines.SnapshotIndexItem{Snapshot: snapshot})
+	}
+	return nil, items, output, err
+}
+
+// checkResticHeaderListing decides whether a successful `restic snapshots
+// --json` listing may replace the vault's cached snapshot list. It returns nil
+// when the listing can be published as it is, and otherwise the error that
+// ends this refresh.
+//
+// Why this exists: Restic can exit 0 with a listing that is missing snapshots
+// the vault still has.
+//   - When the storage goes away while Restic is reading the snapshots folder
+//     (a removable drive unplugged during the refresh, a network share
+//     dropping), Restic exits 0 with `[]`, often with nothing useful on
+//     stderr. The same happens when the snapshots folder is missing.
+//   - With a local repository, when Restic can't read the snapshots folder,
+//     or a snapshot file it has no cached copy of, it prints "could not load
+//     snapshots: …" or `Ignoring "<id>": failed to load snapshot …` on
+//     stderr, exits 0, and lists only what it could load. With rclone's
+//     `local` backend (pinned rclone 1.75.1), an unreadable snapshot file
+//     gives the same `Ignoring` line after Restic's own load retries, but an
+//     unreadable snapshots folder gives `[]` with only rclone's own error on
+//     stderr, so it is handled like the empty listing above; a folder that
+//     stays unreadable is published as empty, the same as a missing one.
+//     Other rclone backends may report these failures differently.
+//
+// Publishing such a listing deletes the missing snapshots and their file index
+// from the cache, so Restore and File History show an empty or shortened vault
+// without any error, and nothing re-lists a fresh cache for days. The vault
+// itself is fine.
+//
+// The rules below only apply when the listing would remove snapshots that are
+// in the cache. Ordinary retention removes cached snapshots with a full,
+// warning-free listing, which publishes as before.
+//
+//   - An `Ignoring "<id>"` warning refuses the listing only when the snapshot
+//     it names is one of the cached snapshots the listing would remove.
+//   - Any other load warning, including "could not load snapshots" and an
+//     `Ignoring` line whose ID can't be read, refuses the listing whenever it
+//     would remove any cached snapshot.
+//   - An empty listing that no warning refused is indistinguishable from a
+//     vault whose snapshots were really all removed, so Restic is asked once
+//     more with the same command. Only a second exit 0 with `[]` (and no load
+//     warning) is accepted. Anything else is recorded as a failed refresh.
+//
+// The `Ignoring` rule is narrow on purpose. A snapshot file that was never
+// cached and can't be read (a permanently damaged file, say) gives that
+// warning on every listing. Retention removes a cached snapshot after most
+// backups, so refusing every warning-carrying listing that removes anything
+// would turn that one damaged, never-seen snapshot into a refresh failure
+// after every backup until the vault is repaired. Do not widen the rule back
+// to "any warning plus any removal" for that reason. A cached snapshot that
+// becomes unreadable still fails every refresh until the vault is repaired,
+// which is the true state.
+//
+// A refused listing is recorded as a failed refresh: the cache, its applied
+// generation and its last reconciliation time stay unchanged, and the existing
+// repository failure state and retry cooldown apply. Nothing is synthesized:
+// when the check passes, the first listing is published exactly as Restic
+// returned it (an accepted empty listing is the same `[]` both times), and no
+// storage re-check is made. Restic's warnings, when there are any, are never
+// dropped: a bounded excerpt goes into the recorded failure message, or into a
+// log line of its own when the listing is published.
+//
+// Do not remove the second listing or loosen these rules without a product
+// decision: either change brings back the emptied-cache defect. The warning
+// texts and the ID in the `Ignoring` line are pinned by
+// TestRealResticSnapshotListingPremises in the engines package.
+func checkResticHeaderListing(ctx context.Context, db *sql.DB, repo models.Repository, manager engines.Engine,
+	session engines.SnapshotIndexSession, items []engines.SnapshotIndexItem) error {
+	warnings := engines.ResticSnapshotLoadWarnings(session)
+	if len(items) != 0 && warnings == "" {
+		return nil
+	}
+	cached, err := database.ListMetadataSnapshots(db, repo.ID)
+	if err != nil {
+		return &repositoryRefreshError{err: fmt.Errorf("read cached snapshots: %w", err)}
+	}
+	listed := make(map[string]bool, len(items))
+	for _, item := range items {
+		listed[item.Snapshot.ID] = true
+	}
+	removed := make(map[string]bool)
+	for _, snapshot := range cached {
+		if !listed[snapshot.ID] {
+			removed[snapshot.ID] = true
+		}
+	}
+	if warnings != "" {
+		lines := strings.Split(warnings, "\n")
+		if refusing := resticWarningsRefuseListing(lines, removed); refusing >= 0 {
+			// The excerpt keeps only the first few lines, so the line that
+			// refused the listing goes first to make sure the message shows it.
+			ordered := append([]string{lines[refusing]}, lines[:refusing]...)
+			ordered = append(ordered, lines[refusing+1:]...)
+			return &repositoryRefreshError{err: fmt.Errorf(
+				"restic snapshots could not load every snapshot and its listing is missing %d cached snapshot(s); the cached snapshot list was kept:\n%s",
+				len(removed), resticWarningExcerpt(strings.Join(ordered, "\n")))}
+		}
+		// The warnings don't stop this listing, but they stay visible in the
+		// log instead of being dropped.
+		log.Printf("metadata refresh for %s (%s): restic snapshots reported:\n%s", repo.Name, repo.ID, resticWarningExcerpt(warnings))
+	}
+	if len(items) != 0 || len(removed) == 0 {
+		return nil
+	}
+	missing := len(removed)
+	confirmSession, confirmItems, confirmOutput, confirmErr := listSnapshotHeaders(ctx, manager, repo)
+	var closeErr error
+	if confirmSession != nil {
+		closeErr = confirmSession.Close()
+	}
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		// A cancelled or yielded refresh records no failure here, the same as
+		// a cancellation during the first listing.
+		return ctxErr
+	}
+	if confirmErr != nil {
+		return &repositoryRefreshError{err: fmt.Errorf("restic snapshots returned an empty list while %d snapshot(s) are cached, and the confirming listing failed; the cached snapshot list was kept: %w",
+			missing, &engineError{output: confirmOutput, err: confirmErr})}
+	}
+	if closeErr != nil {
+		return &repositoryRefreshError{err: fmt.Errorf("close snapshot index session: %w", closeErr)}
+	}
+	if confirmWarnings := engines.ResticSnapshotLoadWarnings(confirmSession); len(confirmItems) != 0 || confirmWarnings != "" {
+		message := fmt.Sprintf("restic snapshots returned an empty list while %d snapshot(s) are cached, but the confirming listing returned %d snapshot(s); the cached snapshot list was kept",
+			missing, len(confirmItems))
+		if confirmWarnings != "" {
+			message += ":\n" + resticWarningExcerpt(confirmWarnings)
+		}
+		return &repositoryRefreshError{err: errors.New(message)}
+	}
+	return nil
+}
+
+// resticWarningsRefuseListing applies the warning rules of
+// checkResticHeaderListing to every warning line. removed holds the cached
+// snapshot IDs the listing would remove. It returns the index of the first
+// line that refuses the listing, or -1 when the listing may be published.
+func resticWarningsRefuseListing(lines []string, removed map[string]bool) int {
+	if len(removed) == 0 {
+		return -1
+	}
+	for index, line := range lines {
+		id, named := engines.ResticIgnoredSnapshotID(line)
+		if !named || removed[id] {
+			return index
+		}
+	}
+	return -1
+}
+
+// Restic prints one warning line per snapshot file it couldn't load, so a
+// badly damaged vault would otherwise write hundreds of lines into the log and
+// the stored failure message on every refresh. Only this much of them is kept
+// there; the rules above always look at every line.
+const (
+	resticWarningExcerptLines    = 5
+	resticWarningExcerptLineSize = 1024
+)
+
+// resticWarningExcerpt returns the first few warning lines, each cut to a
+// bounded size, followed by how many lines were left out.
+func resticWarningExcerpt(warnings string) string {
+	lines := strings.Split(warnings, "\n")
+	kept := lines[:min(len(lines), resticWarningExcerptLines)]
+	var excerpt strings.Builder
+	for index, line := range kept {
+		if index > 0 {
+			excerpt.WriteByte('\n')
+		}
+		if len(line) > resticWarningExcerptLineSize {
+			line = strings.ToValidUTF8(line[:resticWarningExcerptLineSize], "") + "…"
+		}
+		excerpt.WriteString(line)
+	}
+	if omitted := len(lines) - len(kept); omitted > 0 {
+		fmt.Fprintf(&excerpt, "\n(%d more line(s) like these not shown)", omitted)
+	}
+	return excerpt.String()
+}
 
 // The automatic first check is deliberately local and follows successful new
 // header/content publication. A candidate re-enters a complete fresh header
@@ -1521,7 +1771,7 @@ func maybeRebuildMetadata(ctx context.Context, db *sql.DB, repo models.Repositor
 	}
 	setCoordinatorStage(db, repo, "rebuilding_entries")
 	err = database.RebuildMetadataCache(ctx, db, repo.ID, required, rebuild, func(ctx context.Context, snapshot models.Snapshot) ([]models.SnapshotEntry, error) {
-		result := listSnapshotIndexWindow(ctx, manager, session, repo, []engines.SnapshotIndexItem{byID[snapshot.ID]})[0]
+		result := listSnapshotIndexWindow(ctx, db, manager, session, repo, []engines.SnapshotIndexItem{byID[snapshot.ID]})[0]
 		if result.err != nil {
 			return nil, &engineError{output: result.output, err: result.err}
 		}

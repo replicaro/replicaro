@@ -334,6 +334,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/database/metadata_file_roots.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/database/metadata_grouping.go",
       "mode": "100644"
     },
@@ -980,6 +984,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/notifications/title_prefix.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/notifications/urls.go",
       "mode": "100644"
     },
@@ -1238,6 +1246,26 @@
     },
     {
       "path": "code/backend/storageidentity/probe.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/source_path_kind.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/sourcefile_darwin.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/sourcefile_linux.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/sourcefile_unix.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/storageidentity/sourcefile_windows.go",
       "mode": "100644"
     },
     {
@@ -1746,6 +1774,10 @@
     },
     {
       "path": "code/frontend/src/jobSourceDisplay.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/jobSourceKind.ts",
       "mode": "100644"
     },
     {
