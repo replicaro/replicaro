@@ -308,7 +308,19 @@ func ScheduleRepositoryAccessWithReader(db, readDB *sql.DB, repo models.Reposito
 			return false, err
 		}
 		if len(needed) == 0 {
-			return false, nil
+			// Every snapshot is indexed, but Restic snapshots may still need
+			// their diff marks before File History can show versions.
+			if repo.Engine != engines.ResticID {
+				return false, nil
+			}
+			marks, err := database.MetadataSnapshotsNeedingMarks(context.Background(), readDB, repo.ID)
+			if err != nil || len(marks) == 0 {
+				return false, err
+			}
+			request.accessNeededIDs = make([]string, 0, len(marks))
+			for _, need := range marks {
+				request.accessNeededIDs = append(request.accessNeededIDs, need.Snapshot.ID)
+			}
 		} else {
 			request.accessNeededIDs = make([]string, 0, len(needed))
 			for _, snapshot := range needed {
@@ -913,8 +925,12 @@ func SyncRepositoryContext(ctx context.Context, db *sql.DB, repo models.Reposito
 		return fmt.Errorf("managed vault UUID is required for metadata synchronization")
 	}
 	lockKey := repositoryLockKey(repo)
+	// The pause callback can run on another goroutine at any time while the
+	// lock is held, and repo is replaced below by the freshly read row. Give
+	// the callback its own copy so it never reads repo while it is written.
+	pausedRepo := repo
 	workContext, unlock, err := vaultlock.AcquireLowPrioritySharedContext(ctx, lockKey, func(paused bool) {
-		reportRepositoryPause(db, repo, paused)
+		reportRepositoryPause(db, pausedRepo, paused)
 	})
 	if err != nil {
 		return err
@@ -947,6 +963,16 @@ func syncRepositoryRecorded(ctx context.Context, db *sql.DB, repo models.Reposit
 	err := syncRepository(ctx, db, repo)
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return err
+	}
+	// When a yield or shutdown cancels ctx in the middle of a cache write,
+	// database/sql rolls the open transaction back on its own, and the next
+	// statement without a context, or the Commit, returns sql.ErrTxDone
+	// instead of a context error. That is the cancellation, not a broken
+	// vault: recording it would make File History refuse this vault's reads
+	// until the requeued refresh finishes. Return the context's error so the
+	// caller handles it as the yield it is.
+	if ctxErr := ctx.Err(); err != nil && ctxErr != nil {
+		return ctxErr
 	}
 	var refreshErr *repositoryRefreshError
 	if errors.As(err, &refreshErr) {
@@ -1059,7 +1085,12 @@ func syncRepositoryLocked(ctx context.Context, db *sql.DB, repo models.Repositor
 		if len(needed) == 0 {
 			// Entry-only work can make known headers ready, but it cannot certify
 			// that an unexplained generation gap contains no missing/deleted header.
-			return nil
+			// It still gives Restic snapshots their missing diff marks, for
+			// example after a backup between two others was deleted.
+			pending, marksErr := resticMarksPending(ctx, db, repo)
+			if marksErr != nil || !pending {
+				return marksErr
+			}
 		}
 	}
 	manager, resolveErr := resolveMetadataEngine(repo)
@@ -1202,6 +1233,20 @@ func syncRepositoryLocked(ctx context.Context, db *sql.DB, repo models.Repositor
 			uiDiagnostic.Snapshots = len(snapshots)
 			uiDiagnostic.PublicationSkipped = true
 			headerPublicationPhase.finish(headerPublicationDiagnostic)
+			// Unchanged headers with every snapshot listed can still leave a
+			// snapshot without marks against its current neighbour, for
+			// example when an earlier refresh stopped (cancelled, or
+			// Replicaro closed) after storing the listings but before their
+			// diffs ran. A removed backup doesn't come here: it changes the
+			// headers and takes the path below.
+			if err := indexResticMarks(ctx, db, manager, repo, snapshotIndexReadersPerRepository); err != nil {
+				// A cancelled ctx can surface as sql.ErrTxDone from the marks
+				// write; report the cancellation instead, as the path below does.
+				if ctxErr := ctx.Err(); ctxErr != nil {
+					return ctxErr
+				}
+				return err
+			}
 			if err := closeIndexSession(); err != nil {
 				return &repositoryRefreshError{err: err}
 			}
@@ -1347,6 +1392,20 @@ func syncRepositoryLocked(ctx context.Context, db *sql.DB, repo models.Repositor
 	uiDiagnostic.ReusedEntrySets = entryDiagnostic.ReusedEntrySets
 	if persistenceErr != nil {
 		return persistenceErr
+	}
+	// Restic marks need the snapshots' file rows, so they come after the
+	// listings. A failed listing doesn't stop the marks of the others.
+	if err := indexResticMarks(ctx, db, manager, repo, readerLimit); err != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		var native *engineError
+		if !errors.As(err, &native) {
+			return err
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
 	}
 	if err := closeIndexSession(); err != nil {
 		return errors.Join(err,

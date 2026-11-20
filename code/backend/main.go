@@ -1194,6 +1194,9 @@ func run() (result error) {
 		return errors.Join(fmt.Errorf("prepare startup Kopia policy verification: %w", err), rollbackErr)
 	}
 	stopMetadata := metadata.StartContext(db)
+	// The one remote refresh startup begins on its own: vaults whose File
+	// History cache is from an older version are indexed again, once.
+	metadata.ScheduleOutdatedCacheRebuilds(db)
 	stopStatistics := vaultstatistics.StartContext(applicationCtx, db)
 
 	// Establish every request-admitted worker lifecycle before HTTP publication.
@@ -1291,9 +1294,15 @@ func run() (result error) {
 		rcloneAuthErr := closeRcloneAuth()
 		return errors.Join(unpublishErr, shutdownErr, rcloneAuthErr)
 	})
-	// The tray labels and the Quit prompt use the saved UI language. The
-	// labels are read once, when Run sets up the tray; the prompt reads the
-	// setting each time it opens.
+	// The tray icon follows the dashboard's "Active now" list and Issues
+	// count. It reads them through the same read pool as the dashboard, once
+	// when Run sets up the tray and again after each database write that can
+	// change them; without a tray the notice does nothing.
+	desktop.WatchDashboard(readDB)
+	database.NotifyDashboardChanges(desktop.DashboardChanged)
+	// The tray labels, the tray tooltips and the Quit prompt use the saved UI
+	// language. The labels and tooltips are read once, when Run sets up the
+	// tray; the prompt reads the setting each time it opens.
 	desktop.SetText(func() func(key string) string { return savedLanguageLookup(db) })
 	serveErr := desktop.Run(func() error {
 		serviceStarted.Store(true)

@@ -20,16 +20,24 @@ var (
 )
 
 func tintedNotificationPNG(source []byte, status string) ([]byte, error) {
-	decoded, err := png.Decode(bytes.NewReader(source))
-	if err != nil {
-		return nil, err
-	}
 	tint := notificationFailureColor
 	if status == "success" {
 		tint = notificationSuccessColor
 	}
 	if status == "completed_with_issues" {
 		tint = notificationWarningColor
+	}
+	return tintPNG(source, tint)
+}
+
+// tintPNG paints every pixel of the PNG source in tint and keeps its alpha.
+// Replicaro's icon is a single colour on a transparent background, so this
+// gives the same shape in another colour. The notification icons and the
+// tray state icons are made this way.
+func tintPNG(source []byte, tint color.NRGBA) ([]byte, error) {
+	decoded, err := png.Decode(bytes.NewReader(source))
+	if err != nil {
+		return nil, err
 	}
 	bounds := decoded.Bounds()
 	tinted := image.NewNRGBA(bounds)

@@ -71,18 +71,27 @@ function plural(count: number, singular: string, pluralForm = `${singular}s`) {
     return `${count} ${count === 1 ? singular : pluralForm}`;
 }
 
+// Sizes in readable log lines use decimal units and the rounding of the
+// Protect cards and of the backend's sizes (sizeDisplay.ts readableSize,
+// engines.FormatBytes): one decimal below 10, none from 10 up ("1.2 GB",
+// "47 GB"). The log stays English whatever the page's language, so the number
+// is formatted for "en" with no thousands separator rather than through the
+// page's locale. Engine text that the readable view shows as printed keeps
+// the engine's own units; only the lines worded here use this.
+const logSizeUnits = ["KB", "MB", "GB", "TB", "PB"];
+
 function readableBytes(bytes: number) {
-    if (bytes < 1024) return plural(bytes, "byte");
-    const units = ["KiB", "MiB", "GiB", "TiB", "PiB"];
+    if (bytes < 1000) return plural(bytes, "byte");
     let value = bytes;
     let unit = "bytes";
-    for (const candidate of units) {
-        value /= 1024;
+    for (const candidate of logSizeUnits) {
+        value /= 1000;
         unit = candidate;
-        if (value < 1024) break;
+        if (value < 1000) break;
     }
-    const rounded = value >= 100 ? value.toFixed(0) : value >= 10 ? value.toFixed(1) : value.toFixed(2);
-    return `${rounded.replace(/\.0+$/, "")} ${unit}`;
+    const digits = value >= 10 ? 0 : 1;
+    const rounded = new Intl.NumberFormat("en", { minimumFractionDigits: digits, maximumFractionDigits: digits, useGrouping: false }).format(value);
+    return `${rounded} ${unit}`;
 }
 
 function readableDuration(seconds: number) {

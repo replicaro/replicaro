@@ -21,6 +21,9 @@ type CreateRepositoryRequest struct {
 	MaintenanceSchedule  string                    `json:"maintenanceSchedule"`
 	ConcurrencyMode      string                    `json:"concurrencyMode"`
 	ObjectLock           models.ObjectLockSettings `json:"objectLock"`
+	// ECCOverheadPercent is the requested Kopia error correction overhead; 0
+	// (or the field left out) means off.
+	ECCOverheadPercent int `json:"eccOverheadPercent,omitempty"`
 }
 
 type RepositoryScheduleRequest struct {

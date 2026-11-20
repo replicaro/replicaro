@@ -11,5 +11,6 @@ int ReplicaroNotificationCapability(void);
 void ReplicaroShowStartupFailure(const char *message);
 int ReplicaroConfirmStartupRepair(const char *message, const char *repairTitle, const char *declineTitle);
 int ReplicaroConfirmQuit(const char *message, const char *quitTitle, const char *cancelTitle);
+void ReplicaroSetStatusState(int state, const void *png, int length);
 
 #endif

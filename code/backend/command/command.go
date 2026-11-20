@@ -352,6 +352,28 @@ func RunCaptured(ctx context.Context, path string, args, env []string, timeout t
 	return capture, diagnostic, runErr
 }
 
+// RunStreamingStdout sends the command's standard output only to stdout, as
+// it arrives. Nothing of it is kept in memory, captured, returned or shown as
+// live output; standard error is handled as for Run, live output included.
+// The returned text is that diagnostic standard error.
+//
+// A write error from stdout ends the engine the way cancelling ctx does: the
+// process tree gets SIGTERM, then SIGKILL after the usual grace period. Until
+// it has exited, the rest of its standard output is still read and thrown
+// away; nothing more goes to stdout. The pipe is deliberately not closed:
+// an engine that writes to a closed pipe dies of SIGPIPE before it handles the
+// SIGTERM, and Restic then leaves its repository lock behind. The write error
+// is returned as an OutputProcessingFailure even when the engine then exits
+// successfully, because what it wrote was not all delivered; it is not
+// reported as a cancellation. Cancelling ctx still ends the process tree as
+// usual.
+func RunStreamingStdout(ctx context.Context, path string, args, env []string, timeout time.Duration, engine string, stdout io.Writer) (string, error) {
+	if stdout == nil {
+		return "", &Error{Engine: engine, Err: fmt.Errorf("standard output destination is required")}
+	}
+	return runWithInput(ctx, path, args, childProcess{env: nativeEnvironment(env), stdout: stdout}, "", timeout, engine, false, false, nil, nil)
+}
+
 // RunWithInputSecretsPrivateOutput is for commands whose standard output is
 // sensitive data. On failure, neither output stream is returned or included in
 // the public error.
@@ -404,10 +426,12 @@ func RunDiscardOutput(ctx context.Context, path string, args []string, dir strin
 // childProcess is what a child gets besides its arguments: its environment
 // (nil inherits all of Replicaro's) and its working directory (empty keeps
 // Replicaro's). Engine and rclone children always get a non-nil environment
-// from nativeEnvironment.
+// from nativeEnvironment. A non-nil stdout receives the standard output
+// instead of the in-memory buffer (RunStreamingStdout).
 type childProcess struct {
-	env []string
-	dir string
+	env    []string
+	dir    string
+	stdout io.Writer
 }
 
 func runWithInput(ctx context.Context, path string, args []string, child childProcess, input string, timeout time.Duration, engine string, privateOutput, discardOutput bool, observeStderr func([]byte) error, captured *CapturedOutput) (string, error) {
@@ -447,6 +471,11 @@ func runWithInput(ctx context.Context, path string, args []string, child childPr
 	stderr := newHeadTailDiagnosticBuffer(stderrLimit)
 	var stdoutDestination io.Writer = stdout
 	var stderrDestination io.Writer = stderr
+	streaming := child.stdout != nil
+	var streamErr error
+	if streaming {
+		stdoutDestination = child.stdout
+	}
 	if captured != nil {
 		stderr = newHeadTailDiagnosticBuffer(maxCapturedDiagnosticBytes)
 		stdoutDestination = io.MultiWriter(captured.stdout, stdout)
@@ -471,10 +500,12 @@ func runWithInput(ctx context.Context, path string, args []string, child childPr
 		if live != nil {
 			// Raw buffers stay first in each tee. The engine's output is kept as-is; the
 			// live writers only split it into bounded, complete records for display.
-			liveStdout = newLiveRecordWriter("stdout", live)
 			liveStderr = newLiveRecordWriter("stderr", live)
-			stdoutDestination = io.MultiWriter(stdoutDestination, liveStdout)
 			stderrDestination = io.MultiWriter(stderrDestination, liveStderr)
+			if !streaming {
+				liveStdout = newLiveRecordWriter("stdout", live)
+				stdoutDestination = io.MultiWriter(stdoutDestination, liveStdout)
+			}
 		}
 	}
 	// Own both ends of the output pipes. Cmd.StdoutPipe/Cmd.StderrPipe are
@@ -517,6 +548,11 @@ func runWithInput(ctx context.Context, path string, args []string, child childPr
 	// close its copies so readers observe EOF after the process group exits.
 	_ = stdoutWriter.Close()
 	_ = stderrWriter.Close()
+	// stopContext ends the process tree like commandContext does, and also when
+	// a streamed stdout destination fails. It is separate so that failure is
+	// not reported as a cancellation of the command.
+	stopContext, stopForOutput := context.WithCancel(commandContext)
+	defer stopForOutput()
 	readDone := make(chan struct{})
 	go func() {
 		defer close(readDone)
@@ -524,7 +560,18 @@ func runWithInput(ctx context.Context, path string, args []string, child childPr
 		copies.Add(2)
 		go func() {
 			defer copies.Done()
-			_, _ = io.Copy(stdoutDestination, stdoutPipe)
+			_, copyErr := io.Copy(stdoutDestination, stdoutPipe)
+			if streaming && copyErr != nil {
+				// Only the destination can fail here: a read error on our own
+				// pipe ends at EOF once the process tree is gone. End the
+				// engine, and keep reading until it has exited. Do not close
+				// the pipe instead: the engine's next write would kill it with
+				// SIGPIPE before it handles SIGTERM, and Restic would leave its
+				// lock in the repository.
+				streamErr = copyErr
+				stopForOutput()
+				_, _ = io.Copy(io.Discard, stdoutPipe)
+			}
 			if liveStdout != nil {
 				liveStdout.flush()
 			}
@@ -574,7 +621,7 @@ func runWithInput(ctx context.Context, path string, args []string, child childPr
 		if contextErr := commandContext.Err(); contextErr != nil {
 			err = contextErr
 		}
-	case <-commandContext.Done():
+	case <-stopContext.Done():
 		select {
 		case result := <-waitResult:
 			err = result.err
@@ -664,6 +711,9 @@ func runWithInput(ctx context.Context, path string, args []string, child childPr
 	if captured == nil && stdout.truncated {
 		outputErr = errors.Join(outputErr, ErrOutputLimitExceeded)
 	}
+	if streamErr != nil {
+		outputErr = errors.Join(outputErr, fmt.Errorf("write standard output: %w", streamErr))
+	}
 	raw := stdout.buffer.String()
 	diagnosticStdout := ""
 	if !privateOutput {
@@ -695,7 +745,7 @@ func runWithInput(ctx context.Context, path string, args []string, child childPr
 	// We have found nothing in the normal (non-private) pinned Restic and Kopia
 	// commands that prints passwords or keys, so their output is returned
 	// unmodified. Only the public support-report copy is redacted.
-	if captured != nil {
+	if captured != nil || streaming {
 		return diagnostic, nil
 	}
 	return raw, nil

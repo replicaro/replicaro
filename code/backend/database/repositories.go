@@ -67,7 +67,7 @@ const repoColumns = `
 	vault_size_bytes, vault_size_measured_at, vault_size_dirty, vault_size_last_attempt_at,
 	check_schedule, next_check, last_check, last_check_status,
 	maintenance_schedule, object_lock_json, next_maintenance, last_maintenance,
-	last_maintenance_status, concurrency_mode, auto_unlock, created_at,
+	last_maintenance_status, concurrency_mode, auto_unlock, created_at, ecc_overhead_percent,
 	EXISTS (SELECT 1 FROM vault_reconnect_state s
 		WHERE s.repository_id = repositories.id AND s.reconnect_required = 1)`
 
@@ -117,6 +117,7 @@ func scanRepo(scan func(dest ...any) error) (models.Repository, error) {
 		&r.ConcurrencyMode,
 		&r.AutoUnlock,
 		&r.CreatedAt,
+		&r.ECCOverheadPercent,
 		&r.ReconnectRequired,
 	)
 	if err != nil {

@@ -34,6 +34,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/api/download.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/api/file_history.go",
       "mode": "100644"
     },
@@ -302,6 +306,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/database/dashboard_change.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/database/dashboard_timeline.go",
       "mode": "100644"
     },
@@ -355,6 +363,10 @@
     },
     {
       "path": "code/backend/database/metadata_store.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/database/metadata_versions.go",
       "mode": "100644"
     },
     {
@@ -522,6 +534,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/backend/desktop/tray_state.go",
+      "mode": "100644"
+    },
+    {
       "path": "code/backend/desktop/windows_toast.go",
       "mode": "100644"
     },
@@ -629,6 +645,10 @@
     },
     {
       "path": "code/backend/engines/concurrency.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/download.go",
       "mode": "100644"
     },
     {
@@ -753,6 +773,10 @@
     },
     {
       "path": "code/backend/engines/restic.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/engines/restic_diff.go",
       "mode": "100644"
     },
     {
@@ -929,6 +953,14 @@
     },
     {
       "path": "code/backend/metadata/cache.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/metadata/marks.go",
+      "mode": "100644"
+    },
+    {
+      "path": "code/backend/metadata/upgrade.go",
       "mode": "100644"
     },
     {
@@ -1721,6 +1753,10 @@
       "mode": "100644"
     },
     {
+      "path": "code/frontend/src/components/FileDownloadButton.tsx",
+      "mode": "100644"
+    },
+    {
       "path": "code/frontend/src/components/FloatingTooltip.tsx",
       "mode": "100644"
     },
@@ -1742,6 +1778,10 @@
     },
     {
       "path": "code/frontend/src/components/MetadataIndexNotice.tsx",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/components/MultilineSelect.tsx",
       "mode": "100644"
     },
     {
@@ -1858,6 +1898,10 @@
     },
     {
       "path": "code/frontend/src/services/vaultPassword.ts",
+      "mode": "100644"
+    },
+    {
+      "path": "code/frontend/src/sizeDisplay.ts",
       "mode": "100644"
     },
     {

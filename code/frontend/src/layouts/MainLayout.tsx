@@ -208,7 +208,7 @@ export default function MainLayout() {
                     const row = <button type="button" key={job.id} className="job-picker-row" aria-label={!job.enabled ? job.name : undefined} disabled={!job.enabled || Boolean(runningSelection) || allActive} onClick={() => {
                         if (!job.enabled || runOwner.current) return;
                         if (job.targets.length > 1) setSelectedJobID(job.id); else void startBackup(job);
-                    }}><span><strong>{job.name}</strong><span className="mono faint">{displayPath(jobCurrentSource(job))} · {t("ui.backup.destinationVaultCount", { count: job.targets.length })}</span></span><Icon name="play" size={14} /></button>;
+                    }}><span><strong>{job.name}</strong><span className="mono faint"><bdi dir="ltr">{displayPath(jobCurrentSource(job))}</bdi> · {t("ui.backup.destinationVaultCount", { count: job.targets.length })}</span></span><Icon name="play" size={14} /></button>;
                     return job.enabled ? row : <Tooltip key={job.id} content={t("ui.backup.disabledJobHelp")}><span className="job-picker-disabled-tooltip" tabIndex={0} aria-label={t("ui.backup.disabledNamedJobHelp", { jobName: job.name })}>{row}</span></Tooltip>;
                 })}</div>}
             </>}

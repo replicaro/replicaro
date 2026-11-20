@@ -831,9 +831,9 @@ type kopiaSnapshotIndexSession struct {
 
 // kopiaFileRootEntry builds the single index entry of a file-root snapshot
 // from the rootEntry that `snapshot list --json` printed for it: the file's
-// mode and size, with an empty path because the file is the root itself. The
-// cache stores no modified time and no name for a root entry, so mtime and
-// the name are only validated.
+// mode, size, modified time and object ID, with an empty path because the
+// file is the root itself. The cache stores no name for a root entry, so the
+// name is only validated.
 //
 // The entry can't come from a listing: `kopia list <file object>` fails with
 // "is not a directory object", and `show` on a file object would read the
@@ -865,9 +865,10 @@ func kopiaFileRootEntry(raw json.RawMessage) (models.SnapshotEntry, error) {
 }
 
 // kopiaFileRootIdentity is the entry-set reuse key of a file-root snapshot:
-// the root object plus the native mode. Kopia keeps the same object ID when
-// only the file's permissions change, so the object alone would reuse an
-// entry set carrying the old mode. The name is not part of the key because
+// the root object plus the native mode and modified time. Kopia keeps the
+// same object ID when only the file's permissions or modified time change, so
+// the object alone would reuse an entry set carrying the old mode, or the old
+// time that File History shows for the file's version. The name is not part of the key because
 // the cache does not store it. A missing mode gives an empty mode here, and
 // kopiaFileRootEntry indexes that file with mode 0. A mode that isn't a JSON
 // string also gives an empty mode here, and a string that isn't octal is kept
@@ -880,10 +881,11 @@ func kopiaFileRootEntry(raw json.RawMessage) (models.SnapshotEntry, error) {
 // re-indexes them.
 func kopiaFileRootIdentity(object string, raw json.RawMessage) string {
 	var root struct {
-		Mode string `json:"mode"`
+		Mode  string `json:"mode"`
+		Mtime string `json:"mtime"`
 	}
 	_ = json.Unmarshal(raw, &root)
-	return "f:" + object + ":" + root.Mode
+	return "f:" + object + ":" + root.Mode + ":" + root.Mtime
 }
 
 func (s *kopiaSnapshotIndexSession) Snapshots() []SnapshotIndexItem { return s.snapshots }
@@ -1837,6 +1839,16 @@ func kopiaStorageArgs(repo models.Repository, operation string) ([]string, error
 			}
 			common = append(common, "--retention-mode", strings.ToUpper(repo.ObjectLock.Mode),
 				"--retention-period", period)
+		}
+		// --ecc-overhead-percent alone turns on Kopia's error correction with
+		// its only algorithm, REED-SOLOMON-CRC32; --ecc alone would not turn it
+		// on, so it is never passed. Off means no flag at all, leaving Kopia's
+		// default of no error correction.
+		if repo.ECCOverheadPercent != 0 {
+			if err := models.ValidateRequestedECCOverheadPercent(repo.Engine, repo.ECCOverheadPercent); err != nil {
+				return nil, err
+			}
+			common = append(common, "--ecc-overhead-percent="+strconv.Itoa(repo.ECCOverheadPercent))
 		}
 	}
 	options := repo.ConnectorOptions

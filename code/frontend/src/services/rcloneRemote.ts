@@ -53,6 +53,17 @@ export function ltrIsolate(value: string) {
 	return value.split("\n").map((line) => `\u2066${line}\u2069`).join("\n");
 }
 
+// The same for a value whose direction is its own, such as a failure reason
+// that is English text from Replicaro or an engine when nothing translated
+// it, or a job name, which can be in any script: a first-strong isolate
+// (U+2068 ... U+2069) keeps it one piece and lays it out in the direction of
+// its first letter that has one, so English reads left to right and Hebrew
+// or Arabic right to left.
+export function firstStrongIsolate(value: string) {
+	if (!isRightToLeft()) return value;
+	return value.split("\n").map((line) => `\u2068${line}\u2069`).join("\n");
+}
+
 // The values a coded Any Rclone Remote error carries next to its English text.
 export interface RcloneRemoteErrorFields {
 	configFile?: string;

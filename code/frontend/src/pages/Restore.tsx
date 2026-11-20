@@ -1,11 +1,13 @@
-import { formatDisplayDate, formatDisplayNumber, formatDisplayTime, renderMessage, t } from "../i18n";
+import { formatDisplayDate, formatDisplayDateTime, formatDisplayNumber, formatDisplayTime, renderMessage, t } from "../i18n";
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
 
 import { displayPath, resticArchiveDisplayPath, resticNativeAddress } from "../nativePathDisplay";
+import { firstStrongIsolate, ltrIsolate } from "../services/rcloneRemote";
 import { jobSourceTooltip, managedSnapshotJob, pathWithinJob } from "../jobSourceDisplay";
 import { JobSourceLabel } from "../components/JobSourceLabel";
 import { DirectoryField } from "../components/DirectoryPicker";
+import { FileDownloadButton } from "../components/FileDownloadButton";
 import { PaginationControls } from "../components/ListControls";
 import { MetadataIndexNotice } from "../components/MetadataIndexNotice";
 import { EmptyState, Icon, Loading, Modal, parseTime, Tooltip, useToast } from "../components/ui";
@@ -88,11 +90,31 @@ function snapshotTime(value: string) {
     return date ? formatDisplayTime(date, { hour: "2-digit", minute: "2-digit" }) : "—";
 }
 
+// A browsed item's modified time, with the same date and time fields as the
+// backup times above it. It is the modified time the engine lists for the
+// item; for a folder, Restic's is the folder's own time and Kopia's is the
+// newest time within it. An empty or unreadable one shows nothing.
+function entryModified(value: string) {
+	const date = value ? parseTime(value) : null;
+	return date ? formatDisplayDateTime(date, { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" }) : "";
+}
+
 // A managed snapshot's source is shown as its job's name (see
-// jobSourceDisplay.ts); unmanaged snapshots keep their recorded paths.
+// jobSourceDisplay.ts); unmanaged snapshots keep their recorded paths. The
+// size, like a path, reads left to right on a right-to-left page ("2.2 MB").
+// A job name can be in any script, so it is isolated in the direction of its
+// own text; left open, a Latin name would pull the Latin time marker before it
+// ("AM") into its run on a Hebrew page.
 function snapshotMeta(snapshot: Snapshot, job?: BackupJob) {
-	const sources = job ? job.name : snapshotSourceLabel(snapshot);
-    return t("ui.restore.snapshotMeta", { date: fullDate(snapshot.timestamp), time: snapshotTime(snapshot.timestamp), size: snapshot.size || t("ui.restore.sizeUnknown"), sources });
+	const sources = job ? firstStrongIsolate(job.name) : ltrIsolate(snapshotSourceLabel(snapshot));
+    return t("ui.restore.snapshotMeta", { date: fullDate(snapshot.timestamp), time: snapshotTime(snapshot.timestamp), size: snapshot.size ? ltrIsolate(snapshot.size) : t("ui.restore.sizeUnknown"), sources });
+}
+
+// The backup ID that ends the browse dialog's header line. It is Latin
+// letters and digits, isolated left to right on a right-to-left page so it
+// stays one piece and does not join the text before it into one run.
+function snapshotShortID(snapshot: Snapshot) {
+	return ltrIsolate(snapshot.id.slice(0, 12));
 }
 
 function snapshotSourceLabel(snapshot: Snapshot) {
@@ -145,10 +167,10 @@ const SnapshotRow = memo(function SnapshotRow({ snapshot, job, ready, actions }:
 	return <article className="snapshot-row" data-snapshot-id={snapshot.id}>
 		<span className="snapshot-machine" title={snapshot.machineLabel || undefined}>{snapshot.machineLabel || t("ui.restore.unknownComputer")}</span>
 		<time>{snapshotTime(snapshot.timestamp)}</time>
-		{job ? <JobSourceLabel job={job} className="snapshot-source" /> : <span className="snapshot-source">{snapshotSourceLabel(snapshot)}</span>}
-		<span className="snapshot-size">{snapshot.size || "—"}</span>
+		{job ? <JobSourceLabel job={job} className="snapshot-source" /> : <span className="snapshot-source"><bdi dir="ltr">{snapshotSourceLabel(snapshot)}</bdi></span>}
+		<span className="snapshot-size">{snapshot.size ? <bdi dir="ltr">{snapshot.size}</bdi> : "—"}</span>
 		<span className="snapshot-actions">{snapshotRoots(snapshot).map((root) => {
-			const label = `${t("ui.pages.restore.browse")}${snapshotRoots(snapshot).length > 1 ? ` ${snapshotRootLabel(root)}` : ""}`;
+			const label = `${t("ui.pages.restore.browse")}${snapshotRoots(snapshot).length > 1 ? ` ${ltrIsolate(snapshotRootLabel(root))}` : ""}`;
 			// A root that is a single file has no folder to browse; the whole
 			// restore below restores it. Kopia's header says so for its one
 			// root, and the indexed entries say so for every root (Restic's
@@ -978,8 +1000,8 @@ function RestoreRoute() {
             {browsing && (
                 <Modal title={t("ui.pages.restore.snapshot")} wide onClose={closeBrowse}>
 					{browsingJob
-						? <Tooltip content={jobSourceTooltip(browsingJob)}><div className="snapshot-modal-meta mono" aria-label={snapshotMeta(browsing.snapshot, browsingJob)}>{snapshotMeta(browsing.snapshot, browsingJob)} · {browsing.snapshot.id.slice(0, 12)}</div></Tooltip>
-						: <div className="snapshot-modal-meta mono">{snapshotMeta(browsing.snapshot)} · {browsing.snapshot.id.slice(0, 12)}</div>}
+						? <Tooltip content={jobSourceTooltip(browsingJob)}><div className="snapshot-modal-meta mono" aria-label={snapshotMeta(browsing.snapshot, browsingJob)}>{snapshotMeta(browsing.snapshot, browsingJob)} · {snapshotShortID(browsing.snapshot)}</div></Tooltip>
+						: <div className="snapshot-modal-meta mono">{snapshotMeta(browsing.snapshot)} · {snapshotShortID(browsing.snapshot)}</div>}
                     <div className="browse-crumbs">
 						{browsingJob
 							? <Tooltip content={jobSourceTooltip(browsingJob)}><button aria-label={browsingJob.name} onClick={() => openBrowse(browsing.snapshot, browsing.root, "")}><span className="job-source-name">{browsingJob.name}</span></button></Tooltip>
@@ -990,22 +1012,56 @@ function RestoreRoute() {
 						{browsePath && <button className="file-up" onClick={() => openBrowse(browsing.snapshot, browsing.root, crumbs.slice(0, -1).join("/"))}><Icon name="arrowUp" size={16} /><span>{t("ui.pages.restore.up.one.directory")}</span></button>}
                         {entries === null && <Loading />}
                         {entries !== null && entries.length === 0 && <p className="muted file-empty">{t("ui.pages.restore.this.directory.is.empty")}</p>}
-                        {(entries ?? []).map((entry) => {
+						{/* A static ARIA table, so screen readers announce each cell's
+						    column; it adds no keyboard model of its own, and Tab still
+						    moves through the folder, Restore file and Download buttons. The
+						    actions column has no visible header and is left out of the
+						    header row for assistive technology. */}
+						{entries !== null && entries.length > 0 && <div className="file-table" role="table">
+							<div className="file-header" role="row">
+								<span role="columnheader">{t("ui.restore.columnName")}</span>
+								<span role="columnheader">{t("ui.restore.columnModified")}</span>
+								<span role="columnheader">{t("ui.pages.restore.size")}</span>
+								<span aria-hidden="true" />
+							</div>
+                        {entries.map((entry) => {
                             const childPath = browsePath ? `${browsePath}/${entry.name}` : entry.name;
 							const nativePath = repos?.find((repo) => repo.id === selected)?.engine === "restic" ? resticNativeAddress(browsing.root.path, childPath) : childPath;
 							const displayNative = browsing.root.path === "/" && repos?.find((repo) => repo.id === selected)?.engine === "restic"
 								? resticArchiveDisplayPath(nativePath, browsing.snapshot.source) : nativePath;
 							const displayName = displayNative !== nativePath && !childPath.includes("/") ? displayNative : entry.name;
+							const restoreFile = <button className="restore-file" onClick={() => { openRestore(browsing.snapshot, childPath, browsing.root.nativeRootId); closeBrowse(); }}>{t("ui.pages.restore.restore.file")}</button>;
+							// "Restore file | Download": Download is offered for a regular
+							// file only (a symlink keeps "Restore file" alone) and never in a
+							// Cold Storage vault; SnapshotEntry in types.ts says why. It names
+							// the file the way the restore does: this backup, this native root
+							// and the path under it.
+							const downloadable = entry.regularFile && !selectedRepository?.coldStorage;
                             return (
-                                <div key={childPath} title={browsingJob ? pathWithinJob(childPath, browsing.root.path) : `${displayNative}\n${t("ui.restore.backupSourceTooltip", { source: browsing.root.path })}\n${t("ui.restore.snapshotPathTooltip", { path: nativePath })}`} className={`file-row ${entry.isDir ? "folder" : "file"}`}>
-                                    <Icon name={entry.isDir ? "folder" : "file"} size={15} />
-								{entry.isDir ? <button onClick={() => openBrowse(browsing.snapshot, browsing.root, childPath)}>{displayName}</button> : <span>{displayName}</span>}
-								{!entry.isDir && <span>{entry.size}</span>}
-								{!entry.isDir && <button className="restore-file" onClick={() => { openRestore(browsing.snapshot, childPath, browsing.root.nativeRootId); closeBrowse(); }}>{t("ui.pages.restore.restore.file")}</button>}
+                                <div key={childPath} role="row" title={browsingJob ? ltrIsolate(pathWithinJob(childPath, browsing.root.path)) : `${ltrIsolate(displayNative)}\n${t("ui.restore.backupSourceTooltip", { source: ltrIsolate(browsing.root.path) })}\n${t("ui.restore.snapshotPathTooltip", { path: ltrIsolate(nativePath) })}`} className={`file-row ${entry.isDir ? "folder" : "file"}`}>
+									<span role="cell" className="file-name">
+										<Icon name={entry.isDir ? "folder" : "file"} size={15} />
+										{entry.isDir ? <button onClick={() => openBrowse(browsing.snapshot, browsing.root, childPath)}>{displayName}</button> : <span>{displayName}</span>}
+									</span>
+									<span role="cell" className="file-modified">{entryModified(entry.modified)}</span>
+									<span role="cell" className="file-size">{entry.isDir ? "" : <bdi dir="ltr">{entry.size}</bdi>}</span>
+									<div role="cell" className="file-actions">
+										{!entry.isDir && !downloadable && restoreFile}
+										{!entry.isDir && downloadable && <div className="file-row-actions">
+											{restoreFile}
+											<span className="file-row-actions-separator" aria-hidden="true">|</span>
+											<FileDownloadButton
+												className="restore-file"
+												target={{ repositoryId: selected, snapshotId: browsing.snapshot.id, nativeRootId: browsing.root.nativeRootId, path: childPath }}
+												label={t("ui.download.actionNamed", { name: displayName })}
+											/>
+										</div>}
+									</div>
                                 </div>
                             );
                         })}
-						{browseMore.hasMore && <button type="button" className="btn browse-load-more" disabled={browseMore.loading} onClick={loadMoreBrowseEntries}>{browseMore.loading && <span className="spinner" />}{t("ui.fileHistory.loadMoreIn", { folder: browseFolderLabel })}</button>}
+						</div>}
+						{browseMore.hasMore && <button type="button" className="btn browse-load-more" disabled={browseMore.loading} onClick={loadMoreBrowseEntries}>{browseMore.loading && <span className="spinner" />}{t("ui.fileHistory.loadMoreIn", { folder: ltrIsolate(browseFolderLabel) })}</button>}
                     </div>
                     <div className="modal-footer browse-footer">
 						{/* While more pages remain, the loaded count isn't the folder total; the Load more button says more exist. */}
@@ -1025,14 +1081,14 @@ function RestoreRoute() {
 					<label className="field">
 						<span>{restoringFileRoot ? t("ui.pages.restore.destination.file") : t("ui.pages.restore.destination.folder")}</span>
 						{restoringFileRoot
-							? <input value={restoreTarget} onChange={(event) => setRestoreTarget(event.target.value)} aria-label={t("ui.pages.restore.destination.file")} />
+							? <input dir="ltr" value={restoreTarget} onChange={(event) => setRestoreTarget(event.target.value)} aria-label={t("ui.pages.restore.destination.file")} />
 							: <DirectoryField value={restoreTarget} onChange={setRestoreTarget} ariaLabel={t("ui.pages.restore.destination.folder")} placeholder={restoringKopiaSelectedFile ? t("ui.restore.chooseExistingFolder") : undefined} />}
 						{restoringFileRoot && <small>{t("ui.pages.restore.enter.the.full.destination.path.including.the.filename")}</small>}
                     </label>
                     {(restoreCapability(repos?.find((repo) => repo.id === restoring.repositoryId), engines)?.conflictModes.length ?? 0) > 1 &&
 						<label className="field restore-conflict-field"><span>{t("ui.pages.restore.should.existing.files.in.destination.be.overwritten")}</span><select value={conflictMode} onChange={(event) => setConflictMode(event.target.value)}>{restoreCapability(repos?.find((repo) => repo.id === restoring.repositoryId), engines)?.conflictModes.map((mode) => <option key={mode.id} value={mode.id}>{restoreConflictModeLabel(mode)}</option>)}</select></label>}
 					</fieldset>
-					{nameRefusalFolder !== null && <div className="inline-error" role="alert">{t("ui.restore.selectionNameInvalid")}{nameRefusalFolder && <> <button type="button" className="btn" disabled={restoreBusy} onClick={restoreContainingFolder}>{t("ui.restore.restoreContainingFolder")}</button> <strong className="mono">/{nameRefusalFolder}</strong></>}</div>}
+					{nameRefusalFolder !== null && <div className="inline-error" role="alert">{t("ui.restore.selectionNameInvalid")}{nameRefusalFolder && <> <button type="button" className="btn" disabled={restoreBusy} onClick={restoreContainingFolder}>{t("ui.restore.restoreContainingFolder")}</button> <strong className="mono"><bdi dir="ltr">/{nameRefusalFolder}</bdi></strong></>}</div>}
 					<div className="modal-footer"><button className="btn" disabled={restoreBusy} onClick={dismissRestore}>{t("ui.pages.restore.cancel")}</button><button className="btn primary" disabled={restoreBusy || !restoreTarget} onClick={() => void doRestore()}>{restoreBusy && <span className="spinner" />}<Icon name="restore" size={14} />{t("ui.pages.restore.restore")}</button></div>
                 </Modal>
             )}

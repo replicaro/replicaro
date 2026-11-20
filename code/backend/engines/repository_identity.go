@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/local/replicaro/appdata"
@@ -127,22 +128,8 @@ func RepositoryFingerprint(repo models.Repository, validationOutput string) (str
 		}
 	}
 	if repo.Engine == KopiaID {
-		candidates := []string{strings.TrimSpace(validationOutput)}
-		lines := strings.Split(validationOutput, "\n")
-		for index := len(lines) - 1; index >= 0; index-- {
-			line := strings.TrimSpace(lines[index])
-			if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
-				candidates = append(candidates, line)
-			}
-		}
-		for _, candidate := range candidates {
-			value, err := decodeUniqueJSON([]byte(candidate))
-			document, ok := value.(map[string]any)
-			uniqueID, _ := document["uniqueIDHex"].(string)
-			decoded, decodeErr := hex.DecodeString(uniqueID)
-			if err == nil && ok && decodeErr == nil && len(decoded) == sha256.Size && uniqueID == strings.ToLower(uniqueID) {
-				return uniqueID, nil
-			}
+		if document, ok := kopiaStatusDocument(validationOutput); ok {
+			return document["uniqueIDHex"].(string), nil
 		}
 		return "", fmt.Errorf("kopia native repository identity is unavailable")
 	}
@@ -152,6 +139,72 @@ func RepositoryFingerprint(repo models.Repository, validationOutput string) (str
 	}
 	hash := sha256.Sum256([]byte(repo.Engine + "\x00" + normalized))
 	return fmt.Sprintf("%x", hash[:]), nil
+}
+
+// kopiaStatusDocument finds the `kopia repository status --json` document in
+// a validation output. Validation returns the status JSON as one line, after
+// any output of the connect that came before it, so the whole output is tried
+// first and then each line that looks like a JSON object, last line first.
+// The document must carry a well-formed native repository ID, so another
+// JSON line can't be mistaken for the status.
+func kopiaStatusDocument(output string) (map[string]any, bool) {
+	candidates := []string{strings.TrimSpace(output)}
+	lines := strings.Split(output, "\n")
+	for index := len(lines) - 1; index >= 0; index-- {
+		line := strings.TrimSpace(lines[index])
+		if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
+			candidates = append(candidates, line)
+		}
+	}
+	for _, candidate := range candidates {
+		value, err := decodeUniqueJSON([]byte(candidate))
+		document, ok := value.(map[string]any)
+		uniqueID, _ := document["uniqueIDHex"].(string)
+		decoded, decodeErr := hex.DecodeString(uniqueID)
+		if err == nil && ok && decodeErr == nil && len(decoded) == sha256.Size && uniqueID == strings.ToLower(uniqueID) {
+			return document, true
+		}
+	}
+	return nil, false
+}
+
+// KopiaReportedECCOverheadPercent returns the error correction overhead in
+// the `kopia repository status --json` document of a validation output, 0
+// when error correction is off. It reads the status the caller's validation
+// already ran; it never runs Kopia.
+//
+// Pinned Kopia reports contentFormat.ecc ("REED-SOLOMON-CRC32") and
+// contentFormat.eccOverheadPercent only for a repository created with error
+// correction, and leaves both out otherwise. Kopia itself applies error
+// correction only when the overhead is above 0, whatever ecc says, so only
+// the overhead is read: absent or 0 is off. The value is kept as Kopia
+// reported it, including percentages the new-vault form doesn't offer, which
+// a repository created outside Replicaro can have.
+func KopiaReportedECCOverheadPercent(output string) (int, error) {
+	document, ok := kopiaStatusDocument(output)
+	if !ok {
+		return 0, fmt.Errorf("kopia repository status is unavailable")
+	}
+	format, ok := document["contentFormat"].(map[string]any)
+	if !ok {
+		return 0, fmt.Errorf("kopia repository status has no content format")
+	}
+	raw, present := format["eccOverheadPercent"]
+	if !present {
+		return 0, nil
+	}
+	number, ok := raw.(json.Number)
+	if !ok {
+		return 0, fmt.Errorf("kopia repository status has an invalid error correction overhead")
+	}
+	percent, err := strconv.ParseInt(number.String(), 10, 32)
+	if err != nil {
+		return 0, fmt.Errorf("kopia repository status has an invalid error correction overhead")
+	}
+	if percent < 0 {
+		return 0, nil
+	}
+	return int(percent), nil
 }
 
 // KopiaFormatUniqueID returns the repository's stable ID, as lowercase hex,

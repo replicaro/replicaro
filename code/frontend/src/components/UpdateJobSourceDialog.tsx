@@ -93,8 +93,8 @@ export function UpdateJobSourceDialog({
 		return (
 			<Modal title={fileSource ? t("ui.protect.sourceCheck.fileTitle") : t("ui.protect.sourceCheck.title")} onClose={close}>
 				<p className="modal-intro">{renderMessage("ui.protect.sourceCheck.selected", {
-					chosen: <strong key="chosen" className="mono">{check.chosen}</strong>,
-					current: <strong key="current" className="mono">{check.current}</strong>,
+					chosen: <strong key="chosen" className="mono"><bdi dir="ltr">{check.chosen}</bdi></strong>,
+					current: <strong key="current" className="mono"><bdi dir="ltr">{check.current}</bdi></strong>,
 				})}</p>
 				<p className="modal-intro">{reason}</p>
 				<p className="muted">{fileSource ? t("ui.protect.sourceCheck.fileGuidance") : t("ui.protect.sourceCheck.guidance")}</p>

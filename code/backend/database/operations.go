@@ -38,6 +38,7 @@ func StartOperation(
 	); err != nil {
 		return "", err
 	}
+	dashboardChanged()
 	return id, nil
 }
 
@@ -103,6 +104,7 @@ func QueueOperation(db *sql.DB, operation QueuedOperation, queuedAt time.Time) (
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
+	dashboardChanged()
 	return id, nil
 }
 
@@ -138,7 +140,11 @@ func ActivateQueuedOperation(db *sql.DB, operationID string) error {
 			return sql.ErrNoRows
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	dashboardChanged()
+	return nil
 }
 
 // RepositoryOperationTitle is the title of a check or maintenance record,
@@ -195,6 +201,7 @@ func StartRepositoryOperation(db *sql.DB, repo models.Repository, kind string, s
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
+	dashboardChanged()
 	return id, nil
 }
 
@@ -259,7 +266,11 @@ func FinishRepositoryOperation(db *sql.DB, operationID string, repo models.Repos
 		if count, _ := result.RowsAffected(); count != 1 {
 			return sql.ErrNoRows
 		}
-		return tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		dashboardChanged()
+		return nil
 	})
 }
 
@@ -290,7 +301,11 @@ func ActivateBackupOperation(db *sql.DB, operationID, jobID, repositoryID string
 	// and any supporting native commands; the runner resolves it only once storage
 	// is confirmed unavailable before the native backup, or the requested backup
 	// has been reached.
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	dashboardChanged()
+	return nil
 }
 
 func FinishBackupOperation(db *sql.DB, operationID, jobID, repositoryID, status, output string, finishedAt time.Time) error {
@@ -337,7 +352,11 @@ func FinishBackupOperationWithIssueKind(db *sql.DB, operationID, jobID, reposito
 		if count, _ := targetResult.RowsAffected(); count != 1 {
 			return sql.ErrNoRows
 		}
-		return tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		dashboardChanged()
+		return nil
 	})
 }
 
@@ -366,6 +385,7 @@ func FinishOperation(
 		if count, _ := result.RowsAffected(); count == 0 {
 			return nil
 		}
+		dashboardChanged()
 		return nil
 	})
 }
@@ -568,9 +588,16 @@ func PruneOperations(db *sql.DB, days int) error {
 	if err := closeRows(rows); err != nil {
 		return err
 	}
-	stuck := 0
+	stuck, deleted := 0, 0
 	var firstStuckID string
 	var firstStuckErr error
+	// The scheduler prunes on every tick, so the dashboard notice is sent only
+	// when a row was actually deleted, not on every call.
+	defer func() {
+		if deleted > 0 {
+			dashboardChanged()
+		}
+	}()
 	for _, id := range ids {
 		if err := removeOperationLog(id); err != nil {
 			// Skip this one and keep going. A log that can't be deleted (marked
@@ -589,6 +616,7 @@ func PruneOperations(db *sql.DB, days int) error {
 		if err := deleteExpiredOperation(db, id); err != nil {
 			return errors.Join(stuckOperationLogsError(stuck, firstStuckID, firstStuckErr), err)
 		}
+		deleted++
 	}
 	return stuckOperationLogsError(stuck, firstStuckID, firstStuckErr)
 }

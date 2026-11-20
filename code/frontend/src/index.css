@@ -138,6 +138,7 @@
     --ink: #0a0c10;
     --ok: #54e0a8;
     --warn: #f2c063;
+    --running: #3b82f6;
     --danger: #f0776f;
     --danger-hover: #f79790;
     --rule: rgba(255, 255, 255, 0.07);
@@ -201,6 +202,7 @@
     --ink: #ffffff;
     --ok: #0f7a4e;
     --warn: #8a6209;
+    --running: #1d5fd0;
     --danger: #c3352c;
     --danger-hover: #d84a3f;
     --rule: rgba(13, 60, 70, 0.13);
@@ -252,6 +254,7 @@
     --ink: #ffffff;
     --ok: #14653f;
     --warn: #8f5f06;
+    --running: #1d5fd0;
     --danger: #a52521;
     --danger-hover: #bf332d;
     --rule: rgba(16, 26, 26, 0.14);
@@ -303,6 +306,7 @@
         --ink: #ffffff;
         --ok: #0f7a4e;
         --warn: #8a6209;
+        --running: #1d5fd0;
         --danger: #c3352c;
         --danger-hover: #d84a3f;
         --rule: rgba(13, 60, 70, 0.13);
@@ -957,7 +961,7 @@ a.btn[aria-disabled="true"] {
 
 .protection-ring.ok { color: var(--ok); }
 .protection-ring.danger { color: var(--danger); }
-.protection-ring.running { color: var(--warn); }
+.protection-ring.running { color: var(--running); }
 button.protection-ring { cursor: pointer; }
 
 .protection-ring svg {
@@ -1036,7 +1040,7 @@ button.protection-ring { cursor: pointer; }
     display: block;
     width: 68px;
     height: 68px;
-    color: var(--warn);
+    color: var(--running);
 }
 
 .pacman-motion::before,
@@ -1158,6 +1162,12 @@ button.protection-ring { cursor: pointer; }
 
 .overview-stat-link:hover:not(:disabled) {
     box-shadow: none;
+}
+
+/* The size tiles' tooltip is a span inside the tile's link; keep the tile
+   label's spacing off it. */
+.overview-stats .tooltip-popup {
+    margin-top: 0;
 }
 
 .overview-stats .ok strong { color: var(--ok); }
@@ -1483,6 +1493,38 @@ button.protection-ring { cursor: pointer; }
     max-height: 300px;
 }
 
+/* Log text is never translated: the dashboard's log boxes (.output) hold
+   English lines and engine output. On a right-to-left page the whole box is
+   laid out left to right, like a terminal and like the System page's support
+   report: every line starts at the left edge, an English line keeps its
+   trailing full stop at its end and "47 MB / 134 MB" in order, and a line
+   that starts with an Arabic or Hebrew file name still shows that name's
+   letters in their own order. Don't give each line its own direction here
+   with unicode-bidi: plaintext. The box holds the whole log as one text
+   node, and Chromium then carries an Arabic- or Hebrew-led line's direction
+   into the next line, so a following line that starts with digits or a
+   bracket shows its first groups out of order ("10:00:01 2026/11/19 error:
+   ..." for "2026/11/19 10:00:01 error: ..."). Left-to-right pages are left
+   as they are. */
+[dir="rtl"] .output {
+    direction: ltr;
+    text-align: left;
+}
+
+/* The vault activity lines and the engine output in a password change's
+   native result line are English text too, but each is a single line in its
+   own element, so nothing carries over between lines. On a right-to-left
+   page each takes the direction of its own text instead of the page's: an
+   English line reads left to right from its start, and text-align: start
+   aligns it there. The native result's output sits inside a translated
+   line, so there the same value isolates it with the direction of its own
+   text. Left-to-right pages are left as they are. */
+[dir="rtl"] .vault-work-stage,
+[dir="rtl"] .vault-native-output {
+    unicode-bidi: plaintext;
+    text-align: start;
+}
+
 /* Native paths a locked-files backup skipped, in the operation details and
    the timeline's log view. A long list scrolls instead of pushing the log
    out of sight. */
@@ -1805,6 +1847,12 @@ button.protection-ring { cursor: pointer; }
     display: block !important;
     overflow: visible !important;
     white-space: normal;
+}
+
+/* The vaults tooltip is one line per vault, joined with line breaks in the
+   tooltip text (which also names the trigger for assistive technology). */
+.flow-vault-status > .tooltip-popup {
+    white-space: pre-line !important;
 }
 
 .tooltip-trigger.file-path-label {
@@ -2644,21 +2692,31 @@ select option {
 	margin-top: 16px;
 }
 
-.object-lock-enrollment-status {
+/* A Kopia vault's error correction status in vault settings looks like the
+   Object Lock status above it. */
+.object-lock-enrollment-status,
+.error-correction-status {
 	padding-top: 16px;
 	font-weight: 600;
 }
 
-.object-lock-enrollment-status + .object-lock-help {
+.object-lock-enrollment-status + .object-lock-help,
+.error-correction-status + .object-lock-help {
 	margin-bottom: 16px;
 }
 
-.object-lock-enrollment-status .enabled {
+.object-lock-enrollment-status .enabled,
+.error-correction-status .enabled {
 	color: var(--ok);
 }
 
-.object-lock-enrollment-status .disabled {
+.object-lock-enrollment-status .disabled,
+.error-correction-status .disabled {
 	color: var(--danger);
+}
+
+.error-correction-overhead {
+	margin-top: 16px;
 }
 
 .vault-job-speed-field {
@@ -3341,6 +3399,13 @@ select option {
     font-size: 11.5px;
 }
 
+/* The breadcrumbs are a path: on a right-to-left page they still run left
+   to right, from the page's start (right) edge. */
+[dir="rtl"] .browse-crumbs {
+    direction: ltr;
+    justify-content: flex-end;
+}
+
 .browse-crumbs button,
 .browse-crumbs span {
     padding: 0;
@@ -3380,15 +3445,71 @@ select option {
 	flex: 0 0 auto;
 }
 
+/* The browse list is a table of Name | Modified | Size | actions. Each row is a
+   subgrid of .file-table, so a column takes the width of its widest cell and
+   lines up with its header in every row: folder rows (empty Size and actions
+   cells), files with "Restore file" alone and files with "Restore file |
+   Download". A browser without subgrid uses the fixed columns given first.
+   The name column (its grid track, which includes the row's 16 px start
+   padding) keeps at least 10em: without that floor the other columns take
+   their full width first and leave the names nothing. The widths where the
+   four columns no longer fit use the stacked layout further down. */
+.file-table {
+    display: grid;
+    grid-template-columns: minmax(10em, 1fr) auto auto auto;
+    column-gap: 16px;
+}
+
+.file-header,
 .file-row {
     display: grid;
-    grid-template-columns: auto minmax(0, 1fr) auto auto;
+    grid-column: 1 / -1;
+    grid-template-columns: minmax(10em, 1fr) 11em 6em 13em;
+    grid-template-columns: subgrid;
     align-items: center;
-    gap: 10px;
-    min-height: 42px;
+    column-gap: 16px;
     padding: 10px 16px;
     border-bottom: 1px solid var(--rule-soft);
+}
+
+.file-header {
+    padding-block: 8px;
+    color: var(--text-faint);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 9.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.file-row {
+    min-height: 42px;
     color: var(--text-muted);
+}
+
+.file-name {
+    display: flex;
+    min-width: 0;
+    align-items: center;
+    gap: 10px;
+}
+
+.file-name > svg {
+    flex: 0 0 auto;
+}
+
+/* "Name" starts above the names, past the icons. */
+.file-header > :first-child {
+    padding-inline-start: 25px;
+}
+
+.file-header > :nth-child(3),
+.file-size {
+    text-align: end;
+}
+
+.file-modified,
+.file-size {
+    white-space: nowrap;
 }
 
 .file-row:last-child {
@@ -3407,7 +3528,7 @@ select option {
     color: var(--accent);
 }
 
-.file-row > button,
+.file-name > button,
 .restore-file {
     overflow: hidden;
     padding: 0;
@@ -3415,13 +3536,37 @@ select option {
     background: transparent;
     color: var(--text);
     cursor: pointer;
-    text-align: left;
+    text-align: start;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-.file-row > span:nth-last-child(2),
-.file-row > span:last-child {
+/* A file name wraps and shows in full, so two names that differ only at the
+   end can still be told apart before restoring one. A folder name is a
+   button on one line, cut at its end when it is too long. */
+.file-name > span {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+/* A name is part of a path, so on a right-to-left page it still reads left
+   to right, next to its icon. */
+[dir="rtl"] .file-name > button,
+[dir="rtl"] .file-name > span {
+    direction: ltr;
+    text-align: right;
+}
+
+/* The snapshot browser has three columns besides the names, so its dialog is
+   wider than the other wide dialogs. The width keys on the list, which is
+   there while a folder loads and when it is empty too, so the dialog keeps
+   one width while browsing. */
+.modal.wide:has(.file-list) {
+    width: min(100%, 860px);
+}
+
+.file-modified,
+.file-size {
     color: var(--text-faint);
     font-family: "JetBrains Mono", monospace;
     font-size: 11px;
@@ -3433,6 +3578,36 @@ select option {
     font-size: 10px;
     letter-spacing: 0.07em;
     text-transform: uppercase;
+}
+
+/* "Restore file | Download" for a regular file. Actions start at the
+   column's start edge, so "Restore file" sits in the same place in every row.
+   The cap keeps a long translation of the two buttons from taking the names'
+   room on a wide screen; past it the buttons wrap. The space around "|" is
+   the separator's margin rather than a column gap, because a gap would also
+   come before the refused download's message below and widen the column. */
+.file-row-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    row-gap: 2px;
+    max-width: 280px;
+}
+
+.file-row-actions-separator {
+    margin-inline: 8px;
+    color: var(--text-faint);
+    font-size: 10px;
+}
+
+/* The actions column is shared by every row, so a refused download's message
+   must not size it: it has no width of its own (width: 0) and takes the full
+   line under its buttons (min-width: 100%), so it wraps at whatever width the
+   buttons gave the column instead of widening the column for every row. */
+.file-row-actions .download-message {
+    width: 0;
+    min-width: 100%;
+    text-align: start;
 }
 
 .file-empty {
@@ -3887,6 +4062,37 @@ select option {
     white-space: nowrap;
 }
 
+/* File and vault paths always read left to right, in every language, and are
+   never translated. On a right-to-left page a path keeps that order and sits
+   at the page's start (right) edge:
+   - a path shown inside text is a <bdi dir="ltr"> (ltrIsolate where only
+     plain text can go, such as a tooltip or a title);
+   - a path field is an input or textarea with dir="ltr", aligned to the
+     right here;
+   - .file-path-label is a flex row (parent folders, then the name), which a
+     right-to-left page would run right to left, so it is turned left to right
+     and pushed to the right edge. A long name is then cut at its end, as on
+     a left-to-right page.
+   Left-to-right pages are unchanged by all of this. */
+[dir="rtl"] input[dir="ltr"],
+[dir="rtl"] textarea[dir="ltr"] {
+    text-align: right;
+}
+
+/* An empty path field's placeholder is translated page text ("Example:
+   ...", "Exact absolute path ..."), so it runs right to left like the page;
+   an example value in it is already isolated (examplePlaceholder in
+   Protect.tsx). Typed text still runs left to right. */
+[dir="rtl"] input[dir="ltr"]:placeholder-shown,
+[dir="rtl"] textarea[dir="ltr"]:placeholder-shown {
+    direction: rtl;
+}
+
+[dir="rtl"] .file-path-label {
+    direction: ltr;
+    justify-content: flex-end;
+}
+
 .file-path-parent {
     min-width: 0;
     flex: 0 1 auto;
@@ -3949,7 +4155,7 @@ select option {
 
 .find-mode-tabs {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 5px;
     margin: 20px 0;
     padding: 4px;
@@ -3957,6 +4163,8 @@ select option {
     background: var(--surface-raised);
 }
 
+/* The three columns are narrow on a phone, and a long single word (German,
+   Dutch) would otherwise run into the next tab. */
 .find-mode-tabs button {
     padding: 9px 8px;
     border: 0;
@@ -3965,6 +4173,8 @@ select option {
     color: var(--text-muted);
     cursor: pointer;
     font-size: 11px;
+    overflow-wrap: anywhere;
+    hyphens: auto;
 }
 
 .find-mode-tabs button.active {
@@ -3973,21 +4183,150 @@ select option {
     box-shadow: 0 2px 8px var(--shadow-soft);
 }
 
+.find-mode-tabs button:focus-visible {
+    outline: 2px solid var(--accent);
+}
+
+.find-mode-panel {
+    margin-bottom: 20px;
+}
+
 .find-version-list {
     display: flex;
     flex-direction: column;
     gap: 12px;
 }
 
-.find-version-row > .file-path-label {
+/* .file-path-label is a flex row that shortens the parent folders and the
+   name with an ellipsis; don't make it a block here, or a long path widens
+   the panel and the page. */
+.find-version-row > .multiline-select-label > .file-path-label {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-.find-version-row > .tooltip-trigger.file-path-label,
+.find-version-row > .multiline-select-label > .tooltip-trigger.file-path-label,
 .find-selected-item > .tooltip-trigger.file-path-label {
     overflow: visible;
+}
+
+/* MultilineSelect: the dropdown of the "Restore selected" panel, whose
+   entries take several lines. Lines after the first are indented on the start
+   side, so on the right in a right-to-left language. */
+.multiline-select {
+    position: relative;
+    display: block;
+    width: 100%;
+    min-width: 0;
+    padding: 8px 12px;
+    padding-inline-end: 36px;
+    border: 1px solid var(--control-border);
+    border-radius: 10px;
+    outline: none;
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    font-size: 13.5px;
+    line-height: 1.45;
+    text-align: start;
+}
+
+.multiline-select::after {
+    position: absolute;
+    top: 50%;
+    inset-inline-end: 14px;
+    width: 6px;
+    height: 6px;
+    border-right: 1.5px solid var(--text-faint);
+    border-bottom: 1.5px solid var(--text-faint);
+    content: "";
+    transform: translateY(-70%) rotate(45deg);
+}
+
+/* Unlike the app's buttons, and like its other form fields, the dropdown
+   doesn't lift on hover or shrink when pressed. It mustn't move at all: the
+   open list is placed from the button's box, which is measured during the
+   press. */
+.multiline-select:hover:not(:disabled),
+.multiline-select:active:not(:disabled) {
+    transform: none;
+    box-shadow: none;
+}
+
+.multiline-select:focus-visible,
+.multiline-select[aria-expanded="true"] {
+    border-color: transparent;
+    outline: 2px solid var(--accent);
+}
+
+/* A disabled dropdown still shows text that matters ("Loading history…", or
+   why there is no common backup), so it keeps the normal text color, dimmed
+   like a disabled <select>, instead of the faint color of disabled buttons. */
+.multiline-select:disabled {
+    color: var(--text);
+    cursor: not-allowed;
+    opacity: 0.7;
+}
+
+.multiline-select-line {
+    display: block;
+    overflow-wrap: anywhere;
+}
+
+.multiline-select-line.detail {
+    padding-inline-start: 14px;
+    color: var(--text-muted);
+    font-size: 12px;
+}
+
+/* A size such as "2.2 MB" stays on one line; the rest of its line wraps. */
+.find-version-size {
+    white-space: nowrap;
+}
+
+/* The list lives in <body> with a fixed position (see MultilineSelect.tsx),
+   so the scrolling panel can't cut it off. Its top or bottom, left, width and
+   max-height are set from the button's box when it opens. It sits below
+   modal dialogs (z-index 70), like the floating tooltips. */
+.multiline-select-list {
+    position: fixed;
+    z-index: 60;
+    max-height: 320px;
+    padding: 4px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    border: 1px solid var(--hairline);
+    border-radius: 10px;
+    outline: none;
+    background: var(--modal);
+    box-shadow: 0 12px 32px var(--shadow);
+    color: var(--text);
+}
+
+.multiline-select-option {
+    padding: 7px 10px;
+    border-inline-start: 3px solid transparent;
+    border-radius: 7px;
+    cursor: pointer;
+    line-height: 1.45;
+}
+
+.multiline-select-option + .multiline-select-option {
+    margin-top: 2px;
+}
+
+.multiline-select-option.active {
+    background: var(--surface-raised);
+}
+
+.multiline-select-list:focus-visible .multiline-select-option.active {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+
+.multiline-select-option[aria-selected="true"] {
+    border-inline-start-color: var(--accent);
 }
 
 .find-selected-items {
@@ -3998,6 +4337,7 @@ select option {
 
 .find-selected-item {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 7px;
     min-width: 0;
@@ -4020,6 +4360,46 @@ select option {
     color: var(--accent);
     cursor: pointer;
     font-size: 10px;
+}
+
+/* When a narrow row wraps, Remove keeps to the end edge instead of starting
+   the new line alone. On one line the path label takes the free space, so
+   this moves nothing. */
+.find-selected-item > button:last-child {
+    margin-inline-start: auto;
+}
+
+.find-selected-item button:disabled,
+.file-row .restore-file:disabled {
+    color: var(--idle);
+    cursor: not-allowed;
+}
+
+/* A Download button waiting for its ticket is only marked aria-disabled, so it
+   keeps keyboard focus; it looks and reacts like a disabled button (the
+   generic button:disabled look plus the rule above, without hover motion). */
+.find-selected-item button[aria-disabled="true"],
+.file-row .restore-file[aria-disabled="true"] {
+    color: var(--idle);
+    cursor: not-allowed;
+    opacity: 0.72;
+    transform: none;
+    box-shadow: none;
+}
+
+/* A refused download's message sits on its own line under the row's buttons
+   (File History's selected item, the Restore page's file row), after every
+   other part of the row whatever its place in the markup. Its reason often
+   holds a path or another long unbroken word, and the column it sits in can
+   be narrow, so long words break inside it rather than being cut off or
+   running out of its box. */
+.download-message {
+    flex-basis: 100%;
+    order: 1;
+    color: var(--danger);
+    font-size: 12px;
+    white-space: normal;
+    overflow-wrap: anywhere;
 }
 
 .find-restore-button {
@@ -4791,13 +5171,59 @@ select option {
         align-items: flex-end;
         flex-direction: column;
     }
+}
 
-    .file-row {
-        grid-template-columns: auto minmax(0, 1fr) auto;
+/* Where the browse table's four columns no longer fit beside a name column of
+   at least 10em, a row is the name and size, the modified time under the name
+   and the actions under that, so the name keeps the row's width. The column
+   headers would label nothing on screen here, so they are hidden visually
+   but stay for screen readers, which still read the rows as a table. The
+   lines under the name start where its text starts (after the 15 px icon and
+   the 10 px gap).
+   The languages with the longest dates and action labels (German, Brazilian
+   Portuguese) need about 760 px for the table with a 12-hour clock; 800 px
+   leaves room for other fonts. Lowering this cuts the actions off at the
+   dialog's edge in those languages. */
+@media (max-width: 800px) {
+    .file-table {
+        display: block;
     }
 
-    .file-row .restore-file {
-        grid-column: 2 / 4;
+    .file-header {
+        position: absolute;
+        width: 1px;
+        height: 1px;
+        padding: 0;
+        border: 0;
+        overflow: hidden;
+        clip-path: inset(50%);
+        white-space: nowrap;
+    }
+
+    .file-row {
+        grid-template-columns: minmax(0, 1fr) auto;
+        row-gap: 4px;
+    }
+
+    .file-size {
+        grid-row: 1;
+        grid-column: 2;
+    }
+
+    .file-modified,
+    .file-actions {
+        grid-column: 1 / -1;
+        padding-inline-start: 25px;
+    }
+
+    .file-modified:empty,
+    .file-size:empty,
+    .file-actions:empty {
+        display: none;
+    }
+
+    .file-row .file-row-actions {
+        max-width: none;
     }
 }
 
@@ -4900,8 +5326,9 @@ body { font-size: 15.5px; }
 .calendar-grid > button { font-size: 12.5px; }
 .calendar-legend { font-size: 11.5px; }
 .browse-crumbs { font-size: 12.5px; }
-.file-row > span:nth-last-child(2),
-.file-row > span:last-child { font-size: 12.5px; }
+.file-modified,
+.file-size { font-size: 12.5px; }
+.file-header { font-size: 11.5px; letter-spacing: 0.06em; }
 .browse-footer > span { font-size: 12.5px; }
 .restore-option strong { font-size: 14.5px; }
 .restore-option .mono { font-size: 12.5px; }
@@ -4915,6 +5342,9 @@ body { font-size: 15.5px; }
 .find-selected-item,
 .find-confirm-destination { font-size: 12.5px; }
 .find-mode-tabs button { font-size: 12.5px; }
+.multiline-select,
+.multiline-select-option { font-size: 14.5px; }
+.multiline-select-line.detail { font-size: 12.5px; }
 .find-selected-item button { font-size: 12px; }
 .find-confirm-row .mono { font-size: 12.5px; }
 
@@ -5427,6 +5857,14 @@ input, select, textarea { font-size: 14.5px; }
     text-overflow: ellipsis;
     white-space: nowrap;
     unicode-bidi: plaintext;
+}
+
+/* A vault's location is a path or address, so it reads left to right even
+   when it starts with a right-to-left folder name. A block keeps its place
+   from its container, so it stays at the card's start edge. */
+.protect-page .vault-location-text {
+    direction: ltr;
+    unicode-bidi: isolate;
 }
 
 /* The engine and remote label chips share one line. The engine chip is short

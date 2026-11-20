@@ -33,6 +33,7 @@ import {
     Icon,
     Loading,
     Modal,
+    parseTime,
     SaveChangesDialog,
     scheduleLabel,
     timeAgo,
@@ -87,11 +88,13 @@ import type { RcloneRemoteEntry } from "../services/api";
 import { ltrIsolate, parseRcloneRemoteVariables, serializeRcloneRemoteVariables } from "../services/rcloneRemote";
 import { limitedSpeedProviders, RCLONE_REMOTE_CONNECTOR, usesRcloneSignIn, usesSingleProfile, usesVaultFolderName } from "../services/storageConnectors";
 import type { ExistingVaultStorageInput, ForegroundOutcome, JobInput, ManualTargetAdmissionResult, RcloneAuthStatus, RepositoryConnectionIntent, RepositoryCreationIntent, TrackedOperationStart, VaultOwnershipStatus, VaultPasswordChangeResult, VaultProfileSyncStatus, VaultProgressRecord } from "../services/api";
+import { DECIMAL_SIZE_UNITS, decimalSizeUnit, readableSize } from "../sizeDisplay";
 import { backupTargetIsActive, jobMutationStatusLabel, manualRunNotice, manualRunResultText, nextSnapshotTooltip } from "../services/backupJobs";
 import type { JobMutationResultStatus } from "../services/backupJobs";
 import { validVaultPassword } from "../services/vaultPassword";
 import type {
     BackupJob,
+    BackupJobTarget,
     IntegrationOption,
     Repository,
     StorageIntegration,
@@ -747,7 +750,10 @@ function vaultPasswordStatusLabel(status: string) {
 function VaultPasswordResult({ result }: { result: VaultPasswordChangeResult }) {
 	return <div className="vault-password-result">
 		<span><b>{t("ui.pages.protect.phase")}</b> {vaultPasswordPhaseLabel(result.phase)}</span>
-		<span><b>{t("ui.protect.nativeResultLabel", { engine: result.native.engine })}</b> {result.native.status ? vaultPasswordStatusLabel(result.native.status) : t("ui.protect.unresolved")}{result.native.output ? ` — ${formatNativeLogText(result.native.engine, "password_change", result.native.output)}` : ""}</span>
+		{/* The engine's output is log text inside a translated line; on a
+		    right-to-left page it keeps the direction of its own text (see
+		    .vault-native-output in index.css). */}
+		<span><b>{t("ui.protect.nativeResultLabel", { engine: result.native.engine })}</b> {result.native.status ? vaultPasswordStatusLabel(result.native.status) : t("ui.protect.unresolved")}{result.native.output ? <> — <span className="vault-native-output">{formatNativeLogText(result.native.engine, "password_change", result.native.output)}</span></> : ""}</span>
 		<span><b>{t("ui.pages.protect.protected.recovery.metadata")}</b> {vaultPasswordStatusLabel(result.sidecarStatus)}</span>
 		<span><b>{t("ui.pages.protect.local.cleanup")}</b> {result.cleanupPending ? t("ui.protect.pending") : t("ui.protect.notPending")}</span>
 		{/* The backend message and Restic key note are shown as written. dir="auto" gives
@@ -904,6 +910,20 @@ function objectLockForSelection(current: ObjectLockSettings, engine: string, con
 	return { ...current, mode: connector === "s3" && current.mode === "governance" ? "governance" : "compliance" } as ObjectLockSettings;
 }
 
+// Kopia's only error correction algorithm. It stays out of the catalogs as a
+// placeholder value so translations can't change it.
+const ECC_ALGORITHM = "REED-SOLOMON-CRC32";
+// The overheads the new-vault form offers, and the one it starts with. The
+// backend accepts exactly these (models.ValidateRequestedECCOverheadPercent).
+const ECC_OVERHEAD_PERCENTS = [1, 2, 5, 10];
+const DEFAULT_ECC_OVERHEAD_PERCENT = 2;
+
+// Error correction exists only on Kopia, so it is dropped whenever the form
+// ends up on another engine.
+function eccOverheadForEngine(percent: number, engine: string) {
+	return engine === "kopia" ? percent : 0;
+}
+
 function objectLockDurationHours(settings: ObjectLockSettings) {
 	const hours = { days: 24, weeks: 7 * 24, months: 30 * 24, years: 365 * 24 }[settings.durationUnit || "days"];
 	return settings.durationValue * hours;
@@ -1016,6 +1036,22 @@ function targetStatusLabel(status: string, issueKind?: string) {
 		case "reconnect_required": return t("ui.operation.reconnectRequired");
 		default: return status;
 	}
+}
+
+// One vault's line in the tooltip of a job card's vaults line: the vault, its
+// last status and when that run finished (lastRun is written together with
+// the status). Queued and running targets show no time: their lastRun still
+// belongs to the run before, which would read as the time of the current
+// one. A target that never ran, or whose time is empty or unreadable, shows
+// none either. The time has the same fields as the dashboard timeline, File
+// History and Restore (a 2-digit hour), and both lines use the catalog's
+// pattern so each language keeps its own punctuation.
+function targetStatusLine(target: BackupJobTarget) {
+	const status = targetStatusLabel(target.lastStatus, target.lastIssueKind);
+	const finished = target.lastStatus === "" || target.lastStatus === "queued" || target.lastStatus === "running" || !target.lastRun ? null : parseTime(target.lastRun);
+	return finished
+		? t("ui.protect.targetStatusWithTime", { vault: target.repositoryName, status, time: formatDisplayDateTime(finished, { month: "short", day: "numeric", year: "numeric", hour: "2-digit", minute: "2-digit" }) })
+		: t("ui.protect.targetStatus", { vault: target.repositoryName, status });
 }
 
 // The backend reports a failed Vault Size refresh as a stable code naming the
@@ -1299,6 +1335,8 @@ interface VaultForm {
     maintenanceSchedule: string;
 	concurrencyMode: "reduced" | "native" | "increased" | "maximum";
 	objectLock: ObjectLockSettings;
+	// Requested Kopia error correction overhead for a new vault; 0 is off.
+	eccOverheadPercent: number;
 }
 
 const emptyJob: JobForm = {
@@ -1738,6 +1776,7 @@ const emptyVault = (integration?: StorageIntegration, engine: VaultForm["engine"
     maintenanceSchedule: "daily",
 	concurrencyMode: "native",
 	objectLock: emptyObjectLock(),
+	eccOverheadPercent: 0,
 });
 
 // Keep old/imported high-speed values usable while making provider changes
@@ -1751,12 +1790,34 @@ function compatibleVaultForm(form: VaultForm): VaultForm {
 	return concurrencyMode === form.concurrencyMode ? form : { ...form, concurrencyMode };
 }
 
+// A warning that comes and goes under a form field while the user edits the
+// form. The status region stays mounted and only its text comes and goes:
+// several screen readers don't announce a live region that is inserted
+// together with its text. The warning uses normal text in the usual warning
+// box, not the faint help-line text, so it stays readable on the warning
+// tint. Empty, the region takes no space; the margin puts the box just below
+// the field and its help lines.
+function FieldWarning({ text }: { text: string }) {
+	return <div role="status">{text && <div className="recovery-warning" style={{ marginTop: 8 }}><p>{text}</p></div>}</div>;
+}
+
+// Connector options whose value is a local path: an SSH key file, an SSH
+// agent socket, a Google Cloud credentials file. Like every other path field
+// they read left to right on a right-to-left page. The connector catalog does
+// not say which options are paths, so they are named here; Any Rclone
+// Remote's config file and remote path have their own fields.
+const connectorPathOptions: Record<string, readonly string[]> = {
+	sftp: ["identity", "ssh_auth_sock"],
+	gcs: ["credentials_file"],
+};
+
 function IntegrationField({
     connector,
     option,
     value,
     onChange,
     explanation,
+    warning,
     disabled,
 }: {
     connector: string;
@@ -1764,6 +1825,9 @@ function IntegrationField({
     value: string;
     onChange: (value: string) => void;
     explanation?: string;
+    // undefined: the field never warns. A string, empty while no warning
+    // applies: the field keeps a status region for its warning.
+    warning?: string;
     disabled?: boolean;
 }) {
     const label = knownMessage(`ui.integration.${connector}.option.${option.key}.label`, option.label);
@@ -1782,21 +1846,24 @@ function IntegrationField({
                 </label>
 				{help && <small>{help}</small>}
                 {explanation && <small>{explanation}</small>}
+                {warning !== undefined && <FieldWarning text={warning} />}
             </div>
         );
     }
     // Fields are required unless their label says "(optional)", so a required
     // option gets no marker.
+    const dir = connectorPathOptions[connector]?.includes(option.key) ? "ltr" : undefined;
     return (
 		<label className="field">
 			<span>{label}</span>
 			{option.kind === "textarea" ? (
-				<textarea rows={3} value={value} disabled={disabled} placeholder={examplePlaceholder(option.placeholder)} onChange={(event) => onChange(event.target.value)} />
+				<textarea rows={3} dir={dir} value={value} disabled={disabled} placeholder={examplePlaceholder(option.placeholder)} onChange={(event) => onChange(event.target.value)} />
 			) : (
-				<input type={option.secret ? "password" : "text"} value={value} disabled={disabled} placeholder={examplePlaceholder(option.placeholder)} onChange={(event) => onChange(event.target.value)} />
+				<input type={option.secret ? "password" : "text"} dir={dir} value={value} disabled={disabled} placeholder={examplePlaceholder(option.placeholder)} onChange={(event) => onChange(event.target.value)} />
 			)}
 			{help && <small>{help}</small>}
             {explanation && <small>{explanation}</small>}
+            {warning !== undefined && <FieldWarning text={warning} />}
         </label>
     );
 }
@@ -2232,9 +2299,58 @@ function vaultEngineHelp(connector: string, coldStorage: boolean) {
 	return t("ui.protect.immutableEngineHelp");
 }
 
+// Replicaro never rewrites an exclude pattern (it never converts "\"), and
+// each engine reads it its own way. Kopia reads "\" as an escape character
+// and Restic reads it as a folder separator only on Windows, so a line with a
+// backslash usually doesn't exclude what was meant on Kopia. The form only
+// explains this while such a line is present. It doesn't convert "\" to "/",
+// because "\" is also a deliberate escape ("\*") in both engines and part of
+// file names on Linux and macOS. Job cards don't show the note. Don't add a
+// rewrite here without a product decision.
+function excludesHaveBackslash(excludes: string) {
+	return excludes.includes("\\");
+}
+
+// The exclude help line names patterns that are mostly punctuation. They are
+// placeholders isolated left-to-right so a right-to-left language shows them
+// as typed; without that, "**/Folder/SubFolder" reads "Folder/SubFolder/**".
+// A lone "/" or "\" and a plain name such as SubFolder can't be reordered, so
+// they stay in the translated text.
+function excludePatternHelpValues() {
+	return ltrValues({
+		patterns: "* ? [abc] [0-9] **",
+		examples: "*.tmp file?.log log[abc].txt log[0-9].txt **/cache/**",
+		anyDepth: "**/",
+		anyDepthExample: "**/Folder/SubFolder",
+	});
+}
+
 function creationOptionLockedForPending(form: VaultForm, option: IntegrationOption) {
-	if (!form.pendingLocation || option.credential || option.secret) return false;
-	return !(form.connector === "sftp" && option.key === "insecure_ignore_host_key");
+	// A retry has to send the settings the pending creation was reviewed with:
+	// the server refuses a changed non-credential option, the SFTP host-key
+	// opt-out included. Credentials aren't saved with the pending creation, so
+	// they are entered again and stay editable.
+	return Boolean(form.pendingLocation) && !option.credential && !option.secret;
+}
+
+// Kopia uses the system ssh for SFTP when host-key verification is disabled,
+// and also when it signs in through an SSH agent with no key file, whatever
+// the checkbox says; only a key file with verification on uses Kopia's own
+// client. Kopia over the system ssh is very slow, so each case gets a warning
+// under its own field, and both show when both apply. Keep the two warnings
+// separate: each says what to change in the field it sits under.
+//
+// The two SFTP fields get "" rather than undefined while no warning applies,
+// whatever the engine, so their status region is already there when a
+// warning appears (see FieldWarning).
+function kopiaSFTPSlowWarning(engine: string, connector: string, options: Record<string, string>, key: string) {
+	if (connector !== "sftp" || key !== "insecure_ignore_host_key" && key !== "ssh_auth_sock") return undefined;
+	if (engine !== "kopia") return "";
+	if (key === "insecure_ignore_host_key") {
+		return options.insecure_ignore_host_key === "true" ? t("ui.protect.kopiaSFTPHostKeyVerificationDisabledWarning") : "";
+	}
+	return String(options.ssh_auth_sock ?? "").trim() && !String(options.identity ?? "").trim()
+		? t("ui.protect.kopiaSFTPAgentWithoutKeyWarning") : "";
 }
 
 function updateConnectorOption(form: VaultForm, key: string, value: string, inferS3Region = true): VaultForm {
@@ -2268,7 +2384,7 @@ function RemoteVaultFields({
 	const provider = knownMessage(`ui.integration.${integration.id}.label`, integration.label);
 	const rcloneRemote = integration.id === RCLONE_REMOTE_CONNECTOR;
 	const vaultFolderLabel = rcloneRemote ? t("ui.protect.rcloneRemoteVaultFolder") : t("ui.protect.vaultFolderOnProvider", { provider });
-	const vaultFolder = vaultFolderField && <label className="field"><span>{vaultFolderLabel}</span><input aria-label={vaultFolderLabel} value={form.location} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, location: event.target.value })} /><small>{rcloneRemote ? t("ui.protect.rcloneRemoteVaultFolderHelp") : t("ui.protect.vaultFolderExactHelp", { provider })}</small></label>;
+	const vaultFolder = vaultFolderField && <label className="field"><span>{vaultFolderLabel}</span><input aria-label={vaultFolderLabel} dir="ltr" value={form.location} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, location: event.target.value })} /><small>{rcloneRemote ? t("ui.protect.rcloneRemoteVaultFolderHelp") : t("ui.protect.vaultFolderExactHelp", { provider })}</small></label>;
 	// The vault folder name comes after the remote settings, because it names
 	// a folder under the chosen path in remote.
 	if (rcloneRemote) return <><RcloneRemoteFields form={form} integration={integration} onChange={onChange} />{vaultFolder}</>;
@@ -2279,17 +2395,17 @@ function RemoteVaultFields({
             return <>
                 {renderOption("endpoint")}
                 <label className="field"><span>{t("ui.pages.protect.bucket")}</span><input value={form.bucket} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, bucket: event.target.value })} /></label>
-				<label className="field"><span>{t("ui.pages.protect.path.prefix.optional")}</span><input value={form.prefix} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /></label>
+				<label className="field"><span>{t("ui.pages.protect.path.prefix.optional")}</span><input dir="ltr" value={form.prefix} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /></label>
             </>;
         case "azblob":
             return <>
                 <label className="field"><span>{t("ui.pages.protect.container")}</span><input value={form.container} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, container: event.target.value })} /></label>
-				<label className="field"><span>{t("ui.pages.protect.path.prefix.optional")}</span><input value={form.prefix} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /></label>
+				<label className="field"><span>{t("ui.pages.protect.path.prefix.optional")}</span><input dir="ltr" value={form.prefix} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /></label>
             </>;
         case "gcs":
             return <>
                 <label className="field"><span>{t("ui.pages.protect.bucket")}</span><input value={form.bucket} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, bucket: event.target.value })} /></label>
-                <label className="field"><span>{t("ui.pages.protect.path.prefix.optional")}</span><input value={form.prefix} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /></label>
+                <label className="field"><span>{t("ui.pages.protect.path.prefix.optional")}</span><input dir="ltr" value={form.prefix} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /></label>
             </>;
         case "sftp": {
             const pendingURL = (() => {
@@ -2307,7 +2423,7 @@ function RemoteVaultFields({
                 {renderOption("port", pendingURL?.port || undefined)}
                 {renderOption("username", pendingURL?.username || undefined)}
 				{supportsPathMode && <label className="field"><span>{t("ui.pages.protect.vault.location.on.server")}</span><select value={pathMode} disabled={Boolean(form.pendingLocation)} onChange={(event) => updateOption("path_mode", event.target.value)}><option value="home">{t("ui.pages.protect.sftp.home.directory.recommended")}</option><option value="absolute">{t("ui.pages.protect.server.filesystem.root")}</option></select></label>}
-				<label className="field"><span>{absolutePath ? t("ui.pages.protect.vault.path.relative.to.server.filesystem.root") : t("ui.pages.protect.vault.path.relative.to.sftp.home")}</span><input aria-label={absolutePath ? t("ui.protect.vaultPathServerRoot") : t("ui.protect.vaultPathSftpHome")} value={form.prefix} placeholder={examplePlaceholder(absolutePath ? "/srv/backups/vault" : "backups/vault")} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /><small>{absolutePath ? t("ui.pages.protect.start.with.one.the.path.begins.at.the.server") : t("ui.pages.protect.do.not.start.with.the.path.begins.in.the")}</small></label>
+				<label className="field"><span>{absolutePath ? t("ui.pages.protect.vault.path.relative.to.server.filesystem.root") : t("ui.pages.protect.vault.path.relative.to.sftp.home")}</span><input aria-label={absolutePath ? t("ui.protect.vaultPathServerRoot") : t("ui.protect.vaultPathSftpHome")} dir="ltr" value={form.prefix} placeholder={examplePlaceholder(absolutePath ? "/srv/backups/vault" : "backups/vault")} disabled={Boolean(form.pendingLocation)} onChange={(event) => onChange({ ...form, prefix: event.target.value })} /><small>{absolutePath ? t("ui.pages.protect.start.with.one.the.path.begins.at.the.server") : t("ui.pages.protect.do.not.start.with.the.path.begins.in.the")}</small></label>
                 {renderOption("identity")}
                 {/* No role="alert": this shows as soon as SFTP is picked, before anything is typed. */}
                 {missingSFTPAuthentication(integration.id, form.options) && <small className="inline-error">{t("ui.protect.sftpAuthenticationRequiredHint")}</small>}
@@ -2614,6 +2730,54 @@ function ObjectLockFields({
 	</section>;
 }
 
+// The error correction choice on the new-vault form. Like Object Lock, turning
+// it on switches the engine to Kopia (see updateCreateKopiaOption). It is shown
+// wherever Kopia could be chosen for the selected storage, so also while the
+// form is on Restic, and never for Cold Storage or a Restic-only connector.
+// Kopia marks the option experimental; the form deliberately doesn't say so.
+// Do not change the help text without a product decision.
+function ErrorCorrectionFields({
+	form,
+	onChange,
+	available,
+	disabled = false,
+}: {
+	form: VaultForm;
+	onChange: (next: VaultForm) => void;
+	available: boolean;
+	disabled?: boolean;
+}) {
+	if (!available) return null;
+	const enabled = form.eccOverheadPercent > 0;
+	return <section className="advanced-setting">
+		<label className="check"><input type="checkbox" checked={enabled} disabled={disabled} onChange={(event) => onChange({ ...form, eccOverheadPercent: event.target.checked ? DEFAULT_ECC_OVERHEAD_PERCENT : 0 })} />{t("ui.protect.enableErrorCorrection")}</label>
+		<small>{t("ui.protect.errorCorrectionHelp", { algorithm: ECC_ALGORITHM })}</small>
+		{enabled && <label className="field error-correction-overhead"><span>{t("ui.protect.errorCorrectionOverheadLabel")}</span><select value={form.eccOverheadPercent} disabled={disabled} onChange={(event) => onChange({ ...form, eccOverheadPercent: Number(event.target.value) })}>{ECC_OVERHEAD_PERCENTS.map((percent) => <option key={percent} value={percent}>{t("ui.protect.errorCorrectionPercent", { percent })}</option>)}</select></label>}
+	</section>;
+}
+
+// The saved error correction status of a Kopia vault, shown like the Object
+// Lock status. The value is what Kopia reported when this computer created,
+// connected or last reconnected the vault, so a vault added before error
+// correction was offered shows Disabled until its next Reconnect.
+function ErrorCorrectionStatus({ percent }: { percent: number }) {
+	const enabled = percent > 0;
+	return <section className="advanced-setting">
+		<div className="error-correction-status">{t("ui.protect.errorCorrectionStatusLabel")} <strong className={enabled ? "enabled" : "disabled"}>{enabled ? t("ui.protect.errorCorrectionEnabledPercent", { percent }) : t("ui.protect.disabled")}</strong></div>
+		<small className="object-lock-help">{t("ui.protect.errorCorrectionImmutableHelp")}</small>
+	</section>;
+}
+
+// The help under the new-vault engine choice. Object Lock and error
+// correction each fix the engine to Kopia, so the line names whichever is on.
+function createVaultEngineHelp(form: VaultForm) {
+	const errorCorrection = form.eccOverheadPercent > 0;
+	if (form.objectLock.enrolled && errorCorrection) return t("ui.protect.kopiaRequiredForObjectLockAndErrorCorrection");
+	if (form.objectLock.enrolled) return t("ui.pages.protect.kopia.is.the.required.engine.when.object.locking.is");
+	if (errorCorrection) return t("ui.protect.kopiaRequiredForErrorCorrection");
+	return vaultEngineHelp(form.connector, form.coldStorage);
+}
+
 function DestinationVaultPicker({
     repositories,
     selectedIds,
@@ -2671,7 +2835,7 @@ function DestinationVaultPicker({
                         key={repository.id}
                         onClick={() => onChange([...selectedIds, repository.id])}
                     >
-                        <span><strong>{repository.name}</strong><small className="mono">{repository.location}</small></span>
+                        <span><strong>{repository.name}</strong><small className="mono"><bdi dir="ltr">{repository.location}</bdi></small></span>
                         <span className="destination-add"><Icon name="plus" size={12} /> {t("ui.pages.protect.add")}</span>
                     </button>
                 ))}
@@ -2685,35 +2849,21 @@ function DestinationVaultPicker({
     );
 }
 
-function readableSize(bytes: number) {
-    const units = ["B", "KB", "MB", "GB", "TB"];
-    let value = bytes;
-    let unit = 0;
-    while (value >= 1000 && unit < units.length - 1) {
-        value /= 1000;
-        unit += 1;
-    }
-    return `${formatDisplayNumber(value, { minimumFractionDigits: value >= 10 || unit === 0 ? 0 : 1, maximumFractionDigits: value >= 10 || unit === 0 ? 0 : 1 })} ${units[unit]}`;
-}
-
+// A vault's size and its tooltip. On a right-to-left page a size still reads
+// number then unit ("1.8 TB"), so the sizes put into the tooltip sentences are
+// isolated left to right; the card wraps its display in <bdi dir="ltr">.
 function vaultSizePresentation(bytes: number) {
-	const decimalUnits = ["B", "KB", "MB", "GB", "TB"];
 	const binaryUnits = ["B", "KiB", "MiB", "GiB", "TiB"];
-	let decimalValue = bytes;
-	let unit = 0;
-	while (decimalValue >= 1000 && unit < decimalUnits.length - 1) {
-		decimalValue /= 1000;
-		unit += 1;
-	}
-	const display = `${formatDisplayNumber(decimalValue, { minimumFractionDigits: decimalValue >= 10 || unit === 0 ? 0 : 1, maximumFractionDigits: decimalValue >= 10 || unit === 0 ? 0 : 1 })} ${decimalUnits[unit]}`;
+	const { unit } = decimalSizeUnit(bytes);
+	const display = readableSize(bytes);
 	if (unit === 0) {
-		return { display, tooltip: t("ui.protect.bytesUnitTooltip", { display }) };
+		return { display, tooltip: t("ui.protect.bytesUnitTooltip", { display: ltrIsolate(display) }) };
 	}
 	const binaryValue = bytes / (1024 ** unit);
 	const binary = `${formatDisplayNumber(binaryValue, { minimumFractionDigits: binaryValue >= 10 ? 0 : 1, maximumFractionDigits: binaryValue >= 10 ? 0 : 1 })} ${binaryUnits[unit]}`;
 	return {
 		display,
-		tooltip: t("ui.protect.sizeUnitTooltip", { binary, decimalUnit: decimalUnits[unit], binaryUnit: binaryUnits[unit] }),
+		tooltip: t("ui.protect.sizeUnitTooltip", { binary: ltrIsolate(binary), decimalUnit: DECIMAL_SIZE_UNITS[unit], binaryUnit: binaryUnits[unit] }),
 	};
 }
 
@@ -3363,6 +3513,13 @@ export default function Protect() {
 		(!connectForm.coldStorage && connectDetectedEngine === "restic"));
 	const connectMissingRequiredOptions = missingRequiredConnectorOptions(connectIntegration, connectForm.options);
 	const connectMissingSFTPAuthentication = missingSFTPAuthentication(connectForm.connector, connectForm.options);
+	// The Kopia SFTP warnings need the engine. Reconnect knows the saved
+	// vault's engine from the start, so they show there before any Check. A
+	// plain Connect learns the engine only from Check, and a successful Check
+	// hides the connection fields, so there the warnings can show only when
+	// the fields come back with the engine still known, for example after the
+	// server refuses the connection because the vault changed since Check.
+	const connectKnownEngine = connectDetectedEngine || connectReconnectVault?.engine || "";
 	const createOrderedOptions = orderedConnectorOptions(integration, vaultForm.connector).filter((option) =>
 		!vaultForm.coldStorage || vaultForm.connector !== "s3" || option.key !== "storage_class");
 	const createMissingRequiredOptions = missingRequiredConnectorOptions(integration, vaultForm.options);
@@ -3371,9 +3528,13 @@ export default function Protect() {
 	// Restic through rclone into Replicaro/<vault name>: Restic is the only engine.
 	const createUsesVaultFolder = usesVaultFolderName(vaultForm.connector);
 	const createUsesRcloneRemote = vaultForm.connector === RCLONE_REMOTE_CONNECTOR && !vaultForm.coldStorage;
-	const createObjectLockAvailable = !vaultForm.coldStorage && ["s3", "azblob", "gcs"].includes(vaultForm.connector) &&
+	// Whether Kopia can be the new vault's engine. It must agree with the
+	// engine select below, which offers only Restic for Cold Storage and the
+	// vault-folder connectors whatever the catalog says.
+	const createKopiaAvailable = !vaultForm.coldStorage && !createUsesVaultFolder &&
 		engineCatalog.some((descriptor) => descriptor.id === "kopia" && descriptor.installed &&
 			descriptor.providers.some((provider) => provider.id === vaultForm.connector && provider.supported));
+	const createObjectLockAvailable = createKopiaAvailable && ["s3", "azblob", "gcs"].includes(vaultForm.connector);
 	const connectUsesRcloneSignIn = usesRcloneSignIn(connectForm.connector);
 	// The vault name is the vault's folder name, so it can't be changed here.
 	const connectUsesVaultFolder = usesVaultFolderName(connectForm.connector);
@@ -3400,8 +3561,10 @@ export default function Protect() {
 			provider.id === vaultSettings.connector && provider.supported
 		)
 	));
-	const updateCreateObjectLock = (next: VaultForm) => {
-		if (!next.objectLock.enrolled || next.engine === "kopia") {
+	// Object Lock and error correction both need Kopia: turning either on
+	// switches the engine, and the engine choice stays locked while one is on.
+	const updateCreateKopiaOption = (next: VaultForm) => {
+		if ((!next.objectLock.enrolled && next.eccOverheadPercent === 0) || next.engine === "kopia") {
 			setVaultForm(next);
 			return;
 		}
@@ -4321,6 +4484,7 @@ export default function Protect() {
 				maintenanceSchedule: vaultForm.maintenanceSchedule,
 				concurrencyMode: vaultForm.concurrencyMode,
 				objectLock: vaultForm.objectLock,
+				eccOverheadPercent: vaultForm.eccOverheadPercent,
 				...(retryCreationIntentId ? { creationIntentId: retryCreationIntentId } : {}),
 			};
 		const owner = { session: vaultCreateSession.current, generation: ++vaultCreateSubmissionGeneration.current };
@@ -5326,6 +5490,9 @@ export default function Protect() {
 			maintenanceSchedule: intent.maintenanceSchedule,
 			concurrencyMode: intent.concurrencyMode || "native",
 			objectLock: intent.objectLock ?? emptyObjectLock(),
+			// A pending creation saved before error correction was offered
+			// has no value, which is off.
+			eccOverheadPercent: intent.eccOverheadPercent ?? 0,
 		});
 		openVaultCreate(form);
 		setRetryCreationIntentId(intent.id);
@@ -5632,9 +5799,7 @@ export default function Protect() {
                                         : partiallyProtected
                                             ? t("ui.destinationStatus.successfulCount", { successful: successfulTargets.length, total: job.targets.length })
                                             : t("ui.destinationStatus.notRun");
-                        const targetDetails = job.targets.map((target) =>
-                            `${target.repositoryName}: ${targetStatusLabel(target.lastStatus, target.lastIssueKind)}`
-                        ).join(" · ");
+                        const targetDetails = job.targets.map(targetStatusLine).join("\n");
                         const pendingCatchUpTargets = job.targets.filter((target) => target.pendingCatchUp);
                         return (
 	                            <article key={job.id} className={`job-flow ${tone}${selectedJobIDs.includes(job.id) ? " selected" : ""}`}>
@@ -5644,10 +5809,10 @@ export default function Protect() {
 								</div>
                                 <div className="flow-source">
                                     <strong>{job.name}</strong>
-									<Tooltip content={displayPath(currentSource)}>
-										<span className="flow-source-path"><span className="flow-source-path-text"><b>{t("ui.pages.protect.source")}</b> {displayPath(currentSource)}</span></span>
+									<Tooltip content={ltrIsolate(displayPath(currentSource))}>
+										<span className="flow-source-path"><span className="flow-source-path-text"><b>{t("ui.pages.protect.source")}</b> <bdi dir="ltr">{displayPath(currentSource)}</bdi></span></span>
 									</Tooltip>
-									<span><b>{t("ui.pages.protect.size")}</b> {job.sizeBytes == null ? t("ui.pages.protect.not.measured.yet") : readableSize(job.sizeBytes)}</span>
+									<span><b>{t("ui.pages.protect.size")}</b> {job.sizeBytes == null ? t("ui.pages.protect.not.measured.yet") : <bdi dir="ltr">{readableSize(job.sizeBytes)}</bdi>}</span>
                                 </div>
                                 <div className="flow-glyph">
                                     <span className={status === t("ui.jobStatus.completedLockedFilesSkipped") ? "flow-status flow-status-wrap" : "flow-status"}>{status === t("ui.jobStatus.partiallyProtected") ? renderMessage("ui.jobStatus.partiallyProtectedBreak", { break: <br /> }) : status}</span>
@@ -5731,7 +5896,7 @@ export default function Protect() {
 									</span>
 								</div>
 								<strong>{intent.name}</strong>
-								<Tooltip content={intent.location}>
+								<Tooltip content={ltrIsolate(intent.location)}>
 									<span className="vault-location"><span className="vault-location-text">{intent.location}</span></span>
 								</Tooltip>
 							</div>
@@ -5777,7 +5942,7 @@ export default function Protect() {
 									  </span>
 										</div>
 										<strong>{repo.name}</strong>
-										<Tooltip content={repo.location}>
+										<Tooltip content={ltrIsolate(repo.location)}>
 											<span className="vault-location"><span className="vault-location-text">{repositoryLocationLabel(repo)}</span></span>
 										</Tooltip>
 									{repo.connector === "webdav" && webdavUsesPlainHTTP(repo.location) && <p className="recovery-warning webdav-plain-http-warning">{t("ui.protect.webdavPlainHTTPCardWarning")}</p>}
@@ -5787,7 +5952,7 @@ export default function Protect() {
 									{reconnectRequired && <span className="recovery-warning">{t("notifications.message.vaultReconnectRequired", { vaultName: repo.name })}</span>}
                                 </div>
 								<div className={`vault-stat vault-size-stat${statsActive ? " is-refreshing" : ""}`} inert={cardBlocked || undefined}>
-									<div className="vault-size-summary">{sizePresentation ? <Tooltip content={sizePresentation.tooltip}><span className="vault-size-value" aria-label={sizePresentation.display}><strong>{sizePresentation.display}</strong></span></Tooltip> : <strong>{t("ui.pages.protect.not.measured.yet")}</strong>}<span>{t("ui.pages.protect.vault.size")}</span></div>
+									<div className="vault-size-summary">{sizePresentation ? <Tooltip content={sizePresentation.tooltip}><span className="vault-size-value" aria-label={sizePresentation.display}><strong><bdi dir="ltr">{sizePresentation.display}</bdi></strong></span></Tooltip> : <strong>{t("ui.pages.protect.not.measured.yet")}</strong>}<span>{t("ui.pages.protect.vault.size")}</span></div>
 									<div className="vault-size-meta"><small>{t("ui.protect.sizeStatsUpdated", { time: stats.vaultSizeMeasuredAt ? timeAgo(stats.vaultSizeMeasuredAt) : t("ui.protect.notMeasuredYet") })}</small><Tooltip content={t("ui.pages.protect.replicaro.periodically.refreshes.vault.size.stats.you.can.force.a.refr")}><button className="vault-stats-refresh" aria-label={t("ui.pages.protect.refresh.stats.now")} disabled={cardBlocked} onClick={() => refreshVaultSize(repo.id)}>{t("ui.pages.protect.refresh.stats.now")}</button></Tooltip></div>
 									{statsActive && <span className="vault-stats-refreshing"><span className="spinner" /><span><strong>{statsStatus}</strong><span>{t("ui.pages.protect.you.can.safely.close.this.page.if.you.need.to.refreshing.will.resume.i")}</span></span></span>}
 									{stats.failure && <small className="recovery-warning vault-size-failure">
@@ -5858,14 +6023,14 @@ export default function Protect() {
 	// box would be cut off at its edge. A folder source renders the two
 	// settings straight into the panel, without the block.
 	const jobFilterFields = <>
-		<label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" rows={3} value={jobFormFilters.excludes} disabled={jobFormSingleFile} placeholder={`${examplePlaceholder("*.tmp")}\n${examplePlaceholder("node_modules")}`} onChange={(event) => setJobForm({ ...jobForm, excludes: event.target.value })} /><small>{t("ui.pages.protect.one.pattern.per.line.for.files.folders.this.job.should.skip")}</small></label>
+		<label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" dir="ltr" rows={3} value={jobFormFilters.excludes} disabled={jobFormSingleFile} placeholder={`${examplePlaceholder("*.tmp")}\n${examplePlaceholder("node_modules")}`} onChange={(event) => setJobForm({ ...jobForm, excludes: event.target.value })} /><small>{renderMessage("ui.pages.protect.one.pattern.per.line.for.files.folders.this.job.should.skip", excludePatternHelpValues())}</small><FieldWarning text={excludesHaveBackslash(jobFormFilters.excludes) ? t("ui.protect.excludeBackslashNote") : ""} /></label>
 		<MarkerFileFields value={jobFormFilters} usesKopia={jobFormUsesKopia} singleFile={jobFormSingleFile} showErrors={jobSaveAttempted} onChange={(markers) => setJobForm({ ...jobForm, ...markers })} />
 	</>;
 	// The same explanation on bulk edit's exclude patterns while a single-file
 	// job is selected; there the block is the whole setting.
 	const bulkExcludesFields = <>
 		<label className="check"><input type="checkbox" checked={bulkChangesExcludes} disabled={bulkIncludesSingleFile} onChange={(event) => setBulkForm({ ...bulkForm, changeExcludes: event.target.checked })} />{t("ui.pages.protect.change.exclude.patterns")}</label>
-		{bulkChangesExcludes && <div className="bulk-setting-fields"><label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" rows={3} value={bulkForm.excludes} placeholder={`${examplePlaceholder("*.tmp")}\n${examplePlaceholder("node_modules")}`} onChange={(event) => setBulkForm({ ...bulkForm, excludes: event.target.value })} /><small>{t("ui.pages.protect.one.pattern.per.line.for.files.folders.these.jobs.should.skip")}</small></label></div>}
+		{bulkChangesExcludes && <div className="bulk-setting-fields"><label className="field"><span>{t("ui.pages.protect.exclude.patterns.optional")}</span><textarea className="mono" dir="ltr" rows={3} value={bulkForm.excludes} placeholder={`${examplePlaceholder("*.tmp")}\n${examplePlaceholder("node_modules")}`} onChange={(event) => setBulkForm({ ...bulkForm, excludes: event.target.value })} /><small>{renderMessage("ui.pages.protect.one.pattern.per.line.for.files.folders.these.jobs.should.skip", excludePatternHelpValues())}</small><FieldWarning text={excludesHaveBackslash(bulkForm.excludes) ? t("ui.protect.excludeBackslashNote") : ""} /></label></div>}
 	</>;
     return (
         <div className="page protect-page">
@@ -5949,7 +6114,7 @@ export default function Protect() {
 				<div className="mutation-results">{jobCreationResults.map((item, index) => <div className={`mutation-result ${item.status}`} key={`${item.name}:${index}`}>
 					<strong>{item.name}</strong>
 					<span>{jobMutationStatusLabel(item.status)}</span>
-					{item.source && <small className="mono mutation-result-source">{t("ui.protect.sourcePath", { path: item.source })}</small>}
+					{item.source && <small className="mono mutation-result-source">{t("ui.protect.sourcePath", { path: ltrIsolate(item.source) })}</small>}
 					{item.message && <small>{item.message}</small>}
 				</div>)}</div>
 				<div className="modal-footer">
@@ -6075,7 +6240,7 @@ export default function Protect() {
 							<p className="section-copy">{t("ui.protect.enterExistingDetailsHelp")}</p>
 						<label className="field"><span>{t("ui.pages.protect.storage.type")}</span><select value={connectForm.coldStorage ? "cold_s3" : connectForm.connector} disabled={Boolean(connectPreview || retryConnectionIntentId)} onChange={(event) => { if (connectRcloneAuth?.sessionId) void closeRcloneAuthorization(connectRcloneAuth.sessionId); setConnectRcloneAuth(null); const coldStorage = event.target.value === "cold_s3"; const connector = coldStorage ? "s3" : event.target.value; const selected = connectionIntegrations.find((item) => item.id === connector); invalidateConnectPreview(); setConnectForm((current) => ({ ...current, engine: coldStorage ? "restic" : current.engine, connector, coldStorage, archiveWriteClass: "GLACIER", checkSchedule: coldStorage ? "manual" : current.checkSchedule, location: "", pendingLocation: "", options: integrationDefaults(selected), objectLock: emptyObjectLock() })); }}>{connectionIntegrations.flatMap((item) => [<option key={item.id} value={item.id}>{knownMessage(`ui.integration.${item.id}.label`, item.label)}</option>, ...(item.id === "s3" ? [<option key="cold_s3" value="cold_s3">{t("ui.pages.protect.cold.storage.must.be.s3.compatible")}</option>] : [])])}</select>{connectIntegration && <small>{connectForm.coldStorage ? t("ui.protect.coldS3CompatibilityHelp", { glacier: "GLACIER", deepArchive: "DEEP_ARCHIVE" }) : connectIntegrationDescription}</small>}</label>
 						{(!connectPreview || !connectUsesRcloneSignIn) && (connectIntegration?.localBrowser ? <label className="field"><span>{t("ui.pages.protect.location")}</span><DirectoryField value={connectForm.location} disabled={Boolean(retryConnectionIntentId)} placeholder={examplePlaceholder(connectIntegration.placeholder)} onChange={(location) => { invalidateConnectPreview(); setConnectForm((current) => ({ ...current, location, pendingLocation: "" })); }} /></label> : connectIntegration ? <RemoteVaultFields form={connectForm} integration={connectIntegration} onChange={(next) => { if (!retryConnectionIntentId) invalidateConnectPreview(); setConnectForm(next); }} /> : null)}
-						{!connectUsesRcloneSignIn && connectOrderedOptions.filter((option) => !option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={connectForm.connector} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}
+						{!connectUsesRcloneSignIn && connectOrderedOptions.filter((option) => !option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={connectForm.connector} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} warning={kopiaSFTPSlowWarning(connectKnownEngine, connectForm.connector, connectForm.options, option.key)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}
 							{(!connectPreview || !connectUsesRcloneSignIn) && <label className="field"><span>{t("ui.pages.protect.vault.encryption.password")}</span><input type="password" autoComplete="current-password" value={connectForm.password} onChange={(event) => { if (!retryConnectionIntentId) invalidateConnectPreview(); setConnectForm((current) => ({ ...current, password: event.target.value })); }} /><small>{t("ui.pages.protect.the.password.is.used.to.decrypt.and.validate.the.vault.the.password.is")}</small></label>}
 						{matchingConnectionIntent && <section className="recovery-warning recovery-fallback-message" role="status">
 							<p><strong>{retryConnectionError ? t("ui.protect.previousConnectionIncomplete") : matchingConnectionIntent.state === "prepared" ? t("ui.protect.earlierConnectionSaved") : t("ui.protect.unfinishedConnectionFound")}</strong></p>
@@ -6091,7 +6256,7 @@ export default function Protect() {
 						</section>}
 						{connectForm.coldStorage && <div className="recovery-warning">{coldStorageProviderGuidance().map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>}
 						{!connectUsesRcloneSignIn && connectOrderedOptions.some((option) => option.advanced) && <button className="btn advanced-toggle" onClick={() => setConnectAdvanced((value) => !value)}><Icon name="settings" size={14} />{connectAdvanced ? t("ui.pages.protect.hide.advanced.settings") : t("ui.pages.protect.advanced.settings")}</button>}
-						{!connectUsesRcloneSignIn && connectAdvanced && <div className="advanced-panel">{connectOrderedOptions.filter((option) => option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={connectForm.connector} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}</div>}
+						{!connectUsesRcloneSignIn && connectAdvanced && <div className="advanced-panel">{connectOrderedOptions.filter((option) => option.advanced && !connectionOptionIsCustom(connectForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={connectForm.connector} option={option} value={connectForm.options[option.key] ?? ""} disabled={Boolean(retryConnectionIntentId && !option.credential && !option.secret)} warning={kopiaSFTPSlowWarning(connectKnownEngine, connectForm.connector, connectForm.options, option.key)} onChange={(value) => { if (!retryConnectionIntentId) invalidateConnectPreview(option.key === "storage_class" && connectDetectedEngine === "restic"); setConnectForm((current) => updateConnectorOption(current, option.key, value)); }} />)}</div>}
 						<div className={`modal-footer${connectForm.connector === RCLONE_REMOTE_CONNECTOR ? " rclone-remote-dialog-footer" : ""}`}><button className="btn" disabled={connectSaving} onClick={() => { if (!connectSaving) { resetConnectWorkflow(); setShowVaultConnect(false); } }}>{t("ui.pages.protect.cancel")}</button>
 										{matchingConnectionIntent && retryConnectionIntentId ? <button className="btn primary" disabled={connectChecking || connectSaving || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0 || connectMissingSFTPAuthentication} onClick={() => void retryPendingConnection()}>{connectSaving && <span className="spinner" />}{retryConnectionError ? t("ui.protect.retryConnection") : t("ui.protect.continuePreviousConnection")}</button> : (!matchingConnectionIntent || canCheckAnotherRcloneAccount) && <button className="btn primary" disabled={connectChecking || connectReplacingVault || !vaultLocation(connectForm) || !validVaultPassword(connectForm.password) || connectMissingRequiredOptions.length > 0 || connectMissingSFTPAuthentication} onClick={() => { if (connectUsesRcloneSignIn) setConnectRcloneAuthorizationAction("check"); else void checkExistingVault(); }}>{connectChecking && <span className="spinner" />}{t("ui.pages.protect.check.existing.vault")}</button>}
 						</div>
@@ -6180,7 +6345,7 @@ export default function Protect() {
 					<div className="modal-form">
 						{createUsesRcloneRemote && <RcloneRemoteWarning />}
 						<p className="section-copy">{t("ui.pages.protect.encryption.compression.and.deduplication.are.automatically.applied.to")}</p>
-						<label className="field"><span>{t("ui.pages.protect.storage.type")}</span><select autoFocus value={vaultForm.coldStorage ? "cold_s3" : vaultForm.connector} disabled={Boolean(vaultForm.pendingLocation)} onChange={(event) => { if (createRcloneAuth?.sessionId) void closeRcloneAuthorization(createRcloneAuth.sessionId); setCreateRcloneAuth(null); setShowCreateRcloneAuthorization(false); const coldStorage = event.target.value === "cold_s3"; const connector = coldStorage ? "s3" : event.target.value; const selected = vaultStorageIntegrations.find((item) => item.id === connector); const eligible = engineCatalog.filter((descriptor) => descriptor.installed && descriptor.providers.some((provider) => provider.id === connector && provider.supported)); const engine = coldStorage ? "restic" : eligible.some((descriptor) => descriptor.id === vaultForm.engine) ? vaultForm.engine : (eligible.find((descriptor) => descriptor.id === "restic")?.id ?? eligible[0]?.id ?? vaultForm.engine) as VaultForm["engine"]; setVaultForm({ ...vaultForm, engine, connector, coldStorage, archiveWriteClass: "GLACIER", checkSchedule: coldStorage ? "manual" : vaultForm.checkSchedule, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "", options: integrationOptionsForEngine(selected, engine, engineCatalog), objectLock: objectLockForSelection(vaultForm.objectLock, engine, connector) }); }}>{vaultStorageIntegrations.flatMap((item) => [<option key={item.id} value={item.id}>{knownMessage(`ui.integration.${item.id}.label`, item.label)}</option>, ...(item.id === "s3" ? [<option key="cold_s3" value="cold_s3">{t("ui.pages.protect.cold.storage.must.be.s3.compatible")}</option>] : [])])}</select>{integration && <small>{vaultForm.coldStorage ? t("ui.pages.protect.supports.all.s3.compatible.cold.object.storage.that.accept", { glacier: "GLACIER", deepArchive: "DEEP_ARCHIVE" }) : createIntegrationDescription}</small>}</label>
+						<label className="field"><span>{t("ui.pages.protect.storage.type")}</span><select autoFocus value={vaultForm.coldStorage ? "cold_s3" : vaultForm.connector} disabled={Boolean(vaultForm.pendingLocation)} onChange={(event) => { if (createRcloneAuth?.sessionId) void closeRcloneAuthorization(createRcloneAuth.sessionId); setCreateRcloneAuth(null); setShowCreateRcloneAuthorization(false); const coldStorage = event.target.value === "cold_s3"; const connector = coldStorage ? "s3" : event.target.value; const selected = vaultStorageIntegrations.find((item) => item.id === connector); const eligible = engineCatalog.filter((descriptor) => descriptor.installed && descriptor.providers.some((provider) => provider.id === connector && provider.supported)); const engine = coldStorage || usesVaultFolderName(connector) ? "restic" : eligible.some((descriptor) => descriptor.id === vaultForm.engine) ? vaultForm.engine : (eligible.find((descriptor) => descriptor.id === "restic")?.id ?? eligible[0]?.id ?? vaultForm.engine) as VaultForm["engine"]; setVaultForm({ ...vaultForm, engine, connector, coldStorage, archiveWriteClass: "GLACIER", checkSchedule: coldStorage ? "manual" : vaultForm.checkSchedule, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "", options: integrationOptionsForEngine(selected, engine, engineCatalog), objectLock: objectLockForSelection(vaultForm.objectLock, engine, connector), eccOverheadPercent: eccOverheadForEngine(vaultForm.eccOverheadPercent, engine) }); }}>{vaultStorageIntegrations.flatMap((item) => [<option key={item.id} value={item.id}>{knownMessage(`ui.integration.${item.id}.label`, item.label)}</option>, ...(item.id === "s3" ? [<option key="cold_s3" value="cold_s3">{t("ui.pages.protect.cold.storage.must.be.s3.compatible")}</option>] : [])])}</select>{integration && <small>{vaultForm.coldStorage ? t("ui.pages.protect.supports.all.s3.compatible.cold.object.storage.that.accept", { glacier: "GLACIER", deepArchive: "DEEP_ARCHIVE" }) : createIntegrationDescription}</small>}</label>
 						{!createUsesRcloneRemote && createVaultNameField}
 							{createUsesRcloneSignIn && <><label className="field"><span>{t("ui.pages.protect.description.optional")}</span><input disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.description} onChange={(event) => setVaultForm({ ...vaultForm, description: event.target.value })} /></label><div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.encryption.password")}</span><input type="password" autoComplete="new-password" value={vaultForm.password} onChange={(event) => setVaultForm({ ...vaultForm, password: event.target.value })} /><small>{vaultPasswordHelp()}</small></label><label className="field"><span>{t("ui.pages.protect.confirm.encryption.password")}</span><input type="password" autoComplete="new-password" value={vaultForm.passwordConfirmation} onChange={(event) => setVaultForm({ ...vaultForm, passwordConfirmation: event.target.value })} /></label></div>{vaultForm.password && vaultForm.passwordConfirmation && vaultForm.password !== vaultForm.passwordConfirmation && <small className="inline-error" role="alert">{t("ui.pages.protect.the.passwords.do.not.match")}</small>}</>}
 						{integration?.localBrowser ? <label className="field"><span>{t("ui.pages.protect.location")}</span><DirectoryField value={vaultForm.location} disabled={Boolean(vaultForm.pendingLocation)} placeholder={examplePlaceholder(integration.placeholder)} onChange={(location) => setVaultForm({ ...vaultForm, location })} /></label> : integration && !createUsesRcloneSignIn ? <RemoteVaultFields form={vaultForm} integration={integration} vaultFolderField={false} onChange={setVaultForm} /> : null}
@@ -6191,16 +6356,17 @@ export default function Protect() {
 						    protected class, and native Cold imports start from the GLACIER default. */}
 						{vaultCreateError.includes("connect existing vault") && <div className="recovery-warning"><p>{vaultCreateError}</p><button className="btn sm" onClick={() => { if (!closeVaultCreate()) return; invalidateConnectPreview(); setRetryConnectionIntentId(""); setConnectForm((current) => restoreVaultDestinationFields({ ...current, connector: vaultForm.connector, coldStorage: vaultForm.coldStorage, archiveWriteClass: "GLACIER", checkSchedule: vaultForm.coldStorage ? "manual" : current.checkSchedule, location: vaultLocation(vaultForm, true), options: { ...vaultForm.options }, password: vaultForm.password })); setShowVaultConnect(true); refreshConnectionIntents(); }}>{t("ui.pages.protect.connect.to.existing.vault")}</button></div>}
 						{vaultCreateError.includes("selected location is not empty") && <div className="recovery-warning"><p>{vaultCreateError}</p><div className="tool-buttons"><button className="btn sm" onClick={() => { setVaultCreateError(""); setVaultForm({ ...vaultForm, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "" }); }}>{t("ui.pages.protect.select.empty.subfolder")}</button><button className="btn sm" onClick={() => { setVaultCreateError(""); setVaultForm({ ...vaultForm, location: "", pendingLocation: "", bucket: "", container: "", prefix: "", host: "" }); }}>{t("ui.pages.protect.select.different.destination")}</button></div></div>}
-						{!createUsesRcloneSignIn && createOrderedOptions.filter((option) => !option.advanced && !creationOptionIsCustom(vaultForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={vaultForm.connector} option={option} value={vaultForm.options[option.key] ?? ""} disabled={creationOptionLockedForPending(vaultForm, option)} onChange={(value) => setVaultForm(updateConnectorOption(vaultForm, option.key, value))} />)}
+						{!createUsesRcloneSignIn && createOrderedOptions.filter((option) => !option.advanced && !creationOptionIsCustom(vaultForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={vaultForm.connector} option={option} value={vaultForm.options[option.key] ?? ""} disabled={creationOptionLockedForPending(vaultForm, option)} warning={kopiaSFTPSlowWarning(vaultForm.engine, vaultForm.connector, vaultForm.options, option.key)} onChange={(value) => setVaultForm(updateConnectorOption(vaultForm, option.key, value))} />)}
 							{!createUsesRcloneSignIn && <><label className="field"><span>{t("ui.pages.protect.description.optional")}</span><input disabled={Boolean(vaultForm.pendingLocation)} value={vaultForm.description} onChange={(event) => setVaultForm({ ...vaultForm, description: event.target.value })} /></label><div className="form-grid two"><label className="field"><span>{t("ui.pages.protect.encryption.password")}</span><input type="password" autoComplete="new-password" value={vaultForm.password} onChange={(event) => setVaultForm({ ...vaultForm, password: event.target.value })} /><small>{vaultPasswordHelp()}</small></label><label className="field"><span>{t("ui.pages.protect.confirm.encryption.password")}</span><input type="password" autoComplete="new-password" value={vaultForm.passwordConfirmation} onChange={(event) => setVaultForm({ ...vaultForm, passwordConfirmation: event.target.value })} /></label></div>{vaultForm.password && vaultForm.passwordConfirmation && vaultForm.password !== vaultForm.passwordConfirmation && <small className="inline-error" role="alert">{t("ui.pages.protect.the.passwords.do.not.match")}</small>}</>}
 						{vaultForm.coldStorage && <div className="recovery-warning">{coldStorageProviderGuidance().map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>}
                         <button className="btn advanced-toggle" onClick={() => setVaultAdvanced((value) => !value)}><Icon name="settings" size={14} />{vaultAdvanced ? t("ui.pages.protect.hide.advanced.settings") : t("ui.pages.protect.advanced.settings")}</button>
 						{vaultAdvanced && (
 							<div className="advanced-panel">
-								<ObjectLockFields form={vaultForm} creation creationAvailable={createObjectLockAvailable} disabled={Boolean(vaultForm.pendingLocation)} onChange={updateCreateObjectLock} />
-								<label className="field"><span>{t("ui.pages.protect.vault.engine")}</span><select value={vaultForm.engine} disabled={vaultForm.objectLock.enrolled || vaultForm.coldStorage || createUsesVaultFolder || Boolean(vaultForm.pendingLocation)} onChange={(event) => { const engine = event.target.value as VaultForm["engine"]; const selected = vaultStorageIntegrations.find((item) => item.id === vaultForm.connector); setVaultForm({ ...vaultForm, engine, options: integrationOptionsForEngine(selected, engine, engineCatalog, vaultForm.options), objectLock: objectLockForSelection(vaultForm.objectLock, engine, vaultForm.connector) }); }}>{engineCatalog.filter((item) => vaultForm.coldStorage ? item.id === "restic" : !createUsesVaultFolder || item.id === "restic").map((item) => <option key={item.id} value={item.id} disabled={!item.installed || !item.providers.some((provider) => provider.id === vaultForm.connector && provider.supported)}>{item.name}</option>)}</select><small>{vaultForm.objectLock.enrolled ? t("ui.pages.protect.kopia.is.the.required.engine.when.object.locking.is") : vaultEngineHelp(vaultForm.connector, vaultForm.coldStorage)}</small></label>
+								<ObjectLockFields form={vaultForm} creation creationAvailable={createObjectLockAvailable} disabled={Boolean(vaultForm.pendingLocation)} onChange={updateCreateKopiaOption} />
+								<ErrorCorrectionFields form={vaultForm} available={createKopiaAvailable} disabled={Boolean(vaultForm.pendingLocation)} onChange={updateCreateKopiaOption} />
+								<label className="field"><span>{t("ui.pages.protect.vault.engine")}</span><select value={vaultForm.engine} disabled={vaultForm.objectLock.enrolled || vaultForm.eccOverheadPercent > 0 || vaultForm.coldStorage || createUsesVaultFolder || Boolean(vaultForm.pendingLocation)} onChange={(event) => { const engine = event.target.value as VaultForm["engine"]; const selected = vaultStorageIntegrations.find((item) => item.id === vaultForm.connector); setVaultForm({ ...vaultForm, engine, options: integrationOptionsForEngine(selected, engine, engineCatalog, vaultForm.options), objectLock: objectLockForSelection(vaultForm.objectLock, engine, vaultForm.connector), eccOverheadPercent: eccOverheadForEngine(vaultForm.eccOverheadPercent, engine) }); }}>{engineCatalog.filter((item) => vaultForm.coldStorage ? item.id === "restic" : !createUsesVaultFolder || item.id === "restic").map((item) => <option key={item.id} value={item.id} disabled={!item.installed || !item.providers.some((provider) => provider.id === vaultForm.connector && provider.supported)}>{item.name}</option>)}</select><small>{createVaultEngineHelp(vaultForm)}</small></label>
 								{vaultForm.coldStorage && <label className="field"><span>{t("ui.pages.protect.storage.class")}</span><select value={vaultForm.archiveWriteClass} disabled={Boolean(vaultForm.pendingLocation)} onChange={(event) => setVaultForm({ ...vaultForm, archiveWriteClass: event.target.value as VaultForm["archiveWriteClass"] })}><option value="GLACIER">{t("ui.pages.protect.glacier.default", { glacier: "GLACIER" })}</option><option value="DEEP_ARCHIVE">{t("ui.pages.protect.deep.archive", { deepArchive: "DEEP_ARCHIVE" })}</option></select><small>{coldStorageArchiveClassHelp()}</small></label>}
-							{!createUsesRcloneSignIn && createOrderedOptions.filter((option) => option.advanced && !creationOptionIsCustom(vaultForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={vaultForm.connector} option={option} value={vaultForm.options[option.key] ?? ""} disabled={creationOptionLockedForPending(vaultForm, option)} explanation={advancedCreationOptionExplanation(vaultForm.connector, option)} onChange={(value) => setVaultForm(updateConnectorOption(vaultForm, option.key, value))} />)}
+							{!createUsesRcloneSignIn && createOrderedOptions.filter((option) => option.advanced && !creationOptionIsCustom(vaultForm.connector, option.key)).map((option) => <IntegrationField key={option.key} connector={vaultForm.connector} option={option} value={vaultForm.options[option.key] ?? ""} disabled={creationOptionLockedForPending(vaultForm, option)} explanation={advancedCreationOptionExplanation(vaultForm.connector, option)} warning={kopiaSFTPSlowWarning(vaultForm.engine, vaultForm.connector, vaultForm.options, option.key)} onChange={(value) => setVaultForm(updateConnectorOption(vaultForm, option.key, value))} />)}
 								<VaultCareFields form={vaultForm} disabled={Boolean(vaultForm.pendingLocation)} onChange={setVaultForm} />
                             </div>
                         )}
@@ -6251,7 +6417,7 @@ export default function Protect() {
 									: t("ui.pages.protect.checking.whether.vault.work.is.running.vault.settings.cannot")}</span><span className="spinner" aria-hidden="true" /></p>
 						</div>}
 						<div inert={vaultWorkState !== "idle" ? true : undefined}>
-					<div className="modal-location mono">{vaultSettings.engine} · {vaultSettings.location}</div>
+					<div className="modal-location mono">{vaultSettings.engine} · <bdi dir="ltr">{vaultSettings.location}</bdi></div>
 					<div className="modal-section-label">{t("ui.pages.protect.vault.care")}</div>
 					{vaultOwnershipPresentation === "checking" && <section className="recovery-warning vault-owner-status checking" role="status"><span className="spinner" aria-hidden="true" />{t("ui.pages.protect.checking.vault.ownership.status")}</section>}
 					{vaultOwnershipPresentation === "unverified" && <section className="recovery-warning vault-owner-status" role="alert"><p>{t("ui.pages.protect.vault.ownership.status.could.not.be.verified.vault.owner.actions.are.d")}</p><button className="btn" onClick={() => detectVaultOwnership(vaultSettings, vaultSettingsSession.current)}>{t("ui.pages.protect.detect.vault.owner.status")}</button></section>}
@@ -6270,6 +6436,7 @@ export default function Protect() {
 						originalObjectLock={vaultSettings.objectLock}
 						onChange={(next) => { setObjectLock(next.objectLock); setMaintenanceSchedule(next.maintenanceSchedule); }}
 					/>
+					{vaultSettings.engine === "kopia" && <ErrorCorrectionStatus percent={vaultSettings.eccOverheadPercent ?? 0} />}
 					{vaultSettings.coldStorage && <p><strong>{t("ui.pages.protect.archive.write.class")}</strong> {vaultSettings.archiveWriteClass} {t("ui.protect.readOnly")}</p>}
 					{vaultSettings.coldStorage && <div className="recovery-warning">{coldStorageProviderGuidance().map((paragraph) => <p key={paragraph}>{paragraph}</p>)}</div>}
 					{vaultSettings.engine === "restic" && <>
@@ -6289,7 +6456,7 @@ export default function Protect() {
 							<button className="btn" disabled={vaultOwnershipPresentation !== "owner" || Boolean(vaultMutations[vaultSettings.id])} onClick={submitVaultPasswordChange}>{t("ui.pages.protect.change.vault.password")}</button>
 						</>}
 					</section>
-					{dormantJobs.length > 0 && <section className="unowned-snapshots"><div className="modal-section-label">{t("ui.pages.protect.dormant.recovery.jobs")}</div><p>{t("ui.pages.protect.these.definitions.remain.protected.in.vault.replicaro.but.do.not.run.o", { sidecar: "vault.replicaro" })}</p>{dormantJobs.map((item) => <div className="unowned-snapshot" key={item.jobId}><span><strong>{item.definition.name}</strong><small>{displayPath(item.definition.source)} · {scheduleLabel(item.definition.schedule)}</small><small>{t("ui.protect.dormantScriptSummary", { before: item.definition.beforeScriptPath ? `${item.definition.beforeScriptPath} (${item.definition.beforeScriptMustSucceed ? t("ui.protect.required") : t("ui.protect.optional")})` : t("ui.protect.noneLower"), after: item.definition.afterScriptPath ? `${item.definition.afterScriptPath} (${item.definition.afterScriptMustSucceed ? t("ui.protect.required") : t("ui.protect.optional")})` : t("ui.protect.noneLower") })}</small></span><div className="tool-buttons"><button className="btn sm" disabled={Boolean(dormantBusy)} onClick={() => void changeDormant(item.repositoryId, item.jobId, "restore")}>{dormantBusy === `restore:${item.jobId}` && <span className="spinner" />}{t("ui.pages.protect.restore.disabled")}</button><button className="btn sm danger-outline" disabled={Boolean(dormantBusy)} onClick={() => void changeDormant(item.repositoryId, item.jobId, "discard")}>{dormantBusy === `discard:${item.jobId}` && <span className="spinner" />}{t("ui.pages.protect.discard.definition")}</button></div></div>)}</section>}
+					{dormantJobs.length > 0 && <section className="unowned-snapshots"><div className="modal-section-label">{t("ui.pages.protect.dormant.recovery.jobs")}</div><p>{t("ui.pages.protect.these.definitions.remain.protected.in.vault.replicaro.but.do.not.run.o", { sidecar: "vault.replicaro" })}</p>{dormantJobs.map((item) => <div className="unowned-snapshot" key={item.jobId}><span><strong>{item.definition.name}</strong><small><bdi dir="ltr">{displayPath(item.definition.source)}</bdi> · {scheduleLabel(item.definition.schedule)}</small><small>{t("ui.protect.dormantScriptSummary", { before: item.definition.beforeScriptPath ? `${ltrIsolate(item.definition.beforeScriptPath)} (${item.definition.beforeScriptMustSucceed ? t("ui.protect.required") : t("ui.protect.optional")})` : t("ui.protect.noneLower"), after: item.definition.afterScriptPath ? `${ltrIsolate(item.definition.afterScriptPath)} (${item.definition.afterScriptMustSucceed ? t("ui.protect.required") : t("ui.protect.optional")})` : t("ui.protect.noneLower") })}</small></span><div className="tool-buttons"><button className="btn sm" disabled={Boolean(dormantBusy)} onClick={() => void changeDormant(item.repositoryId, item.jobId, "restore")}>{dormantBusy === `restore:${item.jobId}` && <span className="spinner" />}{t("ui.pages.protect.restore.disabled")}</button><button className="btn sm danger-outline" disabled={Boolean(dormantBusy)} onClick={() => void changeDormant(item.repositoryId, item.jobId, "discard")}>{dormantBusy === `discard:${item.jobId}` && <span className="spinner" />}{t("ui.pages.protect.discard.definition")}</button></div></div>)}</section>}
 					{vaultSettingsIntegration && (!usesRcloneSignIn(vaultSettings.connector) || (vaultSettings.engine === "restic" && vaultSettingsRcloneSupported)) && <section className="vault-connection-panel"><div className="modal-section-label">{t("ui.pages.protect.vault.connection")}</div><p>{t("ui.pages.protect.use.this.to.reconnect.to.the.vault.after.disconnection.for.any.reason")}</p><button className="btn" onClick={() => requestSavedVaultReconnect(vaultSettings)}>{t("ui.pages.protect.reconnect.vault")}</button></section>}
 					<div className="danger-zone"><div className="modal-section-label">{t("ui.pages.protect.danger.zone")}</div><p>{t("ui.pages.protect.removing.this.vault.also.removes.it.as.a.destination.from.matching.bac")}</p><button className="btn danger-outline" onClick={() => { const repository = vaultSettings; dismissVaultSettings(); openVaultDelete(repository); }}>{t("ui.pages.protect.remove.vault.from.replicaro")}</button></div>
 						</div>

@@ -3,9 +3,11 @@ package database
 import (
 	"context"
 	"database/sql"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -15,13 +17,30 @@ import (
 	"github.com/google/uuid"
 )
 
-// Only this cache schema version is accepted. It stores shared blocks and
-// ordered block lists; older formats are not migrated or read as a fallback.
-const CurrentMetadataCacheSchemaVersion = 4
+// Only this cache schema version is read. It stores shared blocks and ordered
+// block lists, each file's and folder's native modified time, and for File
+// History versions each file's Kopia object ID plus each Restic snapshot's diff
+// marks. A Restic entry's size and every backup's size are stored as the text
+// engines.FormatBytes writes, in decimal units ("2.2 MB"); version 6 caches
+// hold the binary units of earlier builds ("2.1 MiB"). The two must never be
+// mixed in one cache: a Restic entry's size text is part of the key of the
+// cached file-version rows, and a backup's size text is compared on its
+// snapshot header when the cache is reconciled, so old text next to new text
+// would make every header look changed. Older formats are never migrated:
+// they lack facts that only the vault can give or hold text in another
+// format, so a cache of an older version is thrown away and rebuilt from the
+// vault like a missing one, whatever vault it was bound to, since nothing in
+// it is used (see openMetadataCache and DiscardOutdatedMetadataCache). A newer
+// version is refused and left untouched.
+const CurrentMetadataCacheSchemaVersion = 7
 
 var (
 	ErrMetadataCacheIncompatible = errors.New("vault metadata cache schema is incompatible")
-	ErrMetadataCacheBinding      = errors.New("vault metadata cache binding does not match the authoritative database")
+	// errMetadataCacheOutdated marks a cache written in an older schema version.
+	// It wraps ErrMetadataCacheIncompatible so every caller that only checks for
+	// an unusable cache keeps working.
+	errMetadataCacheOutdated = fmt.Errorf("%w: written by an older version", ErrMetadataCacheIncompatible)
+	ErrMetadataCacheBinding  = errors.New("vault metadata cache binding does not match the authoritative database")
 )
 
 type MetadataReadAuthority struct {
@@ -240,6 +259,21 @@ func metadataCacheReaderForAuthority(ctx context.Context, mainDB *sql.DB, author
 
 func openMetadataCache(path, repositoryID, binding string) (*metadataCacheHandle, error) {
 	initialize, err := preflightMetadataCache(path, repositoryID, binding)
+	if errors.Is(err, errMetadataCacheOutdated) {
+		// A cache from an older version lacks facts only the vault can give
+		// (see CurrentMetadataCacheSchemaVersion), so it is treated as missing:
+		// its files are removed and an empty current cache takes their place.
+		// The next refresh then indexes the vault again. The version is checked
+		// before the binding, so an older cache goes whatever vault it was
+		// bound to: nothing in it is used. Only an older version gets this; a
+		// newer or corrupt cache, or a current-version cache bound to another
+		// vault, is still refused and left alone, because this version can't
+		// tell what it holds or whose it is.
+		if err := discardOutdatedMetadataCache(path); err != nil {
+			return nil, err
+		}
+		initialize, err = preflightMetadataCache(path, repositoryID, binding)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -264,6 +298,86 @@ func openMetadataCache(path, repositoryID, binding string) (*metadataCacheHandle
 		return closeOnError(err)
 	}
 	return &metadataCacheHandle{path: path, binding: binding, writer: writer, readers: readers}, nil
+}
+
+// discardOutdatedMetadataCache removes an older-version cache and its SQLite
+// sidecars. It runs while this vault's cache opening is reserved, so nothing
+// in this process has the file open. The -wal and -shm files go first: a
+// leftover WAL next to the new empty cache would be replayed into it by
+// SQLite. If removal stops part way (a crash, or Windows refusing a file that
+// another program holds), what is left is still the old cache or nothing,
+// and the next open finds it outdated or missing and simply tries again.
+func discardOutdatedMetadataCache(path string) error {
+	base, err := sqliteSidecarBase(path)
+	if err != nil {
+		return err
+	}
+	for _, candidate := range []string{base + "-wal", base + "-shm", path} {
+		if err := removeMetadataCacheFile(candidate); err != nil && !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("remove metadata cache of an older version: %w", err)
+		}
+	}
+	log.Printf("Removed the File History cache %s written by an older Replicaro version; the vault will be indexed again", filepath.Base(path))
+	return nil
+}
+
+// DiscardOutdatedMetadataCache removes the vault's cache when its main file
+// says it was written in an older cache schema (1 to CurrentMetadataCacheSchemaVersion-1),
+// and reports whether it did. Startup calls it once per vault, before anything
+// opens a cache, and queues a refresh for each vault whose cache it removed.
+//
+// It reads only the main file's SQLite header (the format magic and
+// user_version), without opening the database or copying anything, so a
+// leftover WAL costs nothing here, whatever its size. Nothing in an older cache
+// is used, so it is removed whichever vault it was bound to; the binding is not
+// checked. Anything else is left alone and not queued: a missing or empty file,
+// version 0, a current or newer version, or a file that isn't SQLite. The
+// normal open path (openMetadataCache) decides about those, so a newer,
+// corrupt, or wrongly bound current-version cache is refused there and left
+// untouched. Because the old cache is gone after the
+// first start whether or not its vault could be reached, the rebuild is queued
+// once after an upgrade and never again.
+func DiscardOutdatedMetadataCache(db *sql.DB, repositoryID string) (bool, error) {
+	path, err := MetadataCachePath(db, repositoryID)
+	if err != nil {
+		return false, err
+	}
+	version, ok, err := metadataCacheFileVersion(path)
+	if err != nil || !ok || version < 1 || version >= CurrentMetadataCacheSchemaVersion {
+		return false, err
+	}
+	return true, discardOutdatedMetadataCache(path)
+}
+
+// metadataCacheFileVersion reads user_version from a SQLite main file's
+// header: 4 bytes, big-endian, at offset 60, after the 16-byte format magic.
+// ok is false for a missing, short, non-regular or non-SQLite file.
+func metadataCacheFileVersion(path string) (version uint32, ok bool, err error) {
+	file, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return 0, false, err
+	}
+	if !info.Mode().IsRegular() {
+		return 0, false, nil
+	}
+	var header [64]byte
+	if _, err := io.ReadFull(file, header[:]); errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return 0, false, nil
+	} else if err != nil {
+		return 0, false, err
+	}
+	if string(header[:16]) != "SQLite format 3\x00" {
+		return 0, false, nil
+	}
+	return binary.BigEndian.Uint32(header[60:64]), true, nil
 }
 
 func closeMetadataCacheDatabase(db *sql.DB) error {
@@ -363,6 +477,9 @@ func validatePreflightMetadataCache(db *sql.DB, repositoryID, binding string) er
 	var version int
 	if err := db.QueryRow(`PRAGMA user_version`).Scan(&version); err != nil {
 		return err
+	}
+	if version > 0 && version < CurrentMetadataCacheSchemaVersion {
+		return fmt.Errorf("%w (found version %d, expected %d)", errMetadataCacheOutdated, version, CurrentMetadataCacheSchemaVersion)
 	}
 	if version != CurrentMetadataCacheSchemaVersion {
 		return fmt.Errorf("%w (found version %d, expected %d)", ErrMetadataCacheIncompatible, version, CurrentMetadataCacheSchemaVersion)
@@ -797,6 +914,29 @@ func removeClosedMetadataCache(removal metadataCacheRemoval) error {
 	return result
 }
 
+// The File History version columns:
+//
+//   - metadata_cache_file_versions.mtime is the entry's native modified time in
+//     whole Unix seconds, for files and folders: Restore browse and File
+//     History show a folder's time as well as a file's. It is the time the
+//     engine lists for the item; for a folder, Restic's is the folder's own
+//     and Kopia's is the newest within it (see the Kopia directory reader,
+//     engines/kopia_directory.go). object_id is
+//     Kopia's object ID of a file (always empty for Restic and for folders,
+//     which File History keeps per backup date, so a change inside a folder
+//     doesn't add a row for the folder).
+//   - metadata_cache_snapshot_marks lists, for one Restic snapshot, each file
+//     `restic diff --metadata` marked with anything but a removal against the
+//     snapshot in marks_base. A snapshot with marks_base NULL has no marks yet.
+//     Removals aren't stored: a file missing from the snapshot already says so.
+//     Marks belong to the snapshot row and go with it (ON DELETE CASCADE), so
+//     re-indexing or dropping a snapshot always clears them.
+//   - metadata_cache_snapshots.native_source_paths is the JSON array of the
+//     source paths the snapshot's native header lists, sorted and without
+//     repeats (Restic's `paths`, Kopia's one source path). Together with the
+//     computer group it places the snapshot in its chain of File History
+//     versions. It is not the indexing roots: an untagged Restic snapshot is
+//     indexed beneath "/" whatever folders it holds.
 const metadataCacheSchema = `
 CREATE TABLE repositories (
 	database_id INTEGER PRIMARY KEY CHECK (database_id=1),
@@ -832,6 +972,8 @@ CREATE TABLE metadata_cache_snapshots (
 	status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','ready','failed')),
 	indexed_at TEXT NOT NULL DEFAULT '',
 	error TEXT NOT NULL DEFAULT '',
+	marks_base TEXT,
+	native_source_paths TEXT NOT NULL DEFAULT '',
 	PRIMARY KEY (repository_database_id,snapshot_id),
 	FOREIGN KEY (repository_database_id) REFERENCES repositories(database_id) ON DELETE CASCADE,
 	FOREIGN KEY (repository_database_id,entry_set_id) REFERENCES metadata_cache_entry_sets(repository_database_id,entry_set_id)
@@ -865,10 +1007,19 @@ CREATE TABLE metadata_cache_file_versions (
 	mode TEXT NOT NULL DEFAULT '',
 	size TEXT NOT NULL DEFAULT '',
 	is_dir INTEGER NOT NULL CHECK (is_dir IN (0,1)),
-	UNIQUE (file_id,mode,size,is_dir),
+	mtime INTEGER NOT NULL DEFAULT 0,
+	object_id TEXT NOT NULL DEFAULT '',
+	UNIQUE (file_id,mode,size,is_dir,mtime,object_id),
 	UNIQUE (file_id,file_version_id),
 	FOREIGN KEY (file_id) REFERENCES metadata_cache_files(file_id) ON DELETE CASCADE
 );
+CREATE TABLE metadata_cache_snapshot_marks (
+	repository_database_id INTEGER NOT NULL CHECK (repository_database_id=1),
+	snapshot_id TEXT NOT NULL,
+	file_id INTEGER NOT NULL REFERENCES metadata_cache_files(file_id) ON DELETE CASCADE,
+	PRIMARY KEY (repository_database_id,snapshot_id,file_id),
+	FOREIGN KEY (repository_database_id,snapshot_id) REFERENCES metadata_cache_snapshots(repository_database_id,snapshot_id) ON DELETE CASCADE
+) WITHOUT ROWID;
 CREATE TABLE metadata_cache_blocks (
  block_id INTEGER PRIMARY KEY AUTOINCREMENT,
  digest BLOB NOT NULL
@@ -921,4 +1072,5 @@ CREATE INDEX metadata_cache_block_list_items_block ON metadata_cache_block_list_
 CREATE INDEX metadata_cache_entry_sets_list ON metadata_cache_entry_sets(block_list_id);
 CREATE INDEX metadata_cache_snapshots_entry_set ON metadata_cache_snapshots(repository_database_id,entry_set_id);
 CREATE INDEX metadata_cache_snapshots_status ON metadata_cache_snapshots(repository_database_id,status);
+CREATE INDEX metadata_cache_snapshot_marks_file ON metadata_cache_snapshot_marks(file_id);
 `

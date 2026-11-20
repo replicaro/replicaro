@@ -646,11 +646,12 @@ func AttachRecoveredRepository(
 	_, err = tx.Exec(`INSERT INTO repositories
 		(id, name, engine, connector, cold_storage, archive_write_class, location, canonical_identity,
 		 storage_identity_version, storage_identity_key, storage_identity_json, description, passphrase,
-		 connector_options, native_repository_id, profile_uuid, attachment_generation, metadata_cache_binding, check_schedule, next_check, maintenance_schedule, object_lock_json, next_maintenance, concurrency_mode, auto_unlock, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, repo.ID, strings.TrimSpace(repo.Name),
+		 connector_options, native_repository_id, profile_uuid, attachment_generation, metadata_cache_binding, check_schedule, next_check, maintenance_schedule, object_lock_json, next_maintenance, concurrency_mode, auto_unlock, created_at, ecc_overhead_percent)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, repo.ID, strings.TrimSpace(repo.Name),
 		repo.Engine, repo.Connector, repo.ColdStorage, repo.ArchiveWriteClass, repo.Location, identity,
 		storageVersion, storageKey, storageJSON, repo.Description, encodedPassphrase,
-		optionsJSON, repo.NativeRepositoryID, repo.ProfileUUID, repo.AttachmentGeneration, uuid.NewString(), check, NextRunFrom(check, now), maintenance, objectLockJSON, NextRunFrom(maintenance, now), concurrencyMode, repo.AutoUnlock, createdAt)
+		optionsJSON, repo.NativeRepositoryID, repo.ProfileUUID, repo.AttachmentGeneration, uuid.NewString(), check, NextRunFrom(check, now), maintenance, objectLockJSON, NextRunFrom(maintenance, now), concurrencyMode, repo.AutoUnlock, createdAt,
+		repo.ECCOverheadPercent)
 	if err != nil {
 		return "", nil, err
 	}
@@ -972,6 +973,9 @@ func ReconnectRecoveredRepository(db *sql.DB, repo models.Repository, jobs []mod
 	}
 	now := time.Now().UTC()
 	var result sql.Result
+	// Both statements save the error correction overhead Kopia reported during
+	// this reconnect's validation (0 for Restic). That is how a vault saved
+	// before the column existed, or one created elsewhere, gets its real value.
 	if reviewedUpdate {
 		// A confirmed same-UUID update is the only path that replaces configured
 		// address facts. Clear the observational alias and invalidate derived
@@ -979,19 +983,23 @@ func ReconnectRecoveredRepository(db *sql.DB, repo models.Repository, jobs []mod
 		result, err = tx.Exec(`UPDATE repositories SET name=?,description=?,passphrase=?,connector_options=?,
 			cold_storage=?,archive_write_class=?,location=?,canonical_identity=?,storage_identity_version=?,storage_identity_key=?,storage_identity_json=?,
 			resolved_repository_path='',resolved_repository_observed_at='',vault_size_dirty=1,vault_size_dirty_count=vault_size_dirty_count+1,
-			profile_uuid=?,attachment_generation=?,check_schedule=?,next_check=?,maintenance_schedule=?,next_maintenance=?,concurrency_mode=?,auto_unlock=?
+			profile_uuid=?,attachment_generation=?,check_schedule=?,next_check=?,maintenance_schedule=?,next_maintenance=?,concurrency_mode=?,auto_unlock=?,
+			ecc_overhead_percent=?
 			WHERE id=? AND native_repository_id=?`, strings.TrimSpace(repo.Name), repo.Description,
 			encodedPassphrase, optionsJSON, repo.ColdStorage, repo.ArchiveWriteClass,
 			repo.Location, repo.CanonicalIdentity, repo.StorageIdentityVersion, repo.StorageIdentityKey, repo.StorageIdentityJSON,
 			repo.ProfileUUID, repo.AttachmentGeneration, check, NextRunFrom(check, now),
-			maintenance, NextRunFrom(maintenance, now), concurrencyMode, repo.AutoUnlock, repo.ID, repo.NativeRepositoryID)
+			maintenance, NextRunFrom(maintenance, now), concurrencyMode, repo.AutoUnlock, repo.ECCOverheadPercent,
+			repo.ID, repo.NativeRepositoryID)
 	} else {
 		result, err = tx.Exec(`UPDATE repositories SET name=?,description=?,passphrase=?,connector_options=?,
-			cold_storage=?,archive_write_class=?,profile_uuid=?,attachment_generation=?,check_schedule=?,next_check=?,maintenance_schedule=?,next_maintenance=?,concurrency_mode=?,auto_unlock=?
+			cold_storage=?,archive_write_class=?,profile_uuid=?,attachment_generation=?,check_schedule=?,next_check=?,maintenance_schedule=?,next_maintenance=?,concurrency_mode=?,auto_unlock=?,
+			ecc_overhead_percent=?
 			WHERE id=? AND native_repository_id=?`, strings.TrimSpace(repo.Name), repo.Description,
 			encodedPassphrase, optionsJSON, repo.ColdStorage, repo.ArchiveWriteClass,
 			repo.ProfileUUID, repo.AttachmentGeneration, check, NextRunFrom(check, now),
-			maintenance, NextRunFrom(maintenance, now), concurrencyMode, repo.AutoUnlock, repo.ID, repo.NativeRepositoryID)
+			maintenance, NextRunFrom(maintenance, now), concurrencyMode, repo.AutoUnlock, repo.ECCOverheadPercent,
+			repo.ID, repo.NativeRepositoryID)
 	}
 	if err != nil {
 		return "", nil, err

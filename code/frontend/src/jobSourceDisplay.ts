@@ -1,4 +1,5 @@
 import { t } from "./i18n";
+import { ltrIsolate } from "./services/rcloneRemote";
 import type { BackupJob, Snapshot } from "./types";
 
 // Managed snapshots are labelled by job, not by a recorded path.
@@ -42,7 +43,7 @@ export function pathWithinJob(path: string, source: string): string {
 }
 
 export function jobSourceTooltip(job: BackupJob): string {
-	return t("ui.jobSource.tooltip", { source: jobCurrentSource(job) });
+	return t("ui.jobSource.tooltip", { source: ltrIsolate(jobCurrentSource(job)) });
 }
 
 // "Update job source" is offered whenever a bound job's source cannot be used:

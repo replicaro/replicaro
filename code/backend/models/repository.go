@@ -200,6 +200,26 @@ func ValidateObjectLockTransition(current, next ObjectLockSettings) error {
 	return nil
 }
 
+// ValidateRequestedECCOverheadPercent checks the error correction choice of a
+// new vault. 0 means the option is off. Otherwise the vault must use Kopia,
+// the only engine with error correction, and the overhead must be one of the
+// values the new-vault form offers. A value outside that list is refused
+// rather than passed on, even though pinned Kopia accepts any percentage.
+func ValidateRequestedECCOverheadPercent(engine string, percent int) error {
+	if percent == 0 {
+		return nil
+	}
+	if engine != "kopia" {
+		return fmt.Errorf("error correction requires Kopia")
+	}
+	switch percent {
+	case 1, 2, 5, 10:
+		return nil
+	default:
+		return fmt.Errorf("error correction overhead must be 1, 2, 5, or 10 percent")
+	}
+}
+
 // Repository.ResolvedRepositoryPath and ResolvedRepositoryObservedAt mirror
 // the retired automatic vault alias columns. Startup clears them and nothing
 // writes them; a vault always runs at Location. The columns stay only to avoid
@@ -244,6 +264,21 @@ type Repository struct {
 	NativeRepositoryID           string             `json:"native_repository_id"`
 	IsVaultOwner                 bool               `json:"isVaultOwner"`
 	ObjectLock                   ObjectLockSettings `json:"objectLock"`
+	// ECCOverheadPercent is the Kopia error correction overhead; 0 is off. It
+	// means one of two things depending on where the value is:
+	//   - Along the creation path (reserving the creation, loading it for
+	//     Retry, the creation's maintenance context, the database's
+	//     normalization, and the repository handed to the engine's Create,
+	//     where it becomes --ecc-overhead-percent) it is the overhead the
+	//     new-vault form asked for.
+	//   - On a saved vault row it is what `kopia repository status --json`
+	//     reported (contentFormat.eccOverheadPercent) when this computer
+	//     created, connected or last reconnected the vault, never the
+	//     requested value; 0 means Kopia reported none.
+	// Kopia fixes the setting when the repository is created, so nothing
+	// re-reads it in between. It is local only: the protected root and profile
+	// don't carry it.
+	ECCOverheadPercent int `json:"eccOverheadPercent"`
 	// ReconnectRequired is the vault's saved "needs reconnect" state (see
 	// package vaultreconnect). It drives the vault card's Reconnect button and
 	// message, so it survives a reload and shows in every browser.

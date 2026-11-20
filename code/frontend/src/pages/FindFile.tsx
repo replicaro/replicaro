@@ -1,15 +1,18 @@
-import { formatDisplayDateTime, renderMessage, t } from "../i18n";
+import { formatDisplayDate, formatDisplayDateTime, getEffectiveLocale, isRightToLeft, renderMessage, t } from "../i18n";
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
-import type { CSSProperties, ReactNode } from "react";
+import type { CSSProperties, KeyboardEvent, ReactNode } from "react";
 import { createPortal } from "react-dom";
 import { useNavigate, useParams } from "react-router-dom";
 
 import { DirectoryField } from "../components/DirectoryPicker";
+import { FileDownloadButton } from "../components/FileDownloadButton";
 import { FloatingTooltip } from "../components/FloatingTooltip";
 import { JobSourceLabel } from "../components/JobSourceLabel";
 import { fileHistorySourceJob, jobSourceTooltip, pathWithinJob } from "../jobSourceDisplay";
 import { displayPath } from "../nativePathDisplay";
+import { ltrIsolate } from "../services/rcloneRemote";
 import { MetadataIndexNotice } from "../components/MetadataIndexNotice";
+import { MultilineSelect } from "../components/MultilineSelect";
 import { EmptyState, Icon, Loading, Modal, parseTime, Tooltip, useToast } from "../components/ui";
 import {
 	APIError,
@@ -26,10 +29,19 @@ import {
 } from "../services/api";
 import type { MetadataPreparationStatus } from "../services/api";
 import { defaultConflictMode, restorableContainingFolder, RESTORE_SELECTION_NAME_INVALID, restoreCapability, restoreConflictModeLabel } from "../restoreCapabilities";
-import type { BackupJob, EngineDescriptor, FileBrowseEntry, FileSearchResult, FileVersion, MetadataIndexState, Repository, Snapshot } from "../types";
+import type { BackupJob, EngineDescriptor, FileBrowseEntry, FileHistoryVersion, FileSearchResult, FileVersion, MetadataIndexState, Repository, Snapshot } from "../types";
 
-type RestoreMode = "single" | "individual";
+// The three tabs of the "Restore selected" panel, in their order: a version of
+// each file (folders keep a backup date), one backup date shared by every
+// item, or a backup date per item.
+//
+// "File version" comes first and is the tab the panel opens on. That order,
+// that default, and offering the modes as tabs rather than a toggle or a
+// one-time prompt are product decisions; don't change them casually.
+type RestoreMode = "version" | "single" | "individual";
+const restoreModes: RestoreMode[] = ["version", "single", "individual"];
 type HistoryMap = Record<string, FileVersion[]>;
+type FileVersionListMap = Record<string, FileHistoryVersion[]>;
 type VersionMap = Record<string, string>;
 type PageState = { hasMore: boolean; nextOffset: number; loading: boolean; revision: number };
 type BrowseItemsMap = Record<string, FileBrowseEntry[]>;
@@ -272,19 +284,19 @@ function FilePathLabel({ value, source, tooltipPath: nativeTooltipPath, withinJo
 	const tooltipPath = withinJob && nativeTooltipPath !== undefined ? pathWithinJob(value, source ?? "") : nativeTooltipPath;
     const parts = splitDisplayPath(path, path.startsWith("\\") && !value.includes("\\"));
     const text = <><span className="file-path-parent">{parts.parent}</span><span className="file-path-name">{parts.name}</span></>;
-	const sourceTitle = t("ui.restore.backupSourceTooltip", { source: source ?? "" });
+	const sourceTitle = t("ui.restore.backupSourceTooltip", { source: ltrIsolate(source ?? "") });
     if (tooltipPath) return (
         <FloatingTooltip
             className="file-path-label"
-            content={tooltipPath}
+            content={ltrIsolate(tooltipPath)}
             label={tooltipPath}
-            title={withinJob ? undefined : fileSource ? sourceTitle : `${sourceTitle}\n${t("ui.restore.snapshotPathTooltip", { path: value })}`}
+            title={withinJob ? undefined : fileSource ? sourceTitle : `${sourceTitle}\n${t("ui.restore.snapshotPathTooltip", { path: ltrIsolate(value) })}`}
         >{text}</FloatingTooltip>
     );
     const content = withinJob ? pathWithinJob(value, source ?? "") : path;
-    if (floating) return <FloatingTooltip className="file-path-label" content={content} label={content}>{text}</FloatingTooltip>;
+    if (floating) return <FloatingTooltip className="file-path-label" content={ltrIsolate(content)} label={content}>{text}</FloatingTooltip>;
     return (
-        <Tooltip content={content}>
+        <Tooltip content={ltrIsolate(content)}>
             <span className="file-path-label">{text}</span>
         </Tooltip>
     );
@@ -313,7 +325,7 @@ function SelectionCheckbox({
 	return <Tooltip content={parentSelectionMessage}><span style={{ display: "inline-grid", width: 16, height: 16, placeItems: "center" }}>{checkbox}</span></Tooltip>;
 }
 
-function formatDate(value: string) {
+function formatDate(value: string, locale?: string) {
     const date = parseTime(value);
     return date ? formatDisplayDateTime(date, {
         month: "short",
@@ -321,7 +333,7 @@ function formatDate(value: string) {
         year: "numeric",
         hour: "2-digit",
         minute: "2-digit",
-    }) : t("ui.date.unknownDate");
+    }, locale) : t("ui.date.unknownDate");
 }
 
 function sourceLabel(result: FileSearchResult) {
@@ -341,14 +353,28 @@ function newestPresentVersion(history: FileVersion[] | undefined) {
 	}, undefined);
 }
 
-// Keep restore choosers flat and newest-first. Show only the date and
-// available machine label. Do not add computer grouping or snapshot ID,
-// type, size, or root-path details to the chooser presentation; option
-// values retain exact snapshot/root identities.
-function newestVersionFirst(left: FileVersion, right: FileVersion) {
-	if (left.timestamp !== right.timestamp) return left.timestamp > right.timestamp ? -1 : 1;
+// Keep restore choosers flat and newest-first. A backup-date entry for one item
+// shows the backup date (with the size for a file), the item's modified time
+// and the available machine label; one shared by several items shows only the
+// backup date and the machine label. A file-version entry shows only its
+// modified time and size, its backups and the machine label. Do not add
+// computer grouping or snapshot ID, type, or root-path details to the chooser
+// presentation; option values retain exact snapshot/root identities.
+function newestFirst(leftTime: string, rightTime: string, left: { snapshotId: string; nativeRootId: string }, right: { snapshotId: string; nativeRootId: string }) {
+	if (leftTime !== rightTime) return leftTime > rightTime ? -1 : 1;
 	if (left.snapshotId !== right.snapshotId) return left.snapshotId > right.snapshotId ? -1 : 1;
 	return left.nativeRootId === right.nativeRootId ? 0 : left.nativeRootId < right.nativeRootId ? -1 : 1;
+}
+
+function newestVersionFirst(left: FileVersion, right: FileVersion) {
+	return newestFirst(left.timestamp, right.timestamp, left, right);
+}
+
+// File versions are ordered by the newest backup that holds them, the one
+// each restores from, with the same tie-break as backup dates. The API
+// groups a file's versions by computer, so its order can't be shown as is.
+function newestFileVersionFirst(left: FileHistoryVersion, right: FileHistoryVersion) {
+	return newestFirst(left.lastBackup, right.lastBackup, left, right);
 }
 
 function newestSnapshotFirst(left: Snapshot, right: Snapshot) {
@@ -356,17 +382,136 @@ function newestSnapshotFirst(left: Snapshot, right: Snapshot) {
 	return left.id === right.id ? 0 : left.id > right.id ? -1 : 1;
 }
 
-function versionChoiceLabel(version: FileVersion) {
-	return `${formatDate(version.timestamp)}${version.machineLabel ? ` · ${version.machineLabel}` : ""}`;
+// The lines of a dropdown entry. Dates go through the app's formatters, so
+// they follow the language and its digits. Inside a sentence each date is
+// isolated (<bdi>) so the sentence around it can't reorder its parts. The
+// size and a computer's name (name@OS, a Restic host name) are shown left to
+// right as written, so a right-to-left language doesn't move "@", "#2" or the
+// unit to the other end. A computer the backend has no name for is page text
+// instead: "Previous computer" in the page's language and direction, with the
+// backend's number when several computers share that label. Its English
+// machineLabel is never shown, but it stays what identifies the computer when
+// labels are compared (see sharedSnapshotComputer).
+type ComputerLabel = Pick<FileVersion, "machineLabel" | "unnamedComputer" | "unnamedComputerNumber">;
+
+function computerLine(computer: ComputerLabel | undefined): ReactNode[] {
+	if (computer?.unnamedComputer) {
+		return [computer.unnamedComputerNumber
+			? t("ui.findFile.previousComputerNumbered", { number: computer.unnamedComputerNumber })
+			: t("ui.findFile.previousComputer")];
+	}
+	return computer?.machineLabel ? [<bdi dir="ltr">{computer.machineLabel}</bdi>] : [];
 }
 
-function sharedSnapshotMachineLabel(snapshotId: string, results: FileSearchResult[], histories: HistoryMap) {
-	const labels = new Set(results.flatMap((result) =>
-		presentVersions(histories[resultKey(result)])
-			.filter((version) => version.snapshotId === snapshotId && version.machineLabel)
-			.map((version) => version.machineLabel as string)
-	));
-	return labels.size === 1 ? labels.values().next().value ?? "" : "";
+// A dropdown can show two dates of different kinds: when the backup was made
+// and when the item was modified. Each date line is labelled ("Backed up
+// on", "Modified", "From backups") so the two can't be mistaken for each
+// other. A backup-date entry leads with the backup date because that is what
+// is being chosen; a file-version entry leads with the modified time.
+//
+// A backup-date entry for one item (item given): the backup date, with the
+// size for a file; the item's modified time in that backup; the computer.
+// Without an item (one backup shared by several items) it is the backup date
+// and the computer, as the items' sizes and times differ. A folder's line is
+// the modified time the engine lists for it: Restic's is the folder's own
+// time, Kopia's is the newest time within it. An empty or unreadable modified
+// time leaves its line out (a folder held only through the items inside it
+// has none).
+function backupDateLines(timestamp: string, computer: ComputerLabel | undefined, locale?: string, item?: FileVersion): ReactNode[] {
+	const date = <bdi key="date">{formatDate(timestamp, locale)}</bdi>;
+	const first = item && !item.isDir && item.size
+		? renderMessage("ui.findFile.backedUpOnWithSize", { date, size: <bdi key="size" dir="ltr" className="find-version-size">{item.size}</bdi> })
+		: renderMessage("ui.findFile.backedUpOn", { date });
+	return [first, ...(item ? modifiedLine(item.modified, locale) : []), ...computerLine(computer)];
+}
+
+function modifiedLine(modified: string, locale?: string): ReactNode[] {
+	if (!modified || !parseTime(modified)) return [];
+	return [renderMessage("ui.findFile.itemModified", { date: <bdi key="date">{formatDate(modified, locale)}</bdi> })];
+}
+
+// Backup ranges show whole days: a file version can span years, and the time
+// of each end says nothing about the file.
+function formatBackupDay(value: string, locale?: string) {
+	const date = parseTime(value);
+	return date ? formatDisplayDate(date, { month: "short", day: "numeric", year: "numeric" }, locale) : t("ui.date.unknownDate");
+}
+
+// A file version: when the file was modified and its size (both from the
+// backup it restores from), the backups that hold it, and the computer. A
+// version held by one backup, or only by backups of one day, names that day
+// once instead of a range.
+function fileVersionLines(version: FileHistoryVersion, locale: string): ReactNode[] {
+	const first = formatBackupDay(version.firstBackup, locale);
+	const last = formatBackupDay(version.lastBackup, locale);
+	return [
+		renderMessage("ui.findFile.versionModified", { date: <bdi key="date">{formatDate(version.modified, locale)}</bdi>, size: <bdi key="size" dir="ltr" className="find-version-size">{version.size}</bdi> }),
+		first === last
+			? renderMessage("ui.findFile.versionFromBackup", { date: <bdi key="date">{last}</bdi> })
+			: renderMessage("ui.findFile.versionFromBackups", { first: <bdi key="first">{first}</bdi>, last: <bdi key="last">{last}</bdi> }),
+		...computerLine(version),
+	];
+}
+
+function restoreModeLabel(mode: RestoreMode) {
+	if (mode === "version") return t("ui.findFile.fileVersionTab");
+	if (mode === "single") return t("ui.pages.findfile.one.backup.date");
+	return t("ui.findFile.eachItemBackupDateTab");
+}
+
+// The restore panel is rendered twice (beside the search results and beside
+// the browse tree), so the tab and panel ids come from each copy's own useId.
+function RestoreModeTabs({ mode, onChange, children }: { mode: RestoreMode; onChange: (mode: RestoreMode) => void; children: ReactNode }) {
+	const id = useId();
+	const tabs = useRef<Array<HTMLButtonElement | null>>([]);
+	const keyDown = (event: KeyboardEvent<HTMLButtonElement>, index: number) => {
+		// The tabs run right to left in a right-to-left language, so the arrow
+		// keys swap to keep moving in the direction they point.
+		const forward = isRightToLeft() ? "ArrowLeft" : "ArrowRight";
+		const backward = isRightToLeft() ? "ArrowRight" : "ArrowLeft";
+		const last = restoreModes.length - 1;
+		const target = event.key === forward ? (index === last ? 0 : index + 1)
+			: event.key === backward ? (index === 0 ? last : index - 1)
+			: event.key === "Home" ? 0
+			: event.key === "End" ? last
+			: -1;
+		if (target < 0) return;
+		event.preventDefault();
+		onChange(restoreModes[target]);
+		tabs.current[target]?.focus();
+	};
+	return <>
+		<div className="find-mode-tabs" role="tablist" aria-label={t("ui.findFile.restoreModeTabs")}>
+			{restoreModes.map((item, index) => <button
+				key={item}
+				ref={(element) => { tabs.current[index] = element; }}
+				type="button"
+				role="tab"
+				id={`${id}-${item}-tab`}
+				aria-selected={mode === item}
+				aria-controls={`${id}-panel`}
+				tabIndex={mode === item ? 0 : -1}
+				className={mode === item ? "active" : ""}
+				onClick={() => onChange(item)}
+				onKeyDown={(event) => keyDown(event, index)}
+			>{restoreModeLabel(item)}</button>)}
+		</div>
+		<div role="tabpanel" id={`${id}-panel`} aria-labelledby={`${id}-${mode}-tab`} className="find-mode-panel">{children}</div>
+	</>;
+}
+
+// The computer of one backup shared by several items, when every item's
+// history gives it the same label. The labels are compared as the backend
+// wrote them, together with the unnamed mark, so a translated "Previous
+// computer" is never compared with an English one, and a computer really
+// named "Previous computer" is not taken for an unnamed one.
+function sharedSnapshotComputer(snapshotId: string, results: FileSearchResult[], histories: HistoryMap): ComputerLabel | undefined {
+	const computers = new Map<string, ComputerLabel>();
+	for (const version of results.flatMap((result) => presentVersions(histories[resultKey(result)]))) {
+		if (version.snapshotId !== snapshotId || !version.machineLabel) continue;
+		computers.set(JSON.stringify([version.machineLabel, Boolean(version.unnamedComputer)]), version);
+	}
+	return computers.size === 1 ? computers.values().next().value : undefined;
 }
 
 function versionTypeLabel(version: FileVersion | undefined, fallbackIsDir: boolean) {
@@ -550,8 +695,14 @@ function VaultFileHistory({
     const [results, setResults] = useState<FileSearchResult[] | null>(null);
     const [selectedItems, setSelectedItems] = useState<Record<string, FileSearchResult>>({});
     const [histories, setHistories] = useState<HistoryMap>({});
+	// chosenVersions holds each item's backup date (the "Each item's backup
+	// date" tab, and folders in the "File version" tab); chosenFileVersions
+	// holds each file's version in the "File version" tab. Switching tabs keeps
+	// every choice.
     const [chosenVersions, setChosenVersions] = useState<VersionMap>({});
-    const [mode, setMode] = useState<RestoreMode>("single");
+	const [versionLists, setVersionLists] = useState<FileVersionListMap>({});
+	const [chosenFileVersions, setChosenFileVersions] = useState<VersionMap>({});
+    const [mode, setMode] = useState<RestoreMode>("version");
     const [singleSnapshot, setSingleSnapshot] = useState("");
     const [targetPath, setTargetPath] = useState("");
     const [searching, setSearching] = useState(false);
@@ -610,6 +761,8 @@ function VaultFileHistory({
 		setSelectedItems({});
 		setHistories({});
 		setChosenVersions({});
+		setVersionLists({});
+		setChosenFileVersions({});
 		const generationIsDirty = !response.index.repositoryFailed && (response.index.failedSnapshots ?? 0) === 0 &&
 			typeof response.index.requiredGeneration === "number" &&
 			typeof response.index.appliedGeneration === "number" &&
@@ -636,6 +789,8 @@ function VaultFileHistory({
 		setSelectedItems({});
 		setHistories({});
 		setChosenVersions({});
+		setVersionLists({});
+		setChosenFileVersions({});
 		setBrowseItems({});
 		setBrowsePages({ [browseRootKey]: emptyPageState() });
 		void (async () => {
@@ -767,6 +922,20 @@ function VaultFileHistory({
 		onStatusChange(repository.id, { indexBlocked, searching, forcingMetadata });
 	}, [forcingMetadata, indexBlocked, onStatusChange, repository.id, searching]);
 
+	// The entries of each item's dropdowns, built only when the histories or
+	// version lists change (or the language, which the lines are written in),
+	// not on every render: the panel is rendered twice and re-renders on every
+	// keystroke in the destination field, and an item can have hundreds of
+	// backups.
+	const locale = getEffectiveLocale();
+	const backupDateOptions = useMemo(() => Object.fromEntries(Object.entries(histories).map(([key, history]) => [key,
+		presentVersions(history).sort(newestVersionFirst)
+			.map((version) => ({ value: fileVersionKey(version), lines: backupDateLines(version.timestamp, version, locale, version) }))])),
+	[histories, locale]);
+	const fileVersionOptions = useMemo(() => Object.fromEntries(Object.entries(versionLists).map(([key, versions]) => [key,
+		versions.map((version) => ({ value: fileVersionKey(version), lines: fileVersionLines(version, locale) }))])),
+	[versionLists, locale]);
+
 	const commonSnapshots = useMemo(() => {
 		if (!selectedResults.length) return [];
 		return snapshots.filter((snapshot) =>
@@ -777,30 +946,31 @@ function VaultFileHistory({
 	}, [histories, selectedResults, snapshots]);
 
     const allHistoriesLoaded = selectedResults.every((result) => histories[resultKey(result)] !== undefined);
-	const allIndividualVersionsChosen = selectedResults.every((result) =>
-		Boolean(fileVersionForKey(histories[resultKey(result)], chosenVersions[resultKey(result)]))
-	);
     const effectiveSingleSnapshot = commonSnapshots.some((snapshot) => snapshot.id === singleSnapshot)
         ? singleSnapshot
         : commonSnapshots[0]?.id ?? "";
 	// Keep the reviewed filesystem route through confirmation and submission;
 	// trimming or host normalization would redirect restore writes.
 	const effectiveTargetPath = targetPath;
-	const restoreItems: ReviewedRestoreItem[] = mode === "single"
-		? selectedResults.map((result) => {
-			const version = exactSnapshotVersion(histories[resultKey(result)], effectiveSingleSnapshot);
-			return { snapshotId: version?.snapshotId ?? "", path: result.path, nativeRootId: version?.nativeRootId ?? "" };
-		})
-		: selectedResults.map((result) => {
-			const version = fileVersionForKey(histories[resultKey(result)], chosenVersions[resultKey(result)]);
-			return { snapshotId: version?.snapshotId ?? "", path: result.path, nativeRootId: version?.nativeRootId ?? "" };
-		});
+	// An item has file versions once its history has loaded with a non-empty
+	// list: the backend gives none for a folder (folders stay per backup
+	// date), so this decides which dropdown an item gets in the "File version"
+	// tab.
+	const hasFileVersions = (key: string) => (versionLists[key]?.length ?? 0) > 0;
+	// The backup each item restores from. A file version is restored from the
+	// newest backup that holds it: its snapshotId and nativeRootId name one of
+	// the item's per-backup entries, which supplies the rest (folder or file,
+	// recorded source, backup date) exactly as a chosen backup date does, so
+	// the request and every check below are the same for all three tabs.
 	const selectedVersion = (result: FileSearchResult) => {
 		const key = resultKey(result);
-		return mode === "single"
-			? exactSnapshotVersion(histories[key], effectiveSingleSnapshot)
-			: fileVersionForKey(histories[key], chosenVersions[key]);
+		if (mode === "single") return exactSnapshotVersion(histories[key], effectiveSingleSnapshot);
+		return fileVersionForKey(histories[key], mode === "version" && hasFileVersions(key) ? chosenFileVersions[key] : chosenVersions[key]);
 	};
+	const restoreItems: ReviewedRestoreItem[] = selectedResults.map((result) => {
+		const version = selectedVersion(result);
+		return { snapshotId: version?.snapshotId ?? "", path: result.path, nativeRootId: version?.nativeRootId ?? "" };
+	});
 	const restoreSelectionConflict = selectionConflict(selectedResults, selectedVersion);
 	// Kopia restores a selected folder's contents straight into the
 	// destination, so several items that include a folder would merge there.
@@ -817,7 +987,7 @@ function VaultFileHistory({
 		selectedResults.some((result) => !(selectedVersion(result)?.isDir ?? result.isDir));
 	const canRestore = selectedResults.length > 0 && !restoreSelectionConflict && !kopiaFolderSelectionConflict && Boolean(effectiveTargetPath) && allHistoriesLoaded &&
 		restoreItems.every((item) => Boolean(item.nativeRootId)) &&
-		(mode === "single" ? Boolean(effectiveSingleSnapshot) : allIndividualVersionsChosen);
+		(mode === "single" ? Boolean(effectiveSingleSnapshot) : selectedResults.every((result) => Boolean(selectedVersion(result))));
 	const selectedFolderAncestor = (result: FileSearchResult) => selectedResults
 		.filter((candidate) => (selectedVersion(candidate)?.isDir ?? candidate.isDir) && isSelectionDescendant(result, candidate))
 		.sort((left, right) => canonicalSelectionPath(right).length - canonicalSelectionPath(left).length)[0];
@@ -913,6 +1083,8 @@ function VaultFileHistory({
 			setSelectedItems((current) => { const next = { ...current }; delete next[key]; return next; });
 			setHistories((current) => { const next = { ...current }; delete next[key]; return next; });
 			setChosenVersions((current) => { const next = { ...current }; delete next[key]; return next; });
+			setVersionLists((current) => { const next = { ...current }; delete next[key]; return next; });
+			setChosenFileVersions((current) => { const next = { ...current }; delete next[key]; return next; });
             return;
         }
 		const replacedKeys = Object.entries(selectedItems)
@@ -928,6 +1100,8 @@ function VaultFileHistory({
 		]));
 		setHistories((current) => Object.fromEntries(Object.entries(current).filter(([selectedKey]) => !replacedKeys.includes(selectedKey))));
 		setChosenVersions((current) => Object.fromEntries(Object.entries(current).filter(([selectedKey]) => !replacedKeys.includes(selectedKey))));
+		setVersionLists((current) => Object.fromEntries(Object.entries(current).filter(([selectedKey]) => !replacedKeys.includes(selectedKey))));
+		setChosenFileVersions((current) => Object.fromEntries(Object.entries(current).filter(([selectedKey]) => !replacedKeys.includes(selectedKey))));
 		if (histories[key] !== undefined) return;
 		const controller = new AbortController();
 		const vaultGeneration = generation.current;
@@ -941,6 +1115,9 @@ function VaultFileHistory({
 					if (generation.current !== vaultGeneration || historyRequests.current.get(key) !== controller) return;
 					if (!acceptCatalogResponse(response, true)) return;
 					let items = response.items;
+					// Every page carries the file's complete list of versions,
+					// so the last page's list is kept.
+					let versions = response.versions;
 					while (response.hasMore) {
 						if (!Number.isSafeInteger(response.nextOffset) || response.nextOffset <= response.offset) {
 							throw new Error(t("ui.findFile.invalidHistoryPageBoundary"));
@@ -949,11 +1126,20 @@ function VaultFileHistory({
 						if (generation.current !== vaultGeneration || historyRequests.current.get(key) !== controller) return;
 						if (!acceptCatalogResponse(response, true)) return;
 						items = appendUniqueHistory(items, response.items);
+						versions = response.versions;
 					}
 					if (generation.current !== vaultGeneration || historyRequests.current.get(key) !== controller) return;
 					setHistories((current) => ({ ...current, [key]: items }));
+					// The API lists the versions grouped by computer, so they
+					// are sorted here, once, newest first across computers.
+					const fileVersions = [...(versions ?? [])].sort(newestFileVersionFirst);
+					setVersionLists((current) => ({ ...current, [key]: fileVersions }));
+					// Both choices start on the newest: the newest backup date
+					// and, for a file, the version held by the newest backup.
 					const latest = newestPresentVersion(items);
 					if (latest) setChosenVersions((current) => ({ ...current, [key]: fileVersionKey(latest) }));
+					const newestFileVersion = fileVersions[0];
+					if (newestFileVersion) setChosenFileVersions((current) => ({ ...current, [key]: fileVersionKey(newestFileVersion) }));
 					return;
 				} catch (reason) {
 					if (isMetadataRevisionError(reason) && attempts < 3) continue;
@@ -1160,8 +1346,8 @@ function VaultFileHistory({
 		// item rows under it show their path within the job. The browse tree
 		// clips its content like the results list, so the tooltip is floating.
 		const rowLabel = job
-			? <FloatingTooltip content={item.isSource ? jobSourceTooltip(job) : pathWithinJob(item.path, item.source)} label={label} className="job-source-label"><strong className="job-source-name">{label}</strong></FloatingTooltip>
-			: <strong>{label}</strong>;
+			? <FloatingTooltip content={item.isSource ? jobSourceTooltip(job) : ltrIsolate(pathWithinJob(item.path, item.source))} label={label} className="job-source-label"><strong className="job-source-name">{label}</strong></FloatingTooltip>
+			: <strong><bdi dir="ltr">{label}</bdi></strong>;
 		return <div className="browse-tree-node" key={key} role="listitem">
 			<div className={`browse-tree-row${checked ? " selected" : ""}`} style={{ paddingLeft: 10 + depth * 22 } as CSSProperties}>
 				{expandable ? <button type="button" className="browse-disclosure" aria-expanded={expanded} aria-label={expanded ? t("ui.fileHistory.collapseNamed", { name: label }) : t("ui.fileHistory.expandNamed", { name: label })} onClick={() => toggleBrowseNode(item)}>{expanded ? "▾" : "▸"}</button> : <span className="browse-disclosure-spacer" />}
@@ -1176,24 +1362,64 @@ function VaultFileHistory({
 				{childError && !childPage?.loading && <div role="listitem" className="browse-tree-status"><span>{childError}</span><button type="button" className="btn" onClick={() => void loadBrowsePage(item, false)}>{t("ui.pages.findfile.retry.folder")}</button></div>}
 				{browseItems[key] && browseItems[key].length === 0 && !childPage?.loading && <div role="listitem" className="browse-tree-status">{t("ui.pages.findfile.this.folder.has.no.indexed.items")}</div>}
 				{renderBrowseRows(browseItems[key] ?? [], depth + 1)}
-				{childPage?.hasMore && <div role="listitem"><button type="button" className="btn browse-load-more" disabled={childPage.loading} onClick={() => void loadBrowsePage(item, true)}>{childPage.loading && <span className="spinner" />}{t("ui.fileHistory.loadMoreIn", { folder: label })}</button></div>}
+				{childPage?.hasMore && <div role="listitem"><button type="button" className="btn browse-load-more" disabled={childPage.loading} onClick={() => void loadBrowsePage(item, true)}>{childPage.loading && <span className="spinner" />}{t("ui.fileHistory.loadMoreIn", { folder: ltrIsolate(label) })}</button></div>}
 			</div>}
 		</div>;
 	});
+		// Each item's own dropdown is labelled by its path. A loading item shows
+		// the same disabled "Loading history" dropdown in both per-item tabs, because
+		// whether it has file versions isn't known until its history arrives.
+		const itemPathLabel = (result: FileSearchResult) => <FilePathLabel value={shownResultPath(result)} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} withinJob={Boolean(sourceJob(result.source))} fileSource={isFileSourceResult(result)} />;
+		const backupDateChooser = (result: FileSearchResult) => {
+			const key = resultKey(result);
+			const options = backupDateOptions[key] ?? [];
+			return <MultilineSelect key={key} className="find-version-row" label={itemPathLabel(result)} value={chosenVersions[key] ?? ""} options={options} onChange={(value) => setChosenVersions((current) => ({ ...current, [key]: value }))} disabled={!options.length} placeholder={options.length ? t("ui.pages.findfile.choose.a.version") : t("ui.pages.findfile.loading.history")} />;
+		};
+		const fileVersionChooser = (result: FileSearchResult) => {
+			const key = resultKey(result);
+			const options = fileVersionOptions[key] ?? [];
+			return <MultilineSelect key={key} className="find-version-row" label={itemPathLabel(result)} value={chosenFileVersions[key] ?? ""} options={options} onChange={(value) => setChosenFileVersions((current) => ({ ...current, [key]: value }))} placeholder={t("ui.pages.findfile.choose.a.version")} />;
+		};
 		const restorePanel = selectedResults.length > 0 && <aside className="find-selection-panel">
-		<div className="section-heading"><div><h2>{t("ui.pages.findfile.restore.selected")}</h2><p className="section-copy">{t("ui.pages.findfile.choose.one.point.in.time.or.a.version.per.item")}</p></div></div>
-		<div className="find-mode-tabs">
-			<button className={mode === "single" ? "active" : ""} onClick={() => setMode("single")}>{t("ui.pages.findfile.one.backup.date")}</button>
-			<button className={mode === "individual" ? "active" : ""} onClick={() => setMode("individual")}>{t("ui.pages.findfile.each.item.s.version")}</button>
-		</div>
-		{mode === "single" ? <label className="field"><span>{t("ui.pages.findfile.backup.date.shared.by.all.selected.items")}</span><select value={effectiveSingleSnapshot} onChange={(event) => setSingleSnapshot(event.target.value)} disabled={!allHistoriesLoaded || commonSnapshots.length === 0}>{(!allHistoriesLoaded || commonSnapshots.length === 0) && <option value="">{allHistoriesLoaded ? t("ui.pages.findfile.no.unambiguous.common.backup.contains.every.item") : t("ui.pages.findfile.loading.item.history")}</option>}{commonSnapshots.map((snapshot) => { const machineLabel = sharedSnapshotMachineLabel(snapshot.id, selectedResults, histories); return <option key={snapshot.id} value={snapshot.id}>{formatDate(snapshot.timestamp)}{machineLabel ? ` · ${machineLabel}` : ""}</option>; })}</select></label> : <div className="find-version-list">
-			{selectedResults.map((result) => {
-				const key = resultKey(result);
-				const versions = presentVersions(histories[key]).sort(newestVersionFirst);
-					return <label className="field find-version-row" key={key}><FilePathLabel value={shownResultPath(result)} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} withinJob={Boolean(sourceJob(result.source))} fileSource={isFileSourceResult(result)} /><select value={chosenVersions[key] ?? ""} onChange={(event) => setChosenVersions((current) => ({ ...current, [key]: event.target.value }))} disabled={!versions.length}><option value="">{versions.length ? t("ui.pages.findfile.choose.a.version") : t("ui.pages.findfile.loading.history")}</option>{versions.map((version) => <option key={fileVersionKey(version)} value={fileVersionKey(version)}>{versionChoiceLabel(version)}</option>)}</select></label>;
-			})}
-		</div>}
-		<div className="find-selected-items"><span className="modal-section-label">{t("ui.pages.findfile.selected.items")}</span>{selectedResults.map((result) => { const key = resultKey(result); const version = selectedVersion(result); const isDir = version?.isDir ?? result.isDir; return <div className="find-selected-item" key={key}><Icon name={isDir ? "folder" : "file"} size={14} /><span style={{ display: "flex", minWidth: 0, flex: 1, flexDirection: "column", gap: 3 }}><FilePathLabel value={shownResultPath(result)} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} withinJob={Boolean(sourceJob(result.source))} fileSource={isFileSourceResult(result)} />{isDir && <span className="mono faint">{t("ui.pages.findfile.all.files.and.folders.inside")}</span>}</span><span className="mono faint">{versionTypeLabel(version, result.isDir)}</span><button onClick={() => toggleResult(result)} aria-label={t("ui.fileHistory.removeNamed", { name: displayFilePath(shownResultPath(result), result.source) })}>{t("ui.pages.findfile.remove")}</button></div>; })}</div>
+		<div className="section-heading"><div><h2>{t("ui.pages.findfile.restore.selected")}</h2><p className="section-copy">{t("ui.findFile.restoreModesHelp")}</p></div></div>
+		<RestoreModeTabs mode={mode} onChange={setMode}>
+			{mode === "single"
+				? <MultilineSelect
+					label={t("ui.pages.findfile.backup.date.shared.by.all.selected.items")}
+					value={effectiveSingleSnapshot}
+					options={commonSnapshots.map((snapshot) => ({ value: snapshot.id, lines: backupDateLines(snapshot.timestamp, sharedSnapshotComputer(snapshot.id, selectedResults, histories), locale,
+						selectedResults.length === 1 ? presentVersions(histories[resultKey(selectedResults[0])]).find((version) => version.snapshotId === snapshot.id) : undefined) }))}
+					onChange={setSingleSnapshot}
+					disabled={!allHistoriesLoaded || commonSnapshots.length === 0}
+					placeholder={allHistoriesLoaded ? t("ui.pages.findfile.no.unambiguous.common.backup.contains.every.item") : t("ui.pages.findfile.loading.item.history")}
+				/>
+				: <div className="find-version-list">{selectedResults.map((result) =>
+					mode === "version" && hasFileVersions(resultKey(result)) ? fileVersionChooser(result) : backupDateChooser(result))}</div>}
+		</RestoreModeTabs>
+		<div className="find-selected-items"><span className="modal-section-label">{t("ui.pages.findfile.selected.items")}</span>{selectedResults.map((result) => {
+			const key = resultKey(result);
+			const version = selectedVersion(result);
+			const isDir = version?.isDir ?? result.isDir;
+			const name = displayFilePath(shownResultPath(result), result.source);
+			// Download fetches the backup this tab restores the item from
+			// (selectedVersion), so it follows the tab on screen. It is offered
+			// for a file only, never in a Cold Storage vault, and disappears once
+			// the chosen backup holds the item as something other than a regular
+			// file (a symlink, for example); SnapshotEntry in types.ts says why.
+			// Until a backup is chosen, or while the item's history loads, it is
+			// shown disabled.
+			const downloadable = !repository.coldStorage && !isDir && (version === undefined || version.regularFile);
+			const downloadTarget = version?.nativeRootId
+				? { repositoryId: repository.id, snapshotId: version.snapshotId, nativeRootId: version.nativeRootId, path: result.path }
+				: null;
+			return <div className="find-selected-item" key={key}>
+				<Icon name={isDir ? "folder" : "file"} size={14} />
+				<span style={{ display: "flex", minWidth: 0, flex: "1 1 8em", flexDirection: "column", gap: 3 }}><FilePathLabel value={shownResultPath(result)} source={result.source} tooltipPath={displayFullFilePath(result.source, result.path)} withinJob={Boolean(sourceJob(result.source))} fileSource={isFileSourceResult(result)} />{isDir && <span className="mono faint">{t("ui.pages.findfile.all.files.and.folders.inside")}</span>}</span>
+				<span className="mono faint">{versionTypeLabel(version, result.isDir)}</span>
+				{downloadable && <FileDownloadButton target={downloadTarget} label={t("ui.download.actionNamed", { name })} />}
+				<button onClick={() => toggleResult(result)} aria-label={t("ui.fileHistory.removeNamed", { name })}>{t("ui.pages.findfile.remove")}</button>
+			</div>;
+		})}</div>
 		{restoreSelectionConflict && <div className="inline-error" role="alert">{restoreSelectionConflict}</div>}
 		{kopiaFolderSelectionConflict && <div className="inline-error" role="alert">{kopiaFolderSelectionConflict}</div>}
 		<label className="field"><span>{t("ui.pages.findfile.restore.destination")}</span><DirectoryField value={effectiveTargetPath} onChange={setTargetPath} placeholder={kopiaSelectionIncludesFile ? t("ui.restore.chooseExistingFolder") : t("ui.pages.findfile.choose.a.new.or.existing.destination")} /></label>
@@ -1226,7 +1452,7 @@ function VaultFileHistory({
 								const selectionLabel = checked ? t("ui.fileHistory.deselectNamed", { name: path }) : t("ui.fileHistory.selectNamed", { name: path });
 								return <label key={key} className={`find-result${checked ? " selected" : ""}`}><SelectionCheckbox checked={checked} label={selectionLabel} parentSelectionMessage={parentSelectionMessage(result)} onChange={() => toggleResult(result)} /><Icon name={result.isDir ? "folder" : "file"} size={18} /><span className="find-result-main"><strong><FilePathLabel value={shownResultPath(result)} source={result.source} withinJob={Boolean(sourceJob(result.source))} floating /></strong>{(() => { const job = sourceJob(result.source); return job
 									? <span className="mono job-source-line">{t("ui.fileHistory.sourceLabel")} <JobSourceLabel job={job} /></span>
-									: <span className="mono">{t("ui.fileHistory.sourceLabel")} {sourceLabel(result)}</span>; })()}</span></label>;
+									: <span className="mono">{t("ui.fileHistory.sourceLabel")} <bdi dir="ltr">{sourceLabel(result)}</bdi></span>; })()}</span></label>;
 							})}</div>
 							{searchPage.hasMore && <button className="btn find-presentation-load-more" onClick={() => void loadMoreResults()} disabled={searchPage.loading}>{searchPage.loading && <span className="spinner" />}{t("ui.pages.findfile.load.more.matches")}</button>}
 						</section>
@@ -1255,9 +1481,9 @@ function VaultFileHistory({
 
 			{reviewedRestore && <Modal title={t("ui.pages.findfile.review.restore")} onClose={dismissReviewedRestore} wide>
 				<fieldset className="modal-workflow-fields" disabled={restoring}>
-                <p className="muted modal-intro">{reviewedRestore.mode === "single" ? t("ui.fileHistory.singleDateHelp") : t("ui.fileHistory.perItemHelp")}</p>
+                <p className="muted modal-intro">{reviewedRestore.mode === "single" ? t("ui.fileHistory.singleDateHelp") : reviewedRestore.mode === "version" ? t("ui.fileHistory.fileVersionHelp") : t("ui.fileHistory.perItemHelp")}</p>
 				<div className="find-confirm-list">{reviewedRestore.rows.map((row) => <div className="find-confirm-row" key={row.key}><Icon name={row.isDir ? "folder" : "file"} size={15} /><span><strong><FilePathLabel value={row.path} /></strong><span className="mono">{formatDate(row.timestamp)} · {row.isDir ? t("ui.findFile.folderType") : t("ui.findFile.fileType")}</span></span></div>)}</div>
-                <div className="find-confirm-destination"><span>{t("ui.pages.findfile.destination")}</span><strong className="mono">{displayPath(reviewedRestore.targetPath)}</strong></div>
+                <div className="find-confirm-destination"><span>{t("ui.pages.findfile.destination")}</span><strong className="mono"><bdi dir="ltr">{displayPath(reviewedRestore.targetPath)}</bdi></strong></div>
 				{(restoreCapability(selectedRepository, engines)?.conflictModes.length ?? 0) <= 1
 					? <p className="muted">{restoreCapability(selectedRepository, engines)?.conflictModes[0]?.description}</p>
 					: <label className="field"><span>{t("ui.pages.findfile.should.existing.files.be.overwritten")}</span><select value={reviewedRestore.conflictMode} onChange={(event) => setReviewedRestore((current) => current ? { ...current, conflictMode: event.target.value } : current)}>{restoreCapability(selectedRepository, engines)?.conflictModes.map((mode) => <option key={mode.id} value={mode.id}>{restoreConflictModeLabel(mode)}</option>)}</select></label>}

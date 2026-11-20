@@ -266,7 +266,7 @@ func fileHistory(writerDB, readDB *sql.DB, w http.ResponseWriter, r *http.Reques
 	}
 	path := rawPath
 	writeIndexing := func(revision int64, state database.MetadataIndexState) {
-		writeJSON(w, map[string]any{"items": []models.FileVersion{}, "indexing": true, "index": state,
+		writeJSON(w, map[string]any{"items": []models.FileVersion{}, "versions": []models.FileHistoryVersion{}, "indexing": true, "index": state,
 			"revision": revision, "offset": offset, "nextOffset": offset, "hasMore": false})
 	}
 	// An empty path is the source itself. A single-file source has one version
@@ -298,7 +298,9 @@ func fileHistory(writerDB, readDB *sql.DB, w http.ResponseWriter, r *http.Reques
 			return
 		}
 	}
-	history, revision, state, err := database.ReadyMetadataFileHistoryPageForAuthority(
+	// items keep one entry per backup date and are paged; versions is the
+	// file's complete list of versions on every page (empty for a folder).
+	history, versions, revision, state, err := database.ReadyMetadataFileHistoryWithVersionsForAuthority(
 		r.Context(), readDB, authority, path, source, metadataPageSize+1, offset, expectedRevision,
 	)
 	if errors.Is(err, database.ErrMetadataRevisionChanged) {
@@ -317,9 +319,38 @@ func fileHistory(writerDB, readDB *sql.DB, w http.ResponseWriter, r *http.Reques
 	if hasMore {
 		history = history[:metadataPageSize]
 	}
+	for index := range history {
+		history[index].Size = displaySizeText(history[index].Size)
+	}
+	for index := range versions {
+		versions[index].Size = displaySizeText(versions[index].Size)
+	}
 	coordinator := metadata.RepositoryCoordinatorState(writerDB, repoModel)
 	indexing := coordinator.Running || coordinator.Pending
-	writeJSON(w, map[string]any{"items": history, "indexing": indexing, "index": state, "revision": revision, "offset": offset, "nextOffset": offset + len(history), "hasMore": hasMore})
+	writeJSON(w, map[string]any{"items": history, "versions": versions, "indexing": indexing, "index": state, "revision": revision, "offset": offset, "nextOffset": offset + len(history), "hasMore": hasMore})
+}
+
+// displaySizeText writes a cached entry size for the page in the size format
+// Restore browse and File History share (engines.FormatBytes, decimal units),
+// the same for both engines. Both engines
+// list sizes as byte counts, but the cache holds them differently: a Restic
+// size is formatted when the backup is indexed ("2.2 MB"), a Kopia size is
+// kept as the byte count ("2202010"). A size that is only digits is formatted
+// here; any other text is already in that format and is sent as it is. Kopia's
+// is formatted in the response and not in the cache because the stored size
+// is part of what identifies a cached file version, and changing what the
+// cache stores would change those identities. Every response that sends a
+// cached entry size goes through this (Restore browse, File History items and
+// versions).
+func displaySizeText(size string) string {
+	if size == "" || strings.Trim(size, "0123456789") != "" {
+		return size
+	}
+	value, err := strconv.ParseInt(size, 10, 64)
+	if err != nil {
+		return size
+	}
+	return engines.FormatBytes(value)
 }
 
 func retryFileIndex(db *sql.DB, w http.ResponseWriter, r *http.Request) {

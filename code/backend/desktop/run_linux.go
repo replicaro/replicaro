@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"image/png"
+	"log"
 	"net/url"
 	"os"
 	"os/exec"
@@ -28,6 +29,7 @@ import (
 
 const (
 	statusItemInterface  = "org.kde.StatusNotifierItem"
+	statusItemPath       = dbus.ObjectPath("/StatusNotifierItem")
 	statusWatcherService = "org.kde.StatusNotifierWatcher"
 	statusWatcherPath    = dbus.ObjectPath("/StatusNotifierWatcher")
 	menuInterface        = "com.canonical.dbusmenu"
@@ -82,6 +84,7 @@ type linuxDesktop struct {
 	serviceName            string
 	stateMu                sync.RWMutex
 	statusPrepared         bool
+	statusProps            *prop.Properties
 	tray                   bool
 	notifications          bool
 	quit                   chan struct{}
@@ -132,6 +135,13 @@ func Run(service func() error, _ func() error) error {
 			activeLinuxMu.Unlock()
 			desktop.close()
 		}()
+		// The item is exported even before a tray host registers it, so its
+		// state is kept up to date from the start; a host that appears later
+		// reads the current icon. This defer runs before the one above, so the
+		// state stops changing before the connection closes.
+		if desktop.exportedStatusProperties() != nil {
+			defer startTrayState(desktop.showTrayState)()
+		}
 		if openOnStart {
 			_ = desktop.open(currentWebUIURL())
 		}
@@ -246,20 +256,26 @@ func (desktop *linuxDesktop) exportStatusNotifier() error {
 	}
 
 	item := &linuxStatusItem{desktop: desktop}
-	if err := desktop.conn.Export(item, "/StatusNotifierItem", statusItemInterface); err != nil {
+	if err := desktop.conn.Export(item, statusItemPath, statusItemInterface); err != nil {
 		return err
 	}
-	itemProps, err := prop.Export(desktop.conn, "/StatusNotifierItem", statusItemProperties())
+	itemProps, err := prop.Export(desktop.conn, statusItemPath, statusItemProperties())
 	if err != nil {
 		return err
 	}
-	itemNode := &introspect.Node{Name: "/StatusNotifierItem", Interfaces: []introspect.Interface{
+	itemNode := &introspect.Node{Name: string(statusItemPath), Interfaces: []introspect.Interface{
 		prop.IntrospectData,
-		{Name: statusItemInterface, Methods: introspect.Methods(item), Properties: itemProps.Introspection(statusItemInterface)},
+		{
+			Name: statusItemInterface, Methods: introspect.Methods(item), Properties: itemProps.Introspection(statusItemInterface),
+			Signals: []introspect.Signal{{Name: "NewIcon"}, {Name: "NewToolTip"}},
+		},
 	}}
-	if err := desktop.conn.Export(introspect.NewIntrospectable(itemNode), "/StatusNotifierItem", "org.freedesktop.DBus.Introspectable"); err != nil {
+	if err := desktop.conn.Export(introspect.NewIntrospectable(itemNode), statusItemPath, "org.freedesktop.DBus.Introspectable"); err != nil {
 		return err
 	}
+	desktop.stateMu.Lock()
+	desktop.statusProps = itemProps
+	desktop.stateMu.Unlock()
 
 	menu := &linuxStatusMenu{desktop: desktop}
 	if err := desktop.conn.Export(menu, menuPath, menuInterface); err != nil {
@@ -322,8 +338,15 @@ func (desktop *linuxDesktop) probeNotifications() bool {
 	return call.Err == nil && call.Store(&capabilities) == nil
 }
 
+// statusItemProperties builds a new property map with the values the item is
+// exported with, in the idle state. Nothing changes this map once it is
+// exported; the tray state changes the live exported properties, which
+// exportedStatusProperties returns. IconName, IconPixmap and ToolTip change
+// with the tray state (see showTrayState); StatusNotifierItem announces such
+// changes with its own NewIcon and NewToolTip signals rather than
+// PropertiesChanged, so they are EmitFalse. The rest never change.
 func statusItemProperties() prop.Map {
-	pixmaps := statusIconPixmaps()
+	iconName, pixmaps, tooltip := statusItemIcon(trayIdle)
 	iconThemePath := appImageIconThemePath()
 	return prop.Map{statusItemInterface: {
 		"Category":      {Value: "ApplicationStatus", Emit: prop.EmitConst},
@@ -331,13 +354,76 @@ func statusItemProperties() prop.Map {
 		"Title":         {Value: "Replicaro", Emit: prop.EmitConst},
 		"Status":        {Value: "Active", Emit: prop.EmitConst},
 		"WindowId":      {Value: uint32(0), Emit: prop.EmitConst},
-		"IconName":      {Value: "replicaro", Emit: prop.EmitConst},
-		"IconPixmap":    {Value: pixmaps, Emit: prop.EmitConst},
-		"ToolTip":       {Value: statusTooltip{"replicaro", pixmaps, "Replicaro", "Backup companion"}, Emit: prop.EmitConst},
+		"IconName":      {Value: iconName, Emit: prop.EmitFalse},
+		"IconPixmap":    {Value: pixmaps, Emit: prop.EmitFalse},
+		"ToolTip":       {Value: tooltip, Emit: prop.EmitFalse},
 		"ItemIsMenu":    {Value: false, Emit: prop.EmitConst},
 		"Menu":          {Value: menuPath, Emit: prop.EmitConst},
 		"IconThemePath": {Value: iconThemePath, Emit: prop.EmitConst},
 	}}
+}
+
+// statusItemIcon returns the IconName, IconPixmap and ToolTip values for
+// state. Idle names the installed replicaro theme icon and serves the
+// embedded teal icon as the pixmap. Tray hosts prefer the icon name over the
+// pixmap, and the theme icon is always teal, so every other state leaves the
+// name empty and serves the recoloured pixmap, both for the icon and in the
+// tooltip. The tooltip's title carries the state
+// text; its body is the description (trayDescription).
+func statusItemIcon(state trayState) (string, []statusPixmap, statusTooltip) {
+	iconName, source := "replicaro", linuxDesktopIcon
+	if tint, ok := trayStateTint(state); ok {
+		if tinted, err := tintPNG(linuxDesktopIcon, tint); err == nil {
+			iconName, source = "", tinted
+		}
+	}
+	pixmaps := statusIconPixmaps(source)
+	return iconName, pixmaps, statusTooltip{iconName, pixmaps, trayStateText(state), trayDescription()}
+}
+
+var trayDescriptionState struct {
+	once sync.Once
+	text string
+}
+
+// trayDescription returns the tooltip's second line, which says what
+// Replicaro is. Like the state text above it (trayStateText), it is read once,
+// when the tray is set up, in the language saved then.
+func trayDescription() string {
+	trayDescriptionState.once.Do(func() {
+		trayDescriptionState.text = desktopText(TextTrayDescription)
+	})
+	return trayDescriptionState.text
+}
+
+// exportedStatusProperties returns the live properties of the exported item,
+// the ones showTrayState changes, or nil when the item couldn't be exported.
+// statusItemProperties only builds the idle values they start from.
+func (desktop *linuxDesktop) exportedStatusProperties() *prop.Properties {
+	desktop.stateMu.RLock()
+	defer desktop.stateMu.RUnlock()
+	return desktop.statusProps
+}
+
+// showTrayState changes the item's icon and tooltip to state and announces
+// the change. Hosts that ignore the signals keep showing whatever they read
+// first, which is the teal icon only if they read it while the state was
+// idle.
+func (desktop *linuxDesktop) showTrayState(state trayState) {
+	props := desktop.exportedStatusProperties()
+	if props == nil {
+		return
+	}
+	iconName, pixmaps, tooltip := statusItemIcon(state)
+	props.SetMust(statusItemInterface, "IconName", iconName)
+	props.SetMust(statusItemInterface, "IconPixmap", pixmaps)
+	props.SetMust(statusItemInterface, "ToolTip", tooltip)
+	if err := desktop.conn.Emit(statusItemPath, statusItemInterface+".NewIcon"); err != nil {
+		log.Printf("Replicaro could not announce its new tray icon: %v", err)
+	}
+	if err := desktop.conn.Emit(statusItemPath, statusItemInterface+".NewToolTip"); err != nil {
+		log.Printf("Replicaro could not announce its new tray tooltip: %v", err)
+	}
 }
 
 func appImageIconThemePath() string {
@@ -361,8 +447,8 @@ func statusMenuProperties() prop.Map {
 	}}
 }
 
-func statusIconPixmaps() []statusPixmap {
-	image, err := png.Decode(bytes.NewReader(linuxDesktopIcon))
+func statusIconPixmaps(source []byte) []statusPixmap {
+	image, err := png.Decode(bytes.NewReader(source))
 	if err != nil {
 		return []statusPixmap{}
 	}

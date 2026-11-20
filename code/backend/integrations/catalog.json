@@ -125,8 +125,9 @@
         {
           "key": "insecure_ignore_host_key",
           "label": "Disable host-key/known_hosts verification",
+          "help": "When this option is unchecked, the SFTP/SSH server's host key must already be in this computer's known_hosts file.",
           "kind": "boolean",
-          "default": "true"
+          "default": "false"
         },
         {
           "key": "ssh_auth_sock",

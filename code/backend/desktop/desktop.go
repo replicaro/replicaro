@@ -21,25 +21,37 @@ var endpointState = struct {
 
 const replicaroUpdateURL = "https://replicaro.com/update"
 
-// Catalog keys of the tray menu labels and the Quit prompt. They live in the
-// web UI's locale catalogs like the rest of the text; main supplies the
-// lookup (SetText) so they follow the saved UI language.
+// Catalog keys of the tray menu labels, the tray icon's tooltips and the Quit
+// prompt. They live in the web UI's locale catalogs like the rest of the
+// text; main supplies the lookup (SetText) so they follow the saved UI
+// language.
 const (
 	TextTrayOpen     = "desktop.trayOpen"
 	TextTrayQuit     = "desktop.trayQuit"
 	TextQuitPrompt   = "desktop.quitPrompt"
 	TextQuitButton   = "desktop.quitButton"
 	TextCancelButton = "desktop.cancelButton"
+	TextTrayIdle     = "desktop.trayIdle"
+	TextTrayRunning  = "desktop.trayRunning"
+	TextTrayWarnings = "desktop.trayWarnings"
+	TextTrayErrors   = "desktop.trayErrors"
+	// The second line of the Linux tray tooltip, under the state text.
+	TextTrayDescription = "desktop.trayDescription"
 )
 
 // englishText is used until main sets a lookup, and whenever the lookup has
 // no text for a key. It must match en.json; a test checks that.
 var englishText = map[string]string{
-	TextTrayOpen:     "Open Replicaro",
-	TextTrayQuit:     "Quit Replicaro",
-	TextQuitPrompt:   "Quit Replicaro? Backups and other work won't run until you start Replicaro again.",
-	TextQuitButton:   "Quit",
-	TextCancelButton: "Cancel",
+	TextTrayOpen:        "Open Replicaro",
+	TextTrayQuit:        "Quit Replicaro",
+	TextQuitPrompt:      "Quit Replicaro? Backups and other work won't run until you start Replicaro again.",
+	TextQuitButton:      "Quit",
+	TextCancelButton:    "Cancel",
+	TextTrayIdle:        "Replicaro · Idle",
+	TextTrayRunning:     "Replicaro · Running jobs",
+	TextTrayWarnings:    "Replicaro · Warnings to review",
+	TextTrayErrors:      "Replicaro · Errors to review",
+	TextTrayDescription: "Backup companion",
 }
 
 var textLookup struct {
@@ -47,10 +59,10 @@ var textLookup struct {
 	resolve func() func(key string) string
 }
 
-// SetText sets how the tray labels and the Quit prompt get their text:
-// resolve reads the saved UI language and returns a lookup for it. Call it
-// before Run: the tray labels are read once, when the tray is set up, so a
-// language change shows in them after the next start. The Quit prompt
+// SetText sets how the tray labels, the tray tooltips and the Quit prompt get
+// their text: resolve reads the saved UI language and returns a lookup for it.
+// Call it before Run: the tray labels and tooltips are read once, when the
+// tray is set up, so a language change shows in them after the next start. The Quit prompt
 // resolves the language each time it opens, once for all of its texts:
 // resolving the "system" language can run an OS command (on macOS, `defaults
 // read`), and the macOS prompt is built on the main thread.

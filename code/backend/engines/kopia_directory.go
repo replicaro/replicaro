@@ -191,6 +191,10 @@ func (manifest *kopiaDirectoryManifest) listedEntry(name string, record kopiaLis
 	}
 	for _, index := range candidates[1:] {
 		other, err := manifest.Entries[index].snapshotEntry("")
+		// The candidates share the object ID, so their content is the same.
+		// The modified time doesn't decide between them either: Kopia's
+		// listing shows one of them and the first is as good as any.
+		other.Modified = converted.Modified
 		if err != nil || other != converted || manifest.Entries[index].Type != first.Type {
 			return 0, fmt.Errorf("parse Kopia directory: Kopia's listing matches more than one different entry for a duplicated name")
 		}
@@ -266,25 +270,93 @@ func (entry kopiaDirectoryEntry) snapshotEntry(prefix string) (models.SnapshotEn
 	if entry.Size < 0 {
 		return models.SnapshotEntry{}, fmt.Errorf("parse Kopia directory: negative size")
 	}
+	// Kopia stores the modified time in UTC with nanoseconds and leaves the
+	// field out when it is the zero Unix time, so a missing value is 0. The
+	// cache keeps whole seconds, the same as the long listing gives.
+	var modified int64
 	if entry.Mtime != "" {
-		if _, err := time.Parse(time.RFC3339Nano, entry.Mtime); err != nil {
+		parsed, err := time.Parse(time.RFC3339Nano, entry.Mtime)
+		if err != nil {
 			return models.SnapshotEntry{}, fmt.Errorf("parse Kopia directory: invalid mtime")
 		}
+		modified = parsed.Unix()
 	}
 
 	// Kopia's snapshotfs loader replaces a directory's stored FileSize with
-	// DirSummary.TotalFileSize before list prints it. Match that native view.
+	// DirSummary.TotalFileSize, and its stored ModTime with
+	// DirSummary.MaxModTime (the newest modified time within it), before list
+	// prints it and restore applies it. Match that native view, so a folder
+	// read here has the same size and time as from the long listing. A
+	// summary without maxTime leaves the folder's own mtime from its record.
 	size := entry.Size
 	if entry.Type == "d" && len(entry.Summary) > 0 && string(entry.Summary) != "null" {
 		var summary struct {
-			Size int64 `json:"size"`
+			Size    int64  `json:"size"`
+			MaxTime string `json:"maxTime"`
 		}
 		if err := json.Unmarshal(entry.Summary, &summary); err != nil || summary.Size < 0 {
 			return models.SnapshotEntry{}, fmt.Errorf("parse Kopia directory: invalid native directory size")
 		}
 		size = summary.Size
+		if summary.MaxTime != "" {
+			parsed, err := time.Parse(time.RFC3339Nano, summary.MaxTime)
+			if err != nil {
+				return models.SnapshotEntry{}, fmt.Errorf("parse Kopia directory: invalid native directory maxTime")
+			}
+			modified = parsed.Unix()
+		}
 	}
-	return models.SnapshotEntry{Name: entry.Name, Path: prefix + entry.Name, Mode: mode.String(), Size: strconv.FormatInt(size, 10), IsDir: entry.Type == "d"}, nil
+	return models.SnapshotEntry{Name: entry.Name, Path: prefix + entry.Name, Mode: mode.String(), Size: strconv.FormatInt(size, 10), IsDir: entry.Type == "d",
+		Modified: modified, ObjectID: entry.Object}, nil
+}
+
+// kopiaListedModified reads the modified time of a `kopia list --long`
+// record. Kopia prints it to the second in the local time zone it runs in,
+// followed by that zone's name as Go formats it: a letter abbreviation
+// ("2026-01-01 05:00:00 EST"), or for zones without one a numeric offset
+// ("+0330" in Asia/Tehran, "+0545" in Asia/Kathmandu, "+03" for a whole
+// hour). A numeric offset is read as that fixed offset, so it needs no zone
+// lookup. A letter abbreviation is looked up in Replicaro's local zone, which
+// also picks the right side of a daylight-saving change.
+//
+// The lookup assumes Kopia ran in Replicaro's own zone. In the Docker package
+// that holds, because engines inherit the container's TZ
+// (command.InheritTimeZone). Desktop engine processes don't inherit TZ and use
+// the computer's zone, so a desktop Replicaro started with a TZ of its own that
+// differs from the computer's zone can read an abbreviation in the wrong zone
+// (one both zones define) or not find it at all. The time is only shown in
+// File History; it never decides a Kopia version, which follows the object ID.
+//
+// An abbreviation the local zone doesn't define would silently read as UTC, so
+// it is an error instead. The caller then drops the text listing and reads the
+// same tree through `kopia show`, whose JSON gives the time in UTC. That keeps
+// the stored time right at the cost of one native command per folder, which is
+// why the numeric offsets must parse here: in those zones every listing would
+// otherwise take the slow path.
+func kopiaListedModified(date, clock, zone string) (int64, error) {
+	return kopiaListedModifiedIn(date, clock, zone, time.Local)
+}
+
+func kopiaListedModifiedIn(date, clock, zone string, local *time.Location) (int64, error) {
+	if strings.HasPrefix(zone, "+") || strings.HasPrefix(zone, "-") {
+		layout := "2006-01-02 15:04:05 -0700"
+		if len(zone) == 3 {
+			layout = "2006-01-02 15:04:05 -07"
+		}
+		parsed, err := time.Parse(layout, date+" "+clock+" "+zone)
+		if err != nil {
+			return 0, fmt.Errorf("Kopia long listing has invalid time")
+		}
+		return parsed.Unix(), nil
+	}
+	parsed, err := time.ParseInLocation("2006-01-02 15:04:05 MST", date+" "+clock+" "+zone, local)
+	if err != nil {
+		return 0, fmt.Errorf("Kopia long listing has invalid time")
+	}
+	if location := parsed.Location(); location != local && location != time.UTC {
+		return 0, fmt.Errorf("Kopia long listing has a time zone this computer doesn't know")
+	}
+	return parsed.Unix(), nil
 }
 
 func (manifest *kopiaDirectoryManifest) selectedType(basename string) (kopiaSelectedEntryType, error) {
@@ -381,7 +453,7 @@ func parseCheckedKopiaEntries(reader io.Reader, summary json.RawMessage) ([]mode
 			return nil, fmt.Errorf("Kopia long listing record count differs from native summary")
 		}
 		line = strings.TrimSuffix(line, "\n")
-		mode, name, err := parseKopiaLongEntry(line)
+		mode, object, name, err := parseKopiaLongRecord(line)
 		if err != nil {
 			return nil, err
 		}
@@ -393,8 +465,9 @@ func parseCheckedKopiaEntries(reader io.Reader, summary json.RawMessage) ([]mode
 		if err != nil || size < 0 {
 			return nil, fmt.Errorf("Kopia long listing has invalid size")
 		}
-		if _, err := time.Parse("2006-01-02 15:04:05", fields[2]+" "+fields[3]); err != nil {
-			return nil, fmt.Errorf("Kopia long listing has invalid time")
+		modified, err := kopiaListedModified(fields[2], fields[3], fields[4])
+		if err != nil {
+			return nil, err
 		}
 		if mode[0] == 'd' {
 			if !strings.HasSuffix(name, "/") {
@@ -407,7 +480,8 @@ func parseCheckedKopiaEntries(reader io.Reader, summary json.RawMessage) ([]mode
 		}
 		seen[name] = true
 		parts := strings.Split(name, "/")
-		entries = append(entries, models.SnapshotEntry{Name: parts[len(parts)-1], Path: name, Mode: mode, Size: fields[1], IsDir: mode[0] == 'd'})
+		entries = append(entries, models.SnapshotEntry{Name: parts[len(parts)-1], Path: name, Mode: mode, Size: fields[1], IsDir: mode[0] == 'd',
+			Modified: modified, ObjectID: object})
 	}
 	if records != expected {
 		return nil, fmt.Errorf("Kopia long listing record count differs from native summary")

@@ -38,6 +38,8 @@ import type { TimelineEvent } from "./dashboardIssue";
 import { formatReadableLog, noSummaryDiagnosticsLine } from "./nativeLogFormat";
 import { NativeLogPager, retainReadableLog } from "./nativeLogPaging";
 import { VAULT_PASSWORD_CHANGE_KIND, passwordChangeStillBlocksVault } from "../services/trackedOperations";
+import { readableSize } from "../sizeDisplay";
+import { ltrIsolate } from "../services/rcloneRemote";
 
 type TimelineFilter = "all" | "backups" | "restores" | "checks" | "maintenance" | "other" | "issues";
 
@@ -203,7 +205,31 @@ function operationLogPageLabel(page: OperationLogResponse) {
 	if (unitIndex === 0) {
 		return t("ui.overview.logByteRange", { count: page.nextOffset - page.offset, start: page.offset + 1, end: page.nextOffset, size: page.size });
 	}
-	return t("ui.overview.logUnitRange", { start: format(page.offset + 1), end: format(page.nextOffset), size: format(page.size), unit });
+	// The range and the size are each one piece with their unit, isolated left
+	// to right on a right-to-left page, so they read "1–256 KB" and "2.4 MB"
+	// there too (sizes read number then unit on every page).
+	return t("ui.overview.logUnitRange", {
+		range: ltrIsolate(`${format(page.offset + 1)}–${format(page.nextOffset)} ${unit}`),
+		size: ltrIsolate(`${format(page.size)} ${unit}`),
+	});
+}
+
+// The "Vaults' Size" and "Protected Data" tiles add up the saved sizes the
+// Protect page's vault and job cards show (Repository.vaultSizeBytes,
+// BackupJob.sizeBytes) from the lists the dashboard already loads, and format
+// the sum the same way (readableSize). They must never start a measurement or
+// a request of their own. A vault or job that was never measured has no size
+// and is left out, so the sum covers only part of them; the tooltip says how
+// many were measured, so a partial sum isn't read as the whole. With nothing
+// measured the tile shows a dash. On a right-to-left page the value keeps
+// its number before its unit ("1.8 TB", not "TB 1.8").
+function SizeTile({ to, sizes, label, measuredText }: { to: string; sizes: Array<number | null | undefined>; label: string; measuredText: (measured: number, count: number) => string }) {
+	const measured = sizes.filter((size): size is number => typeof size === "number");
+	const value = measured.length ? readableSize(measured.reduce((sum, size) => sum + size, 0)) : "—";
+	const link = <Link to={to} aria-label={`${value} ${label}`}><strong><bdi dir="ltr">{value}</bdi></strong><span>{label}</span></Link>;
+	return <div className="overview-size-stat">{measured.length < sizes.length
+		? <Tooltip content={measuredText(measured.length, sizes.length)}>{link}</Tooltip>
+		: link}</div>;
 }
 
 // A damaged record can have a time the page can't read, or no title, message
@@ -259,6 +285,7 @@ function operationKindLabel(kind: string) {
         case "vault_password": return t("ui.operation.kind.vaultPassword");
         case "vault_settings": return t("ui.operation.kind.vaultSettings");
         case "remove_vault": return t("ui.operation.kind.removeVault");
+        case "download": return t("ui.operation.kind.download");
         default: return kind;
     }
 }
@@ -291,6 +318,7 @@ function operationStepLabel(kind: string) {
         case "repository_integrity_check": return t("ui.operation.kind.check");
         case "maintenance": return t("ui.operation.kind.maintenance");
         case "snapshot_deletion": return t("ui.operation.kind.delete");
+        case "download": return t("ui.operation.kind.download");
         case "retention": return t("ui.operation.step.retention");
         case "integrity_cache_prepare": return t("ui.operation.step.prepareIntegrityCheck");
         case "integrity_cache_cleanup": return t("ui.operation.step.cleanUpIntegrityCheck");
@@ -990,10 +1018,18 @@ export default function Overview() {
     const issueCount = stats?.failedRuns ?? 0;
     const hasIssues = issueCount > 0;
 	const activeRepositoryByID = new Map(repos.map((repo) => [repo.id, repo]));
-	const activeBackupOperations = activeOperations.filter((operation) => operation.kind === "backup");
-	const jobsRunning = activeBackupOperations.length > 0;
-	const gettingStarted = stats !== null && !error && !hasIssues && !jobsRunning && repos.length === 0 && jobs.length === 0;
-	const needsFirstJob = stats !== null && !error && !hasIssues && !jobsRunning && repos.length > 0 && jobs.length === 0;
+	// Anything under "Active now" counts as running, whatever its kind; the
+	// tray icon uses the same rule.
+	const jobsRunning = activeOperations.length > 0;
+	// The two getting-started guides give way only to a running backup. A vault
+	// check, maintenance or restore can run before the first job exists, and the
+	// guide (with its button to create that job) should stay up while it does;
+	// the operation is still listed under "Active now". Outside the
+	// getting-started guides, the pacman, its ring and the count line follow
+	// every active operation through jobsRunning.
+	const backupRunning = activeOperations.some((operation) => operation.kind === "backup");
+	const gettingStarted = stats !== null && !error && !hasIssues && !backupRunning && repos.length === 0 && jobs.length === 0;
+	const needsFirstJob = stats !== null && !error && !hasIssues && !backupRunning && repos.length > 0 && jobs.length === 0;
     const issueTone = issueCount > (stats?.warningRuns ?? 0) ? "danger" : "warn";
     const ringTone = hasIssues ? issueTone : percent === 100 ? "ok" : percent === 0 ? "danger" : "warn";
     const failing = enabledTargets.filter((target) => target.lastStatus === "failed" || target.lastStatus === "interrupted" || target.lastStatus === "reconnect_required");
@@ -1162,7 +1198,7 @@ export default function Overview() {
 		}
 	};
 	const subcopy = jobsRunning
-		? t("ui.overview.runningOperations", { count: activeBackupOperations.length })
+		? t("ui.overview.runningOperations", { count: activeOperations.length })
 		: hasIssues
         ? renderMessage("ui.overview.issuesNeedAttention", { count: issueCount, issueLink: <button type="button" className="text-button inline-issues-link" onClick={showIssues}>{t("ui.overview.issueCount", { count: issueCount })}</button> })
         : failing.length
@@ -1215,7 +1251,7 @@ export default function Overview() {
 		}
 	};
 	const protectionRingContents = jobsRunning ? (
-		<div className="running-indicator" role="img" aria-label={t("ui.pages.overview.backup.jobs.running")}>
+		<div className="running-indicator" role="img" aria-label={t("ui.overview.jobsRunning")}>
 			<span className="pacman-motion" aria-hidden="true" />
 			<span>{t("ui.pages.overview.running")}</span>
 		</div>
@@ -1335,7 +1371,9 @@ export default function Overview() {
                     )}
                     <div className="overview-stats">
                         <div><Link to="/protect#vaults"><strong>{formatDisplayNumber(stats?.repositoryCount ?? repos.length)}</strong><span>{t("ui.pages.overview.vaults")}</span></Link></div>
+                        <SizeTile to="/protect#vaults" sizes={repos.map((repo) => repo.vaultSizeBytes)} label={t("ui.overview.vaultsSize")} measuredText={(measured, count) => t("ui.overview.vaultsMeasured", { measured, count })} />
                         <div><Link to="/protect#jobs"><strong>{formatDisplayNumber(stats?.jobCount ?? jobs.length)}</strong><span>{t("ui.pages.overview.jobs.2")}</span></Link></div>
+                        <SizeTile to="/protect#jobs" sizes={jobs.map((job) => job.sizeBytes)} label={t("ui.overview.protectedData")} measuredText={(measured, count) => t("ui.overview.jobsMeasured", { measured, count })} />
                         <div className="ok"><strong>{formatDisplayNumber(stats?.successfulRuns ?? 0)}</strong><span>{t("ui.pages.overview.runs.ok")}</span></div>
                         <div className={hasIssues ? issueTone : ""}>
                             <button type="button" className="overview-stat-link" onClick={showIssues} aria-controls="timeline">

@@ -39,17 +39,22 @@ type RepositoryCreationIntent struct {
 	MaintenanceSchedule    string                    `json:"maintenanceSchedule"`
 	ConcurrencyMode        string                    `json:"concurrencyMode"`
 	ObjectLock             models.ObjectLockSettings `json:"objectLock"`
-	PublicationOperationID string                    `json:"-"`
-	ReviewedOptions        map[string]string         `json:"reviewedOptions,omitempty"`
-	ReviewedOptionsJSON    string                    `json:"-"`
-	ProfileSHA256          string                    `json:"-"`
-	ProfileJSON            string                    `json:"-"`
-	NativeFingerprint      string                    `json:"-"`
-	NativeOperationID      string                    `json:"-"`
-	Phase                  string                    `json:"phase"`
-	LastError              string                    `json:"lastError,omitempty"`
-	CreatedAt              string                    `json:"createdAt"`
-	UpdatedAt              string                    `json:"updatedAt"`
+	// ECCOverheadPercent is the requested Kopia error correction overhead, 0
+	// for off, kept in the intent's ecc_overhead_percent column. A Retry has
+	// to request the same value. The vault row saves what Kopia reports
+	// instead (see models.Repository.ECCOverheadPercent).
+	ECCOverheadPercent     int               `json:"eccOverheadPercent"`
+	PublicationOperationID string            `json:"-"`
+	ReviewedOptions        map[string]string `json:"reviewedOptions,omitempty"`
+	ReviewedOptionsJSON    string            `json:"-"`
+	ProfileSHA256          string            `json:"-"`
+	ProfileJSON            string            `json:"-"`
+	NativeFingerprint      string            `json:"-"`
+	NativeOperationID      string            `json:"-"`
+	Phase                  string            `json:"phase"`
+	LastError              string            `json:"lastError,omitempty"`
+	CreatedAt              string            `json:"createdAt"`
+	UpdatedAt              string            `json:"updatedAt"`
 }
 
 var ErrRepositoryCreationSettingsMismatch = fmt.Errorf("creation retry differs from the original reviewed vault settings")
@@ -171,7 +176,7 @@ const creationIntentColumns = `id, canonical_identity, storage_identity_version,
 	storage_identity_key, storage_identity_json, engine, connector, cold_storage, archive_write_class, location, name,
 	description, check_schedule, maintenance_schedule, concurrency_mode, object_lock_json, publication_operation_id,
 	reviewed_options_json, profile_sha256, profile_json, native_fingerprint,
-	native_operation_id, phase, last_error, created_at, updated_at`
+	native_operation_id, phase, last_error, created_at, updated_at, ecc_overhead_percent`
 
 func scanCreationIntent(scan func(...any) error) (RepositoryCreationIntent, error) {
 	var value RepositoryCreationIntent
@@ -182,7 +187,7 @@ func scanCreationIntent(scan func(...any) error) (RepositoryCreationIntent, erro
 		&value.Description, &value.CheckSchedule, &value.MaintenanceSchedule, &value.ConcurrencyMode, &objectLockJSON,
 		&value.PublicationOperationID, &value.ReviewedOptionsJSON, &value.ProfileSHA256,
 		&value.ProfileJSON, &value.NativeFingerprint, &value.NativeOperationID,
-		&value.Phase, &value.LastError, &value.CreatedAt, &value.UpdatedAt)
+		&value.Phase, &value.LastError, &value.CreatedAt, &value.UpdatedAt, &value.ECCOverheadPercent)
 	if err != nil {
 		return value, err
 	}
@@ -192,6 +197,9 @@ func scanCreationIntent(scan func(...any) error) (RepositoryCreationIntent, erro
 	value.ObjectLock, err = models.NormalizeObjectLock(value.Engine, value.Connector, value.ObjectLock)
 	if err != nil {
 		return value, fmt.Errorf("invalid pending creation object lock settings: %w", err)
+	}
+	if err := models.ValidateRequestedECCOverheadPercent(value.Engine, value.ECCOverheadPercent); err != nil {
+		return value, fmt.Errorf("invalid pending creation error correction settings: %w", err)
 	}
 	if !models.ValidConcurrencyMode(value.ConcurrencyMode) {
 		return value, fmt.Errorf("invalid pending creation concurrency mode")
@@ -251,6 +259,9 @@ func normalizeCreation(repo models.Repository, reviewedOptions ...map[string]str
 	}
 	if !models.ObjectLockMaintenanceEligible(repo.ObjectLock, maintenance) {
 		return normalizedCreation{}, fmt.Errorf("space reclamation schedule is incompatible with object lock duration")
+	}
+	if err := models.ValidateRequestedECCOverheadPercent(repo.Engine, repo.ECCOverheadPercent); err != nil {
+		return normalizedCreation{}, err
 	}
 	objectLockJSON, err := encodeRepositoryObjectLock(repo)
 	if err != nil {
@@ -324,14 +335,15 @@ func ReserveRepositoryCreation(db *sql.DB, repo models.Repository, reviewedOptio
 		(id,canonical_identity,storage_identity_version,storage_identity_key,storage_identity_json,
 		 engine,connector,cold_storage,archive_write_class,location,name,description,
 		 check_schedule,maintenance_schedule,concurrency_mode,object_lock_json,publication_operation_id,reviewed_options_json,
-		 profile_sha256,profile_json,native_fingerprint,native_operation_id,phase,last_error,created_at,updated_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'','','','','prepared','',?,?)`,
+		 profile_sha256,profile_json,native_fingerprint,native_operation_id,phase,last_error,created_at,updated_at,
+		 ecc_overhead_percent)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'','','','','prepared','',?,?,?)`,
 		id, normalized.identity, normalized.storageVersion, normalized.storageKey,
 		normalized.storageJSON, normalized.repo.Engine, normalized.repo.Connector,
 		normalized.repo.ColdStorage, normalized.repo.ArchiveWriteClass,
 		normalized.repo.Location, normalized.repo.Name, normalized.repo.Description,
 		normalized.check, normalized.maintenance, normalized.repo.ConcurrencyMode, normalized.objectLockJSON, uuid.NewString(), normalized.reviewedJSON,
-		now, now)
+		now, now, normalized.repo.ECCOverheadPercent)
 	if err != nil {
 		return RepositoryCreationIntent{}, err
 	}
@@ -372,6 +384,7 @@ func LoadRepositoryCreationRetry(db *sql.DB, id string, repo models.Repository, 
 		intent.CheckSchedule != normalized.check || intent.MaintenanceSchedule != normalized.maintenance ||
 		intent.ConcurrencyMode != normalized.repo.ConcurrencyMode ||
 		intent.ObjectLock != normalized.repo.ObjectLock ||
+		intent.ECCOverheadPercent != normalized.repo.ECCOverheadPercent ||
 		intent.ReviewedOptionsJSON != normalized.reviewedJSON {
 		return RepositoryCreationIntent{}, ErrRepositoryCreationSettingsMismatch
 	}
@@ -549,6 +562,7 @@ func CompleteRepositoryCreation(db *sql.DB, intent RepositoryCreationIntent, rep
 		storedIntent.ColdStorage != intent.ColdStorage || storedIntent.ArchiveWriteClass != intent.ArchiveWriteClass ||
 		storedIntent.Name != intent.Name || storedIntent.ReviewedOptionsJSON != intent.ReviewedOptionsJSON ||
 		storedIntent.ObjectLock != intent.ObjectLock ||
+		storedIntent.ECCOverheadPercent != intent.ECCOverheadPercent ||
 		storedIntent.Phase != RepositoryCreationNativeReady || strings.TrimSpace(storedIntent.NativeFingerprint) == "" {
 		return "", fmt.Errorf("repository creation intent changed before attachment")
 	}
@@ -582,12 +596,16 @@ func CompleteRepositoryCreation(db *sql.DB, intent RepositoryCreationIntent, rep
 	if err != nil {
 		return "", err
 	}
+	// Every setting below comes from the intent except the error correction
+	// overhead: the vault saves what Kopia reported for the repository it
+	// validated (repo.ECCOverheadPercent), not the overhead the intent asked
+	// for. If the two ever differ, the vault shows Kopia's value.
 	_, err = tx.Exec(`INSERT INTO repositories
 		(id,name,engine,connector,cold_storage,archive_write_class,location,canonical_identity,
 		 storage_identity_version,storage_identity_key,storage_identity_json,description,
 		 passphrase,connector_options,native_repository_id,profile_uuid,attachment_generation,metadata_cache_binding,check_schedule,next_check,
-		 maintenance_schedule,object_lock_json,next_maintenance,concurrency_mode,auto_unlock,created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		 maintenance_schedule,object_lock_json,next_maintenance,concurrency_mode,auto_unlock,created_at,ecc_overhead_percent)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		intent.ID, intent.Name, intent.Engine, intent.Connector, intent.ColdStorage,
 		intent.ArchiveWriteClass, intent.Location, intent.CanonicalIdentity,
 		intent.StorageIdentityVersion, intent.StorageIdentityKey, intent.StorageIdentityJSON,
@@ -595,7 +613,8 @@ func CompleteRepositoryCreation(db *sql.DB, intent RepositoryCreationIntent, rep
 		repo.ProfileUUID, repo.AttachmentGeneration, uuid.NewString(), intent.CheckSchedule,
 		NextRunFrom(intent.CheckSchedule, time.Now()), intent.MaintenanceSchedule,
 		objectLockJSON,
-		NextRunFrom(intent.MaintenanceSchedule, time.Now()), intent.ConcurrencyMode, repo.AutoUnlock, createdAt)
+		NextRunFrom(intent.MaintenanceSchedule, time.Now()), intent.ConcurrencyMode, repo.AutoUnlock, createdAt,
+		repo.ECCOverheadPercent)
 	if err != nil {
 		return "", err
 	}

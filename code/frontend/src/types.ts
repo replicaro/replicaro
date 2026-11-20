@@ -41,6 +41,9 @@ export interface Repository {
 	native_repository_id: string;
 	isVaultOwner: boolean;
 	objectLock: ObjectLockSettings;
+	// Kopia's error correction overhead as Kopia reported it when this
+	// computer created, connected or last reconnected the vault; 0 is off.
+	eccOverheadPercent?: number;
 	// Saved on the server; set when a job or background worker found that this
 	// vault needs a reconnect, cleared by a later success or a reconnect.
 	reconnectRequired?: boolean;
@@ -204,12 +207,31 @@ export interface DormantRecoveryJob {
 	definition: ProtectedProfileJob;
 }
 
+// regularFile (here, on FileVersion and on FileHistoryVersion) is the
+// backend's answer to whether the backup holds the item as a regular file, the
+// only kind it can download: a folder, a symlink or a device is never one.
+// Symlinks are left out because the engines disagree on them: `kopia show`
+// prints the link's target text, which the browser would save as if it were
+// the file, and `restic dump` refuses a symlink. Download is also never
+// offered in a Cold Storage vault, whose data has to be retrieved first; the
+// server refuses those vaults.
+//
+// modified (here and on FileVersion) is the modified time the engine lists for
+// the item, RFC 3339 UTC in whole seconds. For a folder the engines differ:
+// Restic's is the folder's own time, Kopia's is the newest time within it.
+// It is "" only for a File History folder that the backup holds through its
+// contents alone; an empty value hides the date. A
+// Kopia time of exactly 1970-01-01T00:00:00Z may mean the listing had no time;
+// it is shown as that date. size is already written for display by the
+// backend.
 export interface SnapshotEntry {
     name: string;
     path?: string;
     mode: string;
     size: string;
+    modified: string;
     isDir: boolean;
+	regularFile: boolean;
 	nativeRootId?: string;
 	nativeRootUser?: string;
 	nativeRootHost?: string;
@@ -230,12 +252,45 @@ export interface FileBrowseEntry extends FileSearchResult {
 export interface FileVersion {
     snapshotId: string;
     timestamp: string;
+    modified: string;
     size: string;
     source: string;
     isDir: boolean;
+	regularFile: boolean;
     present: boolean;
 	nativeRootId: string;
 	machineLabel?: string;
+	// Set when the backend knows no name for the computer: machineLabel is then
+	// its English "Previous computer" (with " #n" when several computers share
+	// that label), and the page shows its own translation instead, with
+	// unnamedComputerNumber as n (absent without one). Absent for a named
+	// computer.
+	unnamedComputer?: boolean;
+	unnamedComputerNumber?: number;
+}
+
+// One version of a file in File History: a run of neighbouring backups of one
+// computer and one set of source folders in which the engine reported no
+// change to the file. Restore it from snapshotId with nativeRootId (the newest
+// backup holding it). modified is RFC 3339 UTC, whole seconds; size is written
+// like FileVersion.size; firstBackup and lastBackup are the timestamps of the
+// oldest and newest backup in the run.
+export interface FileHistoryVersion {
+	snapshotId: string;
+	nativeRootId: string;
+	source: string;
+	modified: string;
+	size: string;
+	// Whether the newest backup holding the version holds it as a regular file.
+	// The API sends it, but the page's Download button reads the chosen backup's
+	// own entry (FileVersion.regularFile) instead.
+	regularFile: boolean;
+	firstBackup: string;
+	lastBackup: string;
+	machineLabel: string;
+	// See FileVersion.unnamedComputer.
+	unnamedComputer?: boolean;
+	unnamedComputerNumber?: number;
 }
 
 export interface MetadataIndexState {

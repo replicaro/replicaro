@@ -75,8 +75,12 @@ func LogError(
 		`INSERT INTO activity_log (timestamp, level, message) VALUES (?, 'ERROR', ?)`,
 		formatSortableTimestamp(time.Now()), message,
 	)
-
-	return err
+	if err != nil {
+		return err
+	}
+	// An error entry is a dashboard issue.
+	dashboardChanged()
+	return nil
 }
 
 // LogSupport retains bounded diagnostics for export without presenting them as
@@ -95,12 +99,22 @@ func LogWarning(db *sql.DB, message string) error {
 		`INSERT INTO activity_log (timestamp, level, message) VALUES (?, 'WARN', ?)`,
 		formatSortableTimestamp(time.Now()), message,
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	// A warning entry is a dashboard issue.
+	dashboardChanged()
+	return nil
 }
 
+// ClearActivity deletes the whole activity log, its warning and error entries
+// included, so the dashboard's Issues count can drop.
 func ClearActivity(db *sql.DB) error {
-	_, err := db.Exec(`DELETE FROM activity_log`)
-	return err
+	if _, err := db.Exec(`DELETE FROM activity_log`); err != nil {
+		return err
+	}
+	dashboardChanged()
+	return nil
 }
 
 // PruneActivity deletes log entries older than the given retention.
@@ -110,13 +124,18 @@ func PruneActivity(db *sql.DB, days int) error {
 		return nil
 	}
 
-	_, err := db.Exec(
+	result, err := db.Exec(
 		`DELETE FROM activity_log
 		 WHERE timestamp < datetime('now', ?)`,
 		"-"+strconv.Itoa(days)+" days",
 	)
 	if err != nil {
 		return err
+	}
+	// This runs on every scheduler tick; only a deletion can change the
+	// dashboard's Issues count.
+	if count, _ := result.RowsAffected(); count > 0 {
+		dashboardChanged()
 	}
 	return PruneOperations(db, days)
 }

@@ -1640,22 +1640,54 @@ func (e *destinationPreflightError) Error() string {
 
 var runNewVaultPreflight = preflightNewVault
 
-func preflightNewVault(ctx context.Context, repo models.Repository) error {
+// newVaultLocationEntries lists the names directly inside a vault location
+// with a read-only listing: os.ReadDir for a local folder, rclone's listing
+// for every other storage type. A missing location lists as empty. Creation
+// uses it to require an empty destination, and a retried creation uses it to
+// see whether anything was written before the engine is run again.
+//
+// A local folder is read through engines.ReadWithin: the caller holds the new
+// vault's lock, and a hung share must not keep it after the request ends.
+func newVaultLocationEntries(ctx context.Context, repo models.Repository) ([]string, error) {
 	if repo.Connector == "fs" {
-		// Creation holds the new vault's lock here. Both reads of the
-		// destination are bounded by the request context, like the creation
-		// handler's later reads of the vault path, so a hung share cannot keep
-		// that lock after the request is cancelled; see engines.ReadWithin.
 		entries, err := engines.ReadWithin(ctx, func() ([]os.DirEntry, error) { return os.ReadDir(repo.Location) })
 		if errors.Is(err, os.ErrNotExist) {
-			return nil
+			return nil, nil
 		}
 		if err != nil {
-			return err
+			return nil, err
 		}
-		if len(entries) == 0 {
-			return nil
+		names := make([]string, 0, len(entries))
+		for _, entry := range entries {
+			names = append(names, entry.Name())
 		}
+		return names, nil
+	}
+	entries, err := (vaultprofile.Store{Repository: repo}).ListRoot(ctx)
+	if err != nil {
+		return nil, err
+	}
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name)
+	}
+	return names, nil
+}
+
+// runPendingCreationListing is replaceable so tests can count the listing.
+var runPendingCreationListing = newVaultLocationEntries
+
+func preflightNewVault(ctx context.Context, repo models.Repository) error {
+	names, err := newVaultLocationEntries(ctx, repo)
+	if err != nil {
+		return err
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	if repo.Connector == "fs" {
+		// Creation holds the new vault's lock here, so this read is bounded
+		// by the request context like the listing above.
 		_, err = engines.ReadWithin(ctx, func() (os.FileInfo, error) {
 			return os.Stat(filepath.Join(repo.Location, filepath.FromSlash(vaultprofile.PhysicalPath)))
 		})
@@ -1665,26 +1697,11 @@ func preflightNewVault(ctx context.Context, repo models.Repository) error {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return err
 		}
-		for _, entry := range entries {
-			name := strings.ToLower(strings.TrimSpace(entry.Name()))
-			if name == "config" || strings.HasPrefix(name, "kopia.repository") || strings.HasPrefix(name, "kopia.blobcfg") {
-				return &destinationPreflightError{kind: "existing"}
-			}
-		}
-		return &destinationPreflightError{kind: "unknown"}
-	}
-	entries, err := (vaultprofile.Store{Repository: repo}).ListRoot(ctx)
-	if err != nil {
-		return err
-	}
-	if len(entries) == 0 {
-		return nil
-	}
-	if exists, err := (vaultprofile.Store{Repository: repo}).Exists(ctx); err == nil && exists {
+	} else if exists, err := (vaultprofile.Store{Repository: repo}).Exists(ctx); err == nil && exists {
 		return &destinationPreflightError{kind: "existing"}
 	}
-	for _, entry := range entries {
-		name := strings.ToLower(strings.TrimSpace(entry.Name))
+	for _, entry := range names {
+		name := strings.ToLower(strings.TrimSpace(entry))
 		if name == "config" || strings.HasPrefix(name, "kopia.repository") || strings.HasPrefix(name, "kopia.blobcfg") {
 			return &destinationPreflightError{kind: "existing"}
 		}
@@ -2104,6 +2121,16 @@ func previewExistingVault(ctx context.Context, input ExistingVaultStorage) (Exis
 	}
 	if input.DiscoverIdentityOnly {
 		return ExistingVaultPreview{VaultUUID: deterministicImportVaultUUID(engineID, nativeIdentity)}, temporary, nil
+	}
+	if engineID == engines.KopiaID {
+		// A Connect or Reconnect saves the error correction overhead Kopia
+		// reports in the status this validation read; no extra Kopia command
+		// runs for it. It comes from Kopia, not from the protected root, so it
+		// is also right for a repository created outside Replicaro.
+		temporary.ECCOverheadPercent, err = engines.KopiaReportedECCOverheadPercent(validationOutput)
+		if err != nil {
+			return ExistingVaultPreview{}, models.Repository{}, fmt.Errorf("read native repository error correction: %w", err)
+		}
 	}
 	storageIdentity := temporary.CanonicalIdentity
 	snapshots := []models.Snapshot{}
@@ -3415,6 +3442,16 @@ func resumeRepositoryConnection(
 	if err != nil || nativeFingerprint != intent.NativeFingerprint {
 		writeError(w, http.StatusConflict, fmt.Errorf("the native vault changed after review; attachment was stopped"))
 		return
+	}
+	if repo.Engine == engines.KopiaID {
+		// The saved intent doesn't keep the error correction overhead, so a
+		// retried connection reads it from the status this validation read,
+		// as a first Connect does.
+		repo.ECCOverheadPercent, err = engines.KopiaReportedECCOverheadPercent(validationOutput)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, fmt.Errorf("read native repository error correction: %w", err))
+			return
+		}
 	}
 	if rootErr := verifyPendingConnectionRoot(r.Context(), repo, payload, intent.State == "attachment_pending"); rootErr != nil {
 		writeError(w, http.StatusConflict, rootErr)

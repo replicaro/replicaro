@@ -135,6 +135,7 @@ func Migrate(db *sql.DB) error {
 			CHECK (concurrency_mode IN ('reduced','native','increased','maximum')),
 		auto_unlock INTEGER NOT NULL DEFAULT 1 CHECK (auto_unlock IN (0,1)),
 		created_at DATETIME,
+		ecc_overhead_percent INTEGER NOT NULL DEFAULT 0 CHECK (ecc_overhead_percent >= 0),
 		CHECK ((vault_size_bytes IS NULL AND vault_size_measured_at = '') OR
 		       (vault_size_bytes IS NOT NULL AND vault_size_measured_at <> '')),
 		CHECK ((cold_storage = 0 AND archive_write_class = '') OR
@@ -357,6 +358,7 @@ func Migrate(db *sql.DB) error {
 		last_error TEXT NOT NULL DEFAULT '',
 		created_at TEXT NOT NULL,
 		updated_at TEXT NOT NULL,
+		ecc_overhead_percent INTEGER NOT NULL DEFAULT 0 CHECK (ecc_overhead_percent >= 0),
 		CHECK ((cold_storage = 0 AND archive_write_class = '') OR
 		       (cold_storage = 1 AND engine = 'restic' AND connector = 's3' AND archive_write_class IN ('DEEP_ARCHIVE','GLACIER')))
 	);
@@ -563,6 +565,24 @@ func Migrate(db *sql.DB) error {
 		`INTEGER NOT NULL DEFAULT 0 CHECK (vault_size_dirty_count >= 0)`); err != nil {
 		return err
 	}
+	// The Kopia error correction overhead a vault's repository reported (see
+	// models.Repository.ECCOverheadPercent). Existing vaults start at 0, shown
+	// as off: a vault created by Replicaro before this column existed has no
+	// error correction, and a Kopia vault created elsewhere with it shows the
+	// real value after its next Reconnect. Nothing reads every vault once to
+	// fill it in.
+	if err := addColumnIfMissing(tx, "repositories", "ecc_overhead_percent",
+		`INTEGER NOT NULL DEFAULT 0 CHECK (ecc_overhead_percent >= 0)`); err != nil {
+		return err
+	}
+	// The overhead a pending creation asked for (see
+	// RepositoryCreationIntent.ECCOverheadPercent). A pending creation saved
+	// before this column existed had no error correction, so 0 (off) is its
+	// real value and its Retry still matches.
+	if err := addColumnIfMissing(tx, "repository_creation_intents", "ecc_overhead_percent",
+		`INTEGER NOT NULL DEFAULT 0 CHECK (ecc_overhead_percent >= 0)`); err != nil {
+		return err
+	}
 	// A completed_with_issues backup can carry a qualifier such as
 	// "locked_files" (see models.OperationIssueLockedFiles). Existing rows get
 	// '' and keep showing plain completed with issues; they are not
@@ -591,8 +611,9 @@ func Migrate(db *sql.DB) error {
 		return err
 	}
 	// Only the kinds that run native Restic commands under the vault lock can
-	// leave a stale Restic lock behind: backup, restore, check, maintenance and
-	// snapshot deletion ("delete"). A job deletion record runs no Restic
+	// leave a stale Restic lock behind: backup, restore, check, maintenance,
+	// snapshot deletion ("delete") and a file download (`restic dump` takes
+	// Restic's own lock while it reads). A job deletion record runs no Restic
 	// command, and a queued record never started anything, so neither selects
 	// a vault for the unlock. Keep this list to those kinds when adding new
 	// operation kinds.
@@ -601,7 +622,7 @@ func Migrate(db *sql.DB) error {
 		WHERE r.engine = 'restic' AND r.auto_unlock = 1 AND (
 			r.last_check_status = 'running' OR r.last_maintenance_status = 'running' OR
 			EXISTS (SELECT 1 FROM operations o WHERE o.repository_id = r.id AND o.status = 'running'
-				AND o.kind IN ('backup', 'restore', 'check', 'maintenance', 'delete'))
+				AND o.kind IN ('backup', 'restore', 'check', 'maintenance', 'delete', 'download'))
 		)`); err != nil {
 		return err
 	}
@@ -844,6 +865,11 @@ func Migrate(db *sql.DB) error {
 	if err := tx.Commit(); err != nil {
 		return err
 	}
+	// The clean-up above interrupts operations left queued or running. At a
+	// normal start nothing listens yet and the tray reads its state once when
+	// it starts; the notice is sent anyway so every operation writer goes
+	// through the same call.
+	dashboardChanged()
 	// Best effort, after the rows are gone: a leftover staged or previous
 	// config copy is harmless residue (no credentials), and the next start no
 	// longer knows its token, so a failure here is only logged.

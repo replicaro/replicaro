@@ -226,6 +226,16 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		badRequest(w, err.Error())
 		return
 	}
+	// The engine is final here (a Cold Storage vault is Restic, a sign-in or
+	// Any Rclone Remote vault too), so error correction asked for on anything
+	// but Kopia is refused, not dropped. It is checked this early so a refused
+	// request touches nothing: the rclone remote check below creates and
+	// removes a probe file in the local folder that holds the rclone config
+	// file (it writes nothing to the remote storage).
+	if err := models.ValidateRequestedECCOverheadPercent(req.Engine, req.ECCOverheadPercent); err != nil {
+		badRequest(w, err.Error())
+		return
+	}
 	if req.Name == "" || req.Location == "" {
 		badRequest(w, "name and location are required")
 		return
@@ -376,7 +386,7 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		ColdStorage: req.ColdStorage, ArchiveWriteClass: req.ArchiveWriteClass,
 		Description: req.Description, CheckSchedule: req.CheckSchedule,
 		MaintenanceSchedule: req.MaintenanceSchedule, ConcurrencyMode: req.ConcurrencyMode, ObjectLock: req.ObjectLock,
-		AutoUnlock: true, ConnectorOptions: options,
+		ECCOverheadPercent: req.ECCOverheadPercent, AutoUnlock: true, ConnectorOptions: options,
 	})
 	if err != nil {
 		markSupportStorageObservation(w, "vault_create_destination", err)
@@ -488,7 +498,7 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		Location: intent.Location, Passphrase: req.Password, ConnectorOptions: options,
 		ClientUUID: clientUUID, CheckSchedule: intent.CheckSchedule, MaintenanceSchedule: intent.MaintenanceSchedule,
 		ConcurrencyMode: intent.ConcurrencyMode,
-		ObjectLock:      intent.ObjectLock, RcloneConfigPath: rcloneConfigPath}
+		ObjectLock:      intent.ObjectLock, ECCOverheadPercent: intent.ECCOverheadPercent, RcloneConfigPath: rcloneConfigPath}
 	repoModel = applyIntentStorage(repoModel, intent)
 	engine, err := resolveEngine(repoModel)
 	if err != nil {
@@ -550,8 +560,9 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 	}
 
 	// Native create is never automatically replayed after native_started. Retry
-	// first proves the matching inherited fence inactive, then validates the
-	// exact native repository or reports that no repository was found.
+	// first proves the matching inherited fence inactive, then lists the
+	// location, and validates the exact native repository or reports that no
+	// repository was found.
 	if intent.NativeOperationID == "" {
 		writeError(w, http.StatusConflict, fmt.Errorf("pending creation has no native operation identity"))
 		return
@@ -573,15 +584,48 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		writeError(w, http.StatusConflict, errors.New(message))
 		return
 	}
+	const noNativeRepositoryMessage = "The native creation process is inactive, but no native repository was found. Forget this pending creation before starting a new attempt."
+	if !createdStore {
+		// A retry first lists the location with the read-only listing the
+		// new-vault preflight uses, and doesn't run the engine when nothing is
+		// there. Validation can write to an empty location: on SFTP, Kopia's
+		// connect creates the missing folders and writes a .shards file before
+		// it reports that no repository exists, and on WebDAV it writes
+		// .shards into the vault folder when that folder already exists. The
+		// preflight then counts those as content and refuses the next create.
+		// This runs for every engine and storage type, so there is one rule.
+		//
+		// If the listing fails, the retry stops without running the engine and
+		// is answered like a failed validation: the listing error usually comes
+		// from the connection or credentials typed for this retry, and the
+		// validation message tells the user to correct those. The listing
+		// error itself isn't sent back or stored, as the validation error
+		// isn't.
+		//
+		// The validation right after a native create in this same request
+		// doesn't list first, because the engine has just written the
+		// location.
+		names, listErr := runPendingCreationListing(r.Context(), repoModel)
+		if listErr != nil {
+			status, message := pendingCreationValidationFailure("", listErr)
+			_ = database.MarkRepositoryCreationError(db, intent.ID, message)
+			writeError(w, status, errors.New(message))
+			return
+		}
+		if len(names) == 0 {
+			_ = database.MarkRepositoryCreationError(db, intent.ID, noNativeRepositoryMessage)
+			writeError(w, http.StatusConflict, errors.New(noNativeRepositoryMessage))
+			return
+		}
+	}
 	validationOutput, validationErr := engines.ValidateRepository(r.Context(), engine, repoModel)
 	if validationErr != nil {
 		// Bounded by the request for a filesystem vault. If the request ends
 		// before the folder is checked, nothing is known about it, so the
 		// validation failure below is reported instead of "not found".
 		if missing, missingErr := engines.RepositoryMissingContext(r.Context(), repoModel, validationOutput); missingErr == nil && missing {
-			message := "The native creation process is inactive, but no native repository was found. Forget this pending creation before starting a new attempt."
-			_ = database.MarkRepositoryCreationError(db, intent.ID, message)
-			writeError(w, http.StatusConflict, errors.New(message))
+			_ = database.MarkRepositoryCreationError(db, intent.ID, noNativeRepositoryMessage)
+			writeError(w, http.StatusConflict, errors.New(noNativeRepositoryMessage))
 			return
 		}
 		status, message := pendingCreationValidationFailure(validationOutput, validationErr)
@@ -601,6 +645,19 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		_ = database.MarkRepositoryCreationError(db, intent.ID, message)
 		writeError(w, http.StatusConflict, errors.New(message))
 		return
+	}
+	// The vault saves the error correction overhead Kopia reports in the
+	// status this validation just read, on the first attempt and on a Retry
+	// alike; no extra Kopia command runs for it. A value different from the
+	// requested one is saved as reported, not refused or replaced.
+	reportedECCOverheadPercent := 0
+	if repoModel.Engine == engines.KopiaID {
+		reportedECCOverheadPercent, err = engines.KopiaReportedECCOverheadPercent(validationOutput)
+		if err != nil {
+			_ = database.MarkRepositoryCreationError(db, intent.ID, "The native repository's error correction setting could not be read.")
+			writeError(w, http.StatusBadGateway, fmt.Errorf("read created vault error correction: %w", err))
+			return
+		}
 	}
 	if err := database.MarkRepositoryCreationNativeReady(db, intent.ID, nativeFingerprint); err != nil {
 		writeError(w, http.StatusConflict, err)
@@ -640,7 +697,8 @@ func handleRepositoryCreate(db *sql.DB, rcloneAuth *rcloneAuthStore, w http.Resp
 		MaintenanceSchedule: intent.MaintenanceSchedule, ConcurrencyMode: intent.ConcurrencyMode, ObjectLock: intent.ObjectLock,
 		AutoUnlock: true, CreatedAt: preparedProfile.CreatedAt,
 		ProfileUUID: preparedProfile.ProfileUUID, AttachmentGeneration: preparedProfile.Attachment.Generation,
-		ClientUUID: clientUUID, NativeRepositoryID: nativeFingerprint, RcloneConfigPath: rcloneConfigPath}
+		ClientUUID: clientUUID, NativeRepositoryID: nativeFingerprint, RcloneConfigPath: rcloneConfigPath,
+		ECCOverheadPercent: reportedECCOverheadPercent}
 	initialRepo = applyIntentStorage(initialRepo, intent)
 	if profileErr == nil {
 		var rootData []byte

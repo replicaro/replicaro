@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net/url"
 	"os"
 	pathpkg "path"
@@ -413,7 +414,7 @@ func (e *resticEngine) listSnapshotRows(ctx context.Context, repo models.Reposit
 			return nil, nil, out, "", outputFailure(fmt.Errorf("parse restic snapshots: duplicate snapshot id %q", row.ID))
 		}
 		seen[row.ID] = true
-		result = append(result, models.SnapshotWithTags(models.Snapshot{ID: row.ID, Timestamp: parsedTime.UTC().Format(time.RFC3339Nano), Source: source, SourceRoots: roots, NativeSourceHost: row.Hostname, TotalFileCount: optionalNativeFileCount(row.Size.TotalFilesProcessed), Size: formatBytes(row.Size.TotalBytesProcessed)}, row.Tags))
+		result = append(result, models.SnapshotWithTags(models.Snapshot{ID: row.ID, Timestamp: parsedTime.UTC().Format(time.RFC3339Nano), Source: source, SourceRoots: roots, NativeSourcePaths: append([]string(nil), row.Paths...), NativeSourceHost: row.Hostname, TotalFileCount: optionalNativeFileCount(row.Size.TotalFilesProcessed), Size: formatBytes(row.Size.TotalBytesProcessed)}, row.Tags))
 	}
 	return result, rows, out, loadWarnings, nil
 }
@@ -1536,9 +1537,14 @@ func parseResticEntriesForSnapshotReader(output io.Reader, expectedSnapshotID, s
 			Type        string   `json:"type"`
 			Size        int64    `json:"size"`
 			Permissions string   `json:"permissions"`
+			Mtime       string   `json:"mtime"`
 		}
 		if err := json.Unmarshal([]byte(line), &row); err != nil {
 			return nil, fmt.Errorf("parse restic listing: malformed JSON: %w", err)
+		}
+		modified, err := resticNodeModified(row.Mtime)
+		if err != nil {
+			return nil, err
 		}
 		switch row.MessageType {
 		case "snapshot":
@@ -1598,7 +1604,7 @@ func parseResticEntriesForSnapshotReader(output io.Reader, expectedSnapshotID, s
 			if row.Name == "" || row.Name == "." || row.Name == ".." || strings.Contains(row.Name, "/") {
 				return nil, fmt.Errorf("parse restic listing: file root node has an invalid name")
 			}
-			entry := models.SnapshotEntry{Name: row.Name, Mode: row.Permissions, Size: formatBytes(row.Size)}
+			entry := models.SnapshotEntry{Name: row.Name, Mode: row.Permissions, Size: formatBytes(row.Size), Modified: modified}
 			if previous, exists := seen[path]; exists && previous != entry {
 				return nil, fmt.Errorf("parse restic listing: conflicting duplicate file root node")
 			}
@@ -1612,7 +1618,7 @@ func parseResticEntriesForSnapshotReader(output io.Reader, expectedSnapshotID, s
 		if name == "" || name == "." {
 			return nil, fmt.Errorf("parse restic listing: invalid entry name")
 		}
-		entry := models.SnapshotEntry{Name: name, Path: path, Mode: row.Permissions, Size: formatBytes(row.Size), IsDir: row.Type == "dir" || row.Type == "directory"}
+		entry := models.SnapshotEntry{Name: name, Path: path, Mode: row.Permissions, Size: formatBytes(row.Size), IsDir: row.Type == "dir" || row.Type == "directory", Modified: modified}
 		if previous, exists := seen[path]; exists && previous != entry {
 			return nil, fmt.Errorf("parse restic listing: conflicting duplicate path %q", path)
 		}
@@ -1983,24 +1989,74 @@ func resticPathFilter(value string) string {
 
 var resticSnapshotIDPattern = regexp.MustCompile(`(?i)^[0-9a-f]{64}$`)
 
+// FormatBytes writes a byte count in the display format the backend uses for
+// the sizes it sends (Restore browse, File History, the Restore backup list):
+// decimal units (1000-based B, KB, MB, GB, TB), one decimal below 10 and none
+// from 10 up, plain bytes below 1000 ("512 B", "2.2 MB", "47 GB"). It is not
+// Restic's own format (Restic writes binary units such as "2.100 MiB");
+// engine output keeps the engine's units. The web UI's readable log lines
+// (nativeLogFormat.ts) and its log page label use decimal units with rules of
+// their own.
+//
+// The web UI formats saved byte counts with readableSize in
+// frontend/src/sizeDisplay.ts, and both must give the same text for the same
+// byte count (the web UI uses the page language's decimal and grouping
+// separators, this does not): keep the unit steps, the digit rule and the
+// rounding of the two in step. The shared cases are in TestFormatBytes and
+// sizeDisplay.test.ts.
+//
+// This text is stored in the File History cache: Restic's listed byte counts
+// are cached in this format when a backup is indexed, and a Restic entry's
+// size text is part of the key of the cached file-version rows, while every
+// backup's size text is compared on its snapshot header when the cache is
+// reconciled. A change to this format therefore needs a new cache schema
+// (CurrentMetadataCacheSchemaVersion); otherwise old and new text would sit
+// side by side and every header would look changed. Kopia's entry sizes are
+// cached as byte counts and formatted with this when they are sent.
+func FormatBytes(value int64) string {
+	return formatBytes(value)
+}
+
 func formatBytes(value int64) string {
 	if value < 0 {
 		value = 0
 	}
-	units := []string{"B", "KiB", "MiB", "GiB", "TiB"}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
 	size := float64(value)
 	unit := 0
-	for size >= 1024 && unit < len(units)-1 {
-		size /= 1024
+	for size >= 1000 && unit < len(units)-1 {
+		size /= 1000
 		unit++
 	}
 	if unit == 0 {
 		return strconv.FormatInt(value, 10) + " B"
 	}
+	decimals := 1
 	if size >= 10 {
-		return fmt.Sprintf("%.0f %s", size, units[unit])
+		decimals = 0
 	}
-	return fmt.Sprintf("%.1f %s", size, units[unit])
+	return roundHalfUp(size, decimals) + " " + units[unit]
+}
+
+// roundHalfUp writes a positive value with 0 or 1 decimals the way the
+// browser's number formatting (Intl.NumberFormat) does for the web UI's sizes:
+// it takes the shortest decimal text that reads back as the same float
+// ("1.15" for 1150/1000, whose float is just below 1.15) and rounds that text,
+// a digit 5 upwards ("1.2"; "12.5" gives "13"). fmt and strconv round the
+// float's exact binary value instead and send an exact half to the even
+// digit, so they give "1.1" and "12" for these and would disagree with the
+// web UI. big.Rat keeps the decimal text exact while it is rounded.
+func roundHalfUp(value float64, decimals int) string {
+	scaled, _ := new(big.Rat).SetString(strconv.FormatFloat(value, 'f', -1, 64))
+	if decimals == 1 {
+		scaled.Mul(scaled, big.NewRat(10, 1))
+	}
+	scaled.Add(scaled, big.NewRat(1, 2))
+	whole := new(big.Int).Quo(scaled.Num(), scaled.Denom()).Int64()
+	if decimals == 0 {
+		return strconv.FormatInt(whole, 10)
+	}
+	return strconv.FormatInt(whole/10, 10) + "." + strconv.FormatInt(whole%10, 10)
 }
 func binaryName(name string) string {
 	if runtime.GOOS == "windows" {

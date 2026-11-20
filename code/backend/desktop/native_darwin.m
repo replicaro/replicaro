@@ -12,6 +12,7 @@ extern void replicaroLaunchOpenRequested(void);
 extern void replicaroTerminateRequested(void);
 extern int replicaroConfirmQuit(void);
 extern char *replicaroTrayLabel(int quit);
+extern char *replicaroTrayStateText(int state);
 
 static atomic_int replicaroNotificationStatus = UNAuthorizationStatusNotDetermined;
 
@@ -38,6 +39,61 @@ static NSString *replicaroLabel(int quit) {
     return label;
 }
 
+// The menu-bar item's state (trayState in tray_state.go: 0 idle, 1 running,
+// 2 warnings, 3 errors) and, per state, its image and tooltip. Each image and
+// tooltip is made once and kept for the rest of the run; idle's image is the
+// bundle icon. Only the main thread uses these.
+#define REPLICARO_TRAY_STATES 4
+static int replicaroTrayState = 0;
+static NSImage *replicaroTrayImages[REPLICARO_TRAY_STATES];
+static NSString *replicaroTrayTooltips[REPLICARO_TRAY_STATES];
+
+static NSImage *replicaroTrayImage(int state) {
+    if (state == 0 && replicaroTrayImages[0] == nil) {
+        NSString *path = [[NSBundle mainBundle] pathForResource:@"replicaro-favicon" ofType:@"png"];
+        if (path != nil) {
+            NSImage *image = [[NSImage alloc] initWithContentsOfFile:path];
+            image.size = NSMakeSize(18.0, 18.0);
+            replicaroTrayImages[0] = image;
+        }
+    }
+    return replicaroTrayImages[state];
+}
+
+static NSString *replicaroTrayTooltip(int state) {
+    if (replicaroTrayTooltips[state] == nil) {
+        char *value = replicaroTrayStateText(state);
+        NSString *text = value != NULL ? [NSString stringWithUTF8String:value] : nil;
+        free(value);
+        if (text != nil && text.length > 0) {
+            replicaroTrayTooltips[state] = [text copy];
+        }
+    }
+    return replicaroTrayTooltips[state] != nil ? replicaroTrayTooltips[state] : @"Replicaro";
+}
+
+// replicaroShowTrayState shows the current state on item. A state whose
+// image couldn't be made shows the bundle icon, and without that the item
+// shows the letter R, as it does at launch without the bundle icon.
+static void replicaroShowTrayState(NSStatusItem *item) {
+    NSImage *image = replicaroTrayImage(replicaroTrayState);
+    if (image == nil) {
+        image = replicaroTrayImage(0);
+    }
+    if (image != nil) {
+        item.button.title = @"";
+        // Never mark these images as template images (image.template = YES):
+        // the menu bar would then draw them in one colour that follows its
+        // appearance, and the state colour would be lost.
+        item.button.image = image;
+        item.button.imagePosition = NSImageOnly;
+    } else {
+        item.button.image = nil;
+        item.button.title = @"R";
+    }
+    item.button.toolTip = replicaroTrayTooltip(replicaroTrayState);
+}
+
 @interface ReplicaroAppDelegate : NSObject <NSApplicationDelegate, UNUserNotificationCenterDelegate>
 @property(nonatomic, strong) NSStatusItem *statusItem;
 @end
@@ -60,20 +116,9 @@ static NSString *replicaroLabel(int quit) {
     }
     NSStatusItem *item = [[NSStatusBar systemStatusBar] statusItemWithLength:NSSquareStatusItemLength];
     self.statusItem = item;
-
-    NSImage *image = nil;
-    NSString *path = [[NSBundle mainBundle] pathForResource:@"replicaro-favicon" ofType:@"png"];
-    if (path != nil) {
-        image = [[NSImage alloc] initWithContentsOfFile:path];
-        image.size = NSMakeSize(18.0, 18.0);
-    }
-    if (image != nil) {
-        item.button.image = image;
-        item.button.imagePosition = NSImageOnly;
-    } else {
-        item.button.title = @"R";
-    }
-    item.button.toolTip = @"Replicaro";
+    // The bundle icon and the idle tooltip, or the state set before the item
+    // existed.
+    replicaroShowTrayState(item);
 
     NSMenu *menu = [[NSMenu alloc] initWithTitle:@"Replicaro"];
     // The labels are read once, here, so a language change shows in them
@@ -270,6 +315,33 @@ void ReplicaroReplyToTerminate(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [NSApp replyToApplicationShouldTerminate:YES];
     });
+}
+
+// ReplicaroSetStatusState is called from Go with a tray state and, for every
+// state but idle, the recoloured icon as PNG bytes, which are copied before
+// it returns. The item is changed on the main thread; a state that arrives
+// before the item exists is shown when applicationDidFinishLaunching: creates
+// it.
+void ReplicaroSetStatusState(int state, const void *png, int length) {
+    if (state < 0 || state >= REPLICARO_TRAY_STATES) {
+        return;
+    }
+    @autoreleasepool {
+        NSData *data = (png != NULL && length > 0) ? [NSData dataWithBytes:png length:(NSUInteger)length] : nil;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (state != 0 && replicaroTrayImages[state] == nil && data != nil) {
+                NSImage *image = [[NSImage alloc] initWithData:data];
+                if (image != nil) {
+                    image.size = NSMakeSize(18.0, 18.0);
+                    replicaroTrayImages[state] = image;
+                }
+            }
+            replicaroTrayState = state;
+            if (replicaroDelegate.statusItem != nil) {
+                replicaroShowTrayState(replicaroDelegate.statusItem);
+            }
+        });
+    }
 }
 
 int ReplicaroIsMainThread(void) {

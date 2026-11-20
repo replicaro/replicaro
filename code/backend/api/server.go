@@ -49,6 +49,14 @@ import (
 var applyDesktopSettings = desktop.ApplySettings
 var desktopCapabilities = desktop.Capabilities
 
+// The tray icon is set from the dashboard's own answers (see the
+// /api/dashboard and /api/operations/active handlers). Tests replace these.
+var (
+	trayNotices                    = desktop.TrayNotices
+	updateTrayFromDashboard        = desktop.UpdateTrayFromDashboard
+	updateTrayFromActiveOperations = desktop.UpdateTrayFromActiveOperations
+)
+
 // Credential activation checks native access here; its callers also require
 // the same physical vault address and matching protected root/profile records
 // before saving credentials. If a different repository readable with the saved
@@ -526,6 +534,7 @@ func handlerForExecutionInstanceWithReader(
 	mux := http.NewServeMux()
 	registerAppUpdateHandlers(mux, updater, readDB)
 	registerRcloneAuthHandlers(mux, db, rcloneAuth)
+	registerDownloadHandlers(mux, db, runtimeManager)
 	// New vault creation has no preview reservation. The single intent begins
 	// only when the create request reaches its non-atomic native boundary.
 	handle(mux, "/api/vaults/connect/preview", handleExistingVaultPreview(db, rcloneAuth))
@@ -605,7 +614,10 @@ func handlerForExecutionInstanceWithReader(
 	// ------------------------------------------------------------------
 
 	handle(mux, "/api/dashboard", func(w http.ResponseWriter, r *http.Request) {
-
+		// The tray icon is set from the same answer the dashboard gets, so
+		// the two agree while the dashboard is open (see
+		// desktop.UpdateTrayFromDashboard).
+		notices := trayNotices()
 		stats, err := database.GetDashboardStats(readDB)
 
 		if err != nil {
@@ -613,6 +625,7 @@ func handlerForExecutionInstanceWithReader(
 			return
 		}
 
+		updateTrayFromDashboard(notices, stats)
 		writeJSON(w, stats)
 	})
 
@@ -675,11 +688,14 @@ func handlerForExecutionInstanceWithReader(
 	})
 
 	handle(mux, "/api/operations/active", func(w http.ResponseWriter, r *http.Request) {
+		// As for /api/dashboard, the tray is set from this same answer.
+		notices := trayNotices()
 		operations, err := database.ListActiveOperations(readDB)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, err)
 			return
 		}
+		updateTrayFromActiveOperations(notices, operations)
 		writeJSON(w, operations)
 	})
 
@@ -1678,13 +1694,31 @@ func handlerForExecutionInstanceWithReader(
 		if hasMore {
 			entries = entries[:metadataPageSize]
 		}
+		// regularFile tells the page which entries can be downloaded
+		// (models.RegularFileMode); the download ticket request checks it again.
+		// modified is the modified time the engine lists for the item, written
+		// like File History's (models.NativeModifiedText). For a folder,
+		// Restic's is the folder's own and Kopia's is the newest within it (see
+		// the Kopia directory reader, engines/kopia_directory.go). The size is
+		// sent in the format File History uses too (displaySizeText); the
+		// cache keeps what it holds.
+		type snapshotFileEntry struct {
+			models.SnapshotEntry
+			Modified    string `json:"modified"`
+			RegularFile bool   `json:"regularFile"`
+		}
+		listed := make([]snapshotFileEntry, len(entries))
 		for index := range entries {
 			entries[index].NativeRootID = nativeRoot.Identity
 			entries[index].NativeRootUser = nativeRoot.User
 			entries[index].NativeRootHost = nativeRoot.Host
+			entries[index].Size = displaySizeText(entries[index].Size)
+			listed[index] = snapshotFileEntry{SnapshotEntry: entries[index],
+				Modified:    models.NativeModifiedText(entries[index].Modified),
+				RegularFile: !entries[index].IsDir && models.RegularFileMode(entries[index].Mode)}
 		}
 		writeJSON(w, map[string]any{
-			"entries":    entries,
+			"entries":    listed,
 			"raw":        "Loaded from the metadata cache.",
 			"offset":     offset,
 			"nextOffset": offset + len(entries),

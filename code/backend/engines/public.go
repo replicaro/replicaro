@@ -457,6 +457,24 @@ func (e *publicEngine) autoUnlockRestic(ctx context.Context, repo models.Reposit
 	return nil
 }
 
+// AutoUnlockRestic runs the automatic unlock that Restore runs before its
+// native command, with the same condition, command and failure: Restic's own
+// plain `unlock` for a Restic vault whose automatic unlock is on, nothing
+// otherwise, and a failed unlock is a preparation failure, so the requested
+// command must not start. A file download calls it by itself because the
+// browser's download starts before DownloadFile runs, and a failed unlock must
+// end the download before anything is sent.
+func AutoUnlockRestic(ctx context.Context, engine Engine, repo models.Repository) error {
+	public, ok := engine.(*publicEngine)
+	if !ok {
+		return nil
+	}
+	if err := public.autoUnlockRestic(ctx, repo); err != nil {
+		return resticPreparationFailure(err)
+	}
+	return nil
+}
+
 // ValidateRepository checks an existing repository without changing its
 // repository-level settings. Engines without a specialized validation path
 // already have a non-mutating Info implementation.

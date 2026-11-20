@@ -68,6 +68,11 @@ func Run(service func() error, stop func() error) error {
 		activeDarwinMu.Unlock()
 	}()
 
+	// The menu-bar item is created once AppKit has finished launching; the
+	// state shown before then is kept and applied to it (see
+	// ReplicaroSetStatusState in native_darwin.m).
+	defer startTrayState(showDarwinTrayState)()
+
 	serviceDone := make(chan error, 1)
 	go func() {
 		serviceDone <- service()
@@ -191,6 +196,33 @@ func replicaroTrayLabel(quit C.int) *C.char {
 		label = quitLabel
 	}
 	return C.CString(strings.ToValidUTF8(strings.ReplaceAll(label, "\x00", ""), "\uFFFD"))
+}
+
+// replicaroTrayStateText returns the tooltip of a tray state (see trayState)
+// as a C string the caller frees.
+//
+//export replicaroTrayStateText
+func replicaroTrayStateText(state C.int) *C.char {
+	text := trayStateText(trayState(state))
+	return C.CString(strings.ToValidUTF8(strings.ReplaceAll(text, "\x00", ""), "\uFFFD"))
+}
+
+// showDarwinTrayState hands state and, unless it is idle, the recoloured icon
+// to the main thread, which changes the menu-bar item. It returns at once.
+func showDarwinTrayState(state trayState) {
+	var image unsafe.Pointer
+	var length C.int
+	if tint, ok := trayStateTint(state); ok {
+		tinted, err := tintPNG(notificationSourceIcon, tint)
+		if err != nil {
+			log.Printf("Replicaro could not make its menu-bar icon for the new state and keeps the current one: %v", err)
+			return
+		}
+		image = C.CBytes(tinted)
+		defer C.free(image)
+		length = C.int(len(tinted))
+	}
+	C.ReplicaroSetStatusState(C.int(state), image, length)
 }
 
 // terminateReplyLimit is a little longer than the staged shutdown's

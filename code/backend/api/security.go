@@ -69,6 +69,7 @@ var endpointMethods = map[string][]string{
 	"/api/files/history": {http.MethodGet}, "/api/files/index/retry": {http.MethodPost}, "/api/snapshot": {http.MethodDelete},
 	"/api/metadata/status": {http.MethodGet}, "/api/metadata/prepare": {http.MethodPost},
 	"/api/restore": {http.MethodPost}, "/api/restore-selection": {http.MethodPost},
+	downloadTicketPath:         {http.MethodPost},
 	"/api/repository/snapshot": {http.MethodPost}, "/api/jobs": {http.MethodGet, http.MethodPost, http.MethodPut, http.MethodDelete},
 	"/api/rclone/auth/start": {http.MethodPost}, "/api/rclone/auth/continue": {http.MethodPost},
 	"/api/rclone/auth/status":  {http.MethodPost},
@@ -135,6 +136,60 @@ func secureAPIRequest(w http.ResponseWriter, r *http.Request) bool {
 		r.Body = http.MaxBytesReader(w, r.Body, maxJSONBodyBytes)
 	}
 	return true
+}
+
+// secureDownloadRequest checks the browser's request for a file download
+// (downloadPath) and lets it through only with a valid ticket. It is the one
+// route that doesn't need the X-Replicaro-Client-UUID header: the browser
+// opens it itself to save the file and can't add a header. A one-time ticket from downloadTicketPath, a
+// request that does carry the header, stands in for it. Only a page that
+// could read that response has a ticket, and another website can neither send
+// the header without a preflight this API refuses nor read our responses.
+//
+// Every other check stays: Host, Origin when the browser sends one, and Fetch
+// Metadata, which is stricter here than approvedFetchMetadata: a request a
+// browser labels cross-site is refused even for GET, before its ticket is
+// looked at, so another website can't even use up a ticket. A request with
+// no Fetch Metadata headers is accepted like any other API request (native
+// clients and older browsers send none); it still needs a valid ticket. Only
+// GET is accepted, with no OPTIONS preflight and no CORS headers. A request
+// without a valid ticket (missing, unknown, used or expired) gets 403 and
+// runs nothing: no engine, no vault lock, no operation record.
+//
+// Do not add another route here or accept the ticket anywhere else.
+func secureDownloadRequest(w http.ResponseWriter, r *http.Request, redeem func(string) (downloadTicket, bool)) (downloadTicket, bool) {
+	security := securityFromRequest(r)
+	setSecurityHeaders(w.Header(), security)
+	if !approvedHost(r.Host, security) {
+		writeSecurityError(w, http.StatusForbidden, "request host is not permitted")
+		return downloadTicket{}, false
+	}
+	if origin := strings.TrimSpace(r.Header.Get("Origin")); origin != "" && !approvedOrigin(origin, security) {
+		writeSecurityError(w, http.StatusForbidden, "request origin is not permitted")
+		return downloadTicket{}, false
+	}
+	switch strings.ToLower(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site"))) {
+	case "", "same-origin", "same-site", "none":
+	default:
+		writeSecurityError(w, http.StatusForbidden, "cross-site browser request is not permitted")
+		return downloadTicket{}, false
+	}
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", http.MethodGet)
+		writeSecurityError(w, http.StatusMethodNotAllowed, "method is not allowed")
+		return downloadTicket{}, false
+	}
+	tokens := r.URL.Query()["ticket"]
+	if len(tokens) != 1 {
+		writeSecurityError(w, http.StatusForbidden, "download ticket is missing, used or expired")
+		return downloadTicket{}, false
+	}
+	ticket, ok := redeem(tokens[0])
+	if !ok {
+		writeSecurityError(w, http.StatusForbidden, "download ticket is missing, used or expired")
+		return downloadTicket{}, false
+	}
+	return ticket, true
 }
 
 func methodAllowed(method string, allowed []string) bool {

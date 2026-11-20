@@ -24,7 +24,10 @@ type vaultMutex struct {
 	mu       sync.Mutex
 	next     uint64
 	priority int
-	low      map[uint64]lowPriorityReader
+	// held counts the exclusive and ordinary shared holders, for Busy.
+	// Low-priority readers are not counted.
+	held int
+	low  map[uint64]lowPriorityReader
 }
 
 var registry struct {
@@ -53,7 +56,35 @@ func tryExclusive(id string) (func(), bool) {
 	if !lock.lock.TryLock() {
 		return nil, false
 	}
-	return lock.lock.Unlock, true
+	return lock.counted(lock.lock.Unlock), true
+}
+
+// counted records one more holder for Busy and returns unlock wrapped so it
+// records the release first.
+func (lock *vaultMutex) counted(unlock func()) func() {
+	lock.mu.Lock()
+	lock.held++
+	lock.mu.Unlock()
+	return func() {
+		lock.mu.Lock()
+		lock.held--
+		lock.mu.Unlock()
+		unlock()
+	}
+}
+
+// Busy reports whether a new exclusive taker would find the vault taken: an
+// exclusive or ordinary shared holder has it, or an exclusive taker is
+// waiting for it or making its attempt. Low-priority readers don't count;
+// they give way. It reads only this package's bookkeeping and takes no lock,
+// so asking can never make another taker's attempt fail. The answer can be
+// out of date as soon as it is returned, so it is only a hint: work that
+// needs the vault still takes the lock and handles busy then.
+func Busy(id string) bool {
+	lock := mutex(id)
+	lock.mu.Lock()
+	defer lock.mu.Unlock()
+	return lock.held > 0 || lock.priority > 0
 }
 
 // AcquireExclusiveContext makes low-priority readers yield, then waits for
@@ -94,7 +125,7 @@ func AcquireExclusiveContext(ctx context.Context, id string, onWait ...func()) (
 			lock.lock.Unlock()
 			return nil, err
 		}
-		return lock.lock.Unlock, nil
+		return lock.counted(lock.lock.Unlock), nil
 	case <-ctx.Done():
 		go func() {
 			<-acquired
@@ -150,13 +181,13 @@ func TryShared(id string) (func(), bool) {
 	if !lock.lock.TryRLock() {
 		return nil, false
 	}
-	return lock.lock.RUnlock, true
+	return lock.counted(lock.lock.RUnlock), true
 }
 
 func AcquireShared(id string) func() {
 	lock := mutex(id)
 	lock.lock.RLock()
-	return lock.lock.RUnlock
+	return lock.counted(lock.lock.RUnlock)
 }
 
 // AcquireLowPrioritySharedContext admits a read-only background operation and

@@ -901,6 +901,10 @@ func CoordinateScheduledAdmission(db *sql.DB, request ScheduledAdmissionRequest)
 	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
+	// admitted is set exactly when a backup operation was queued above.
+	if admitted {
+		dashboardChanged()
+	}
 	return results, nil
 }
 
@@ -949,7 +953,13 @@ func InterruptQueuedBackupOperations(
 				return err
 			}
 		}
-		return tx.Commit()
+		if err := tx.Commit(); err != nil {
+			return err
+		}
+		if len(finals) > 0 {
+			dashboardChanged()
+		}
+		return nil
 	})
 }
 
@@ -1378,6 +1388,12 @@ func AdmitManualBackupTargets(db *sql.DB, request ManualAdmissionRequest) ([]Tar
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
+	}
+	for _, result := range results {
+		if result.OperationID != "" {
+			dashboardChanged()
+			break
+		}
 	}
 	return results, nil
 }

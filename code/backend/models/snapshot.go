@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"strings"
+	"time"
 	"unicode"
 	"unicode/utf8"
 
@@ -85,6 +86,13 @@ type Snapshot struct {
 	// presentation or portable profile fields.
 	NativeSourceUser string `json:"-"`
 	NativeSourceHost string `json:"-"`
+	// NativeSourcePaths are the source paths the engine's own snapshot header
+	// lists (Restic's `paths`). They stay as the header gives them even when
+	// SourceRoots are replaced for indexing (an untagged Restic snapshot is
+	// indexed beneath "/"). File History uses them to put a backup in its
+	// chain of versions. Empty means the SourceRoots paths are the native
+	// source paths, as they are for Kopia's single source path.
+	NativeSourcePaths []string `json:"-"`
 	// LogicalSizeBytes is optional application-cache input captured only from
 	// already-produced native backup output.
 	LogicalSizeBytes *int64 `json:"-"`
@@ -216,6 +224,59 @@ type SnapshotEntry struct {
 	Mode           string `json:"mode"`
 	Size           string `json:"size"`
 	IsDir          bool   `json:"isDir"`
+	// Modified is the native modification time in whole Unix seconds and
+	// ObjectID is Kopia's content object ID (empty for Restic). Modified is 0
+	// both when the listing gave no time and for a file dated
+	// 1970-01-01T00:00:00Z; nothing tells the two apart, and the pages show
+	// that date for either. The metadata cache stores Modified for files and
+	// folders and ObjectID for files only. Neither is serialized from here:
+	// Restore browse and File History send the time as NativeModifiedText, and
+	// ObjectID only tells a file's versions apart in File History.
+	Modified int64  `json:"-"`
+	ObjectID string `json:"-"`
+}
+
+// NativeModifiedText writes a cached native modified time (whole Unix
+// seconds) the way every API response sends it: RFC 3339 in UTC, whole
+// seconds. A stored 0 comes out as 1970-01-01T00:00:00Z on purpose (see
+// SnapshotEntry.Modified); the time is the engine's own value, shown and never
+// interpreted.
+func NativeModifiedText(seconds int64) string {
+	return time.Unix(seconds, 0).UTC().Format(time.RFC3339)
+}
+
+// RegularFileMode reports whether a cached entry mode names a regular file.
+// Both engines' listings are cached as Go's FileMode text: any type letters
+// come before the nine permission characters ("-rw-r--r--" is a regular
+// file, "drwx------" a folder, "Lrwxrwxrwx" a symlink, "Dcrw-rw-rw-" a
+// character device). A regular file has no type letter, though it can carry
+// the setuid, setgid, sticky, append-only, exclusive or temporary letters. An
+// empty or unreadable mode is not a regular file.
+//
+// A Kopia entry of an unknown native type would be cached with mode 0, which
+// reads as "----------" here. Pinned Kopia doesn't store such entries: a named
+// pipe or a socket never gets into the stored directory (it is left out, or
+// listed under the directory summary's errors), and `kopia show <root>/<name>`
+// of one fails with "entry not found".
+func RegularFileMode(mode string) bool {
+	if len(mode) < 10 {
+		return false
+	}
+	prefix, permissions := mode[:len(mode)-9], mode[len(mode)-9:]
+	for index := range len(permissions) {
+		if permissions[index] != '-' && permissions[index] != "rwx"[index%3] {
+			return false
+		}
+	}
+	if prefix == "-" {
+		return true
+	}
+	for _, letter := range prefix {
+		if !strings.ContainsRune("alTugt", letter) {
+			return false
+		}
+	}
+	return true
 }
 
 type FileSearchResult struct {
@@ -236,15 +297,59 @@ type FileBrowseEntry struct {
 	CanExpand bool   `json:"canExpand"`
 }
 
+// FileVersion is one backup holding a File History item. RegularFile is set
+// when that backup holds it as a regular file (RegularFileMode), the only kind
+// of item that can be downloaded. Modified is the modified time the engine
+// lists for the item in that backup (NativeModifiedText); for a folder,
+// Restic's is the folder's own and Kopia's is the newest within it (see the
+// Kopia directory reader, engines/kopia_directory.go). It is empty for the
+// backup source folder itself, reached by a path of only slashes: neither
+// engine's listing has an entry for it.
+//
+// MachineLabel names the computer that made the backup (see
+// applyMetadataMachineLabels in the database package). When no name is known
+// it is the English "Previous computer", with " #n" added when several
+// computers end up with the same label; UnnamedComputer is then set and
+// UnnamedComputerNumber is that n (0 without one), so the page can show its
+// own translation. Both are left out for a named computer, also for a real
+// name that carries a " #n" suffix.
 type FileVersion struct {
 	SnapshotID   string `json:"snapshotId"`
 	Timestamp    string `json:"timestamp"`
+	Modified     string `json:"modified"`
 	Size         string `json:"size"`
 	Source       string `json:"source"`
 	IsDir        bool   `json:"isDir"`
+	RegularFile  bool   `json:"regularFile"`
 	Present      bool   `json:"present"`
 	NativeRootID string `json:"nativeRootId"`
 	MachineLabel string `json:"machineLabel"`
+	// UnnamedComputer and UnnamedComputerNumber: see FileVersion.
+	UnnamedComputer       bool `json:"unnamedComputer,omitempty"`
+	UnnamedComputerNumber int  `json:"unnamedComputerNumber,omitempty"`
+}
+
+// FileHistoryVersion is one version of a file in File History: a run of
+// neighbouring backups of one computer and one exact set of native source
+// paths (NativeSourcePaths) in which the engine reported no change to the
+// file (Restic's diff marks, Kopia's object ID). SnapshotID and NativeRootID name the newest backup holding the
+// version, which is the one it restores from; Modified (RFC 3339, UTC, whole
+// seconds) and Size come from that backup. FirstBackup and LastBackup are the
+// timestamps of the oldest and newest backup in the run. RegularFile is
+// FileVersion.RegularFile of that newest backup.
+type FileHistoryVersion struct {
+	SnapshotID   string `json:"snapshotId"`
+	NativeRootID string `json:"nativeRootId"`
+	Source       string `json:"source"`
+	Modified     string `json:"modified"`
+	Size         string `json:"size"`
+	RegularFile  bool   `json:"regularFile"`
+	FirstBackup  string `json:"firstBackup"`
+	LastBackup   string `json:"lastBackup"`
+	MachineLabel string `json:"machineLabel"`
+	// UnnamedComputer and UnnamedComputerNumber: see FileVersion.
+	UnnamedComputer       bool `json:"unnamedComputer,omitempty"`
+	UnnamedComputerNumber int  `json:"unnamedComputerNumber,omitempty"`
 }
 
 // ParseSnapshotPresentationTags validates the two optional presentation

@@ -261,7 +261,7 @@ func ValidateConnectorOptions(engine, connector string, options map[string]strin
 			return fmt.Errorf("PuTTY .ppk keys are not supported by the selected native SFTP tools; export the key in unencrypted OpenSSH private-key format")
 		}
 		if engine == KopiaID && boolOption(options, "insecure_ignore_host_key") {
-			if err := validateKopiaSFTPIdentityPath(options["identity"]); err != nil {
+			if err := validateKopiaSFTPIdentityPath(sftpIdentityFile(options)); err != nil {
 				return err
 			}
 		}
@@ -311,15 +311,33 @@ func ValidateConnectorOptions(engine, connector string, options map[string]strin
 	return nil
 }
 
+// validateKopiaSFTPIdentityPath checks a key path that will go to the system
+// ssh inside Kopia's --ssh-args string. That only happens for Kopia with
+// host-key verification disabled; with verification on, Kopia's own client
+// takes the path as one --keyfile argument, and Restic gets it quoted, so both
+// callers check the engine and the option before calling this.
+//
+// Pinned Kopia splits --ssh-args on every ASCII space and has no quote
+// handling, so "-i D:\My Keys\id_ed25519" reaches ssh as "-i D:\My" plus a
+// stray "Keys\id_ed25519" that ssh reads as the host name. Quoting the path or
+// copying the key to another name would not give ssh the path the user chose,
+// so a path with an ASCII space is refused here with advice instead of failing
+// later with ssh's confusing messages. Tabs and other Unicode whitespace are
+// not split by Kopia and reach ssh unchanged (kopia_sftp_pinned_test.go), so
+// they stay allowed. Quotes, CR, LF and NUL can't be passed safely either.
+//
+// Do not make spaced paths work here (for example through an environment
+// variable that ssh expands) without a product decision: Kopia saves the
+// --ssh-args string in its repository config, so every later Kopia command,
+// including one run by hand, would then depend on that variable.
 func validateKopiaSFTPIdentityPath(identity string) error {
-	// Keep the existing control-character and quote restrictions. Spaces pass
-	// unchanged: external SSH argument parsing belongs to Kopia. Its pinned
-	// parser splits ASCII spaces without shell quote handling, so adding quotes
-	// or staging a differently named key would not preserve the supplied path.
-	if !strings.ContainsAny(identity, "\x00\r\n\"") {
-		return nil
+	if strings.Contains(identity, " ") {
+		return fmt.Errorf("Kopia cannot use an SSH identity path containing a space when host-key verification is disabled. You can either enable host-key verification, use an SSH agent, choose another key path, or switch the engine to Restic.")
 	}
-	return fmt.Errorf("Kopia engine cannot use an SSH identity path containing a quote, newline, or NUL when host-key verification is disabled. You can either enable host-key verification, use an SSH agent, choose another key path, or switch the engine to Restic.")
+	if strings.ContainsAny(identity, "\x00\r\n\"") {
+		return fmt.Errorf("Kopia cannot use an SSH identity path containing a quote, newline, or NUL when host-key verification is disabled. You can either enable host-key verification, use an SSH agent, choose another key path, or switch the engine to Restic.")
+	}
+	return nil
 }
 
 func validateStoragePort(value string) error {

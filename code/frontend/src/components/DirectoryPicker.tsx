@@ -53,6 +53,7 @@ export function DirectoryField({
                 <input
                     type="text"
                     className="mono"
+                    dir="ltr"
                     value={value}
                     placeholder={placeholder}
                     onChange={(event) => onChange(event.target.value)}
@@ -198,6 +199,7 @@ function DirectoryPicker({
                 <input
                     className="mono"
                     type="text"
+                    dir="ltr"
                     value={path}
 					onChange={(event) => {
 						// Typing a new path drops the chosen file, like moving
@@ -231,7 +233,7 @@ function DirectoryPicker({
                                 key={root.path}
                                 onClick={() => void load(root.path)}
                             >
-                                {root.name}
+                                <bdi dir="ltr">{root.name}</bdi>
                             </button>
                         ))}
                     </div>

@@ -367,7 +367,11 @@ func MarkDashboardIssuesReviewed(db *sql.DB, reviewedAt time.Time) error {
 		dashboardIssuesReviewedAtKey,
 		formatSortableTimestamp(reviewedAt),
 	)
-	return err
+	if err != nil {
+		return err
+	}
+	dashboardChanged()
+	return nil
 }
 
 func dashboardIssuesReviewedAt(tx *sql.Tx) (string, error) {

@@ -5,6 +5,7 @@ package desktop
 import (
 	"errors"
 	"fmt"
+	"image/color"
 	"log"
 	"os"
 	"runtime"
@@ -20,6 +21,7 @@ import (
 const (
 	trayCallbackMessage     = 0x0401 // WM_USER + 1
 	trayNotificationMessage = 0x8001 // WM_APP + 1
+	trayStateMessage        = 0x8002 // WM_APP + 2
 	menuOpen                = 1001
 	menuQuit                = 1002
 
@@ -29,6 +31,7 @@ const (
 	wmRButtonUp    = 0x0205
 	wmNull         = 0x0000
 	nimAdd         = 0x00000000
+	nimModify      = 0x00000001
 	nimDelete      = 0x00000002
 	nifMessage     = 0x00000001
 	nifIcon        = 0x00000002
@@ -101,6 +104,14 @@ type nativeTray struct {
 	// quitPromptOpen is set while the Quit message box is open. Only the
 	// tray's own thread reads and writes it.
 	quitPromptOpen bool
+	// wantedState is the tray state last asked for (see requestState).
+	// shownState and stateIcon belong to the tray's own thread: the state the
+	// icon shows, and the recoloured icon showing it, which is 0 while the
+	// icon is the base icon (idle).
+	stateMu     sync.Mutex
+	wantedState trayState
+	shownState  trayState
+	stateIcon   uintptr
 }
 
 var errTrayNotificationsClosed = errors.New("notification tray is closed")
@@ -248,11 +259,7 @@ func (tray *nativeTray) initialize() error {
 		guidItem:        trayIconGUID,
 	}
 	tray.notifyData.size = uint32(unsafe.Sizeof(tray.notifyData))
-	tooltip, err := windows.UTF16FromString("Replicaro")
-	if err != nil {
-		return err
-	}
-	copy(tray.notifyData.tip[:], tooltip)
+	copyUTF16(tray.notifyData.tip[:], strings.ReplaceAll(trayStateText(trayIdle), "\x00", ""))
 
 	// A missing icon isn't a reason to stop. Early in a login Explorer may not
 	// be up yet, and it can refuse the icon for other reasons. The window
@@ -308,6 +315,10 @@ func (tray *nativeTray) windowProc(window uintptr, message uint32, wParam, lPara
 		tray.showNextNotification()
 		return 0
 
+	case trayStateMessage:
+		tray.applyState()
+		return 0
+
 	case trayCallbackMessage:
 		switch uint32(lParam) {
 		case wmLButtonUp:
@@ -348,7 +359,10 @@ func (tray *nativeTray) windowProc(window uintptr, message uint32, wParam, lPara
 		tray.iconAdded = false
 		if err := tray.addIcon(); err != nil {
 			log.Printf("Replicaro could not add its notification-area icon after Explorer restarted: %v", err)
+			return 0
 		}
+		// A state change that failed while Explorer was gone is shown now.
+		tray.applyState()
 		return 0
 	}
 
@@ -391,6 +405,71 @@ func (tray *nativeTray) endSession() {
 	if !finishWithin(tray.sessionEnd, sessionEndWait) {
 		log.Printf("Replicaro is still shutting down after %s; Windows may end it before it finishes", sessionEndWait)
 	}
+}
+
+// requestState asks the tray's thread to show state. It is called with the
+// tray state lock held, from the tray state reader and from the
+// /api/dashboard and /api/operations/active handlers (see
+// UpdateTrayFromDashboard), so it only records the state and posts a
+// message; the icon is made and changed on the tray's own thread,
+// which owns the icon handles and notifyData. Messages that arrive in a burst
+// all apply the latest state.
+func (tray *nativeTray) requestState(state trayState) {
+	tray.stateMu.Lock()
+	tray.wantedState = state
+	tray.stateMu.Unlock()
+	if tray.window == 0 {
+		return
+	}
+	if result, _, callErr := procPostMessage.Call(tray.window, trayStateMessage, 0, 0); result == 0 {
+		log.Printf("Replicaro could not ask its tray to change the icon: %v", win32Error("post tray state", callErr))
+	}
+}
+
+// applyState shows the wanted state on the tray's thread: the base icon for
+// idle, otherwise the base icon recoloured, with the state's tooltip. The
+// icon it replaces is destroyed once Windows shows the new one. When the
+// icon can't be made or changed, the tray keeps what it shows and a later
+// state change tries again.
+func (tray *nativeTray) applyState() {
+	tray.stateMu.Lock()
+	state := tray.wantedState
+	tray.stateMu.Unlock()
+	if state == tray.shownState {
+		return
+	}
+	icon := tray.icon
+	if tint, ok := trayStateTint(state); ok {
+		loaded, err := loadTrayStateIcon(tint)
+		if err != nil {
+			log.Printf("Replicaro could not make its tray icon for the new state and keeps the current one: %v", err)
+			return
+		}
+		icon = loaded
+	}
+	previous := tray.notifyData
+	tray.notifyData.icon = icon
+	copyUTF16(tray.notifyData.tip[:], strings.ReplaceAll(trayStateText(state), "\x00", ""))
+	// Without the icon in the notification area (Explorer not running yet),
+	// notifyData is all there is to change: addIcon shows it later.
+	if tray.iconAdded {
+		if err := shellNotifyIcon(nimModify, &tray.notifyData); err != nil {
+			log.Printf("Replicaro could not change its notification-area icon and keeps the current one: %v", win32Error("change notification-area icon", err))
+			tray.notifyData = previous
+			if icon != tray.icon {
+				procDestroyIcon.Call(icon)
+			}
+			return
+		}
+	}
+	if tray.stateIcon != 0 {
+		procDestroyIcon.Call(tray.stateIcon)
+	}
+	tray.stateIcon = 0
+	if icon != tray.icon {
+		tray.stateIcon = icon
+	}
+	tray.shownState = state
 }
 
 func (tray *nativeTray) enqueueNotification(notification nativeNotification) error {
@@ -548,6 +627,10 @@ func (tray *nativeTray) close() {
 		procDestroyMenu.Call(tray.menu)
 		tray.menu = 0
 	}
+	if tray.stateIcon != 0 {
+		procDestroyIcon.Call(tray.stateIcon)
+		tray.stateIcon = 0
+	}
 	if tray.icon != 0 {
 		procDestroyIcon.Call(tray.icon)
 		tray.icon = 0
@@ -595,6 +678,20 @@ func createTrayMenu() (uintptr, error) {
 }
 
 func loadTrayIcon() (uintptr, error) {
+	return loadTrayIconData(trayIcon())
+}
+
+// loadTrayStateIcon makes the tray icon recoloured in tint, from the same
+// .ico the base icon is loaded from.
+func loadTrayStateIcon(tint color.NRGBA) (uintptr, error) {
+	data, err := tintedICO(trayIcon(), tint)
+	if err != nil {
+		return 0, err
+	}
+	return loadTrayIconData(data)
+}
+
+func loadTrayIconData(data []byte) (uintptr, error) {
 	file, err := os.CreateTemp("", "replicaro-tray-*.ico")
 	if err != nil {
 		return 0, err
@@ -602,7 +699,7 @@ func loadTrayIcon() (uintptr, error) {
 	name := file.Name()
 	defer os.Remove(name)
 
-	if _, err := file.Write(trayIcon()); err != nil {
+	if _, err := file.Write(data); err != nil {
 		_ = file.Close()
 		return 0, err
 	}

@@ -38,7 +38,8 @@ const notificationContract = {
   'notifications.task.restoreSelectedItems': 'name',
 };
 
-// The tray menu labels and the Quit prompt are read by the backend's desktop
+// The tray menu labels, the tray state tooltips, the Linux tooltip's
+// description line and the Quit prompt are read by the backend's desktop
 // integration (desktop.SetText), never by frontend source.
 const desktopContract = {
   'desktop.trayOpen': '',
@@ -46,6 +47,11 @@ const desktopContract = {
   'desktop.quitPrompt': '',
   'desktop.quitButton': '',
   'desktop.cancelButton': '',
+  'desktop.trayIdle': '',
+  'desktop.trayRunning': '',
+  'desktop.trayWarnings': '',
+  'desktop.trayErrors': '',
+  'desktop.trayDescription': '',
 };
 
 // JSON.parse accepts a repeated object key and silently keeps its last value.

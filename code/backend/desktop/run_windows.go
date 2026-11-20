@@ -73,6 +73,12 @@ func Run(service func() error, stop func() error) error {
 		}
 		activeTrayMu.Unlock()
 	}()
+	// Runs before tray.close (defers run last first), so the tray state stops
+	// asking for changes before the window and icons are released. A change
+	// can still arrive after WM_CLOSE has destroyed the window and before this
+	// runs; posting it then fails and only logs a line, which is harmless
+	// because the tray is going away anyway.
+	defer startTrayState(tray.requestState)()
 
 	serviceDone := make(chan error, 1)
 	go func() {

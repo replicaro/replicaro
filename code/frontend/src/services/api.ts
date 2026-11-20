@@ -18,6 +18,7 @@ import type {
     FileSearchResult,
 	FileBrowseEntry,
     FileVersion,
+    FileHistoryVersion,
     MetadataIndexState,
     Snapshot,
     SnapshotEntry,
@@ -387,6 +388,8 @@ export interface CreateRepositoryInput {
     maintenanceSchedule: string;
 	concurrencyMode: "reduced" | "native" | "increased" | "maximum";
 	objectLock: ObjectLockSettings;
+	// Requested Kopia error correction overhead; absent or 0 is off.
+	eccOverheadPercent?: number;
 }
 
 export interface ProfileMutationResult {
@@ -446,6 +449,8 @@ export interface RepositoryCreationIntent {
 	maintenanceSchedule: string;
 	concurrencyMode: "reduced" | "native" | "increased" | "maximum";
 	objectLock?: ObjectLockSettings;
+	// Requested Kopia error correction overhead; absent or 0 is off.
+	eccOverheadPercent?: number;
 	canonicalIdentity: string;
 	reviewedOptions?: Record<string, string>;
 	phase: "prepared" | "native_started" | "native_ready";
@@ -782,6 +787,13 @@ export interface IndexedResult<T> {
 	storageModel?: "snapshot_repository";
 }
 
+// File History keeps one item per backup date in items (paged), and gives the
+// file's complete list of versions in versions on every page. A folder has no
+// versions: folders stay per backup date.
+export interface FileHistoryResult extends IndexedResult<FileVersion> {
+	versions: FileHistoryVersion[];
+}
+
 export const retryFileIndex = (repositoryId: string) =>
     post<{ admitted: boolean }>(`/api/files/index/retry?id=${encodeURIComponent(repositoryId)}`);
 
@@ -834,7 +846,7 @@ export const getFileHistory = (
 	signal?: AbortSignal,
 	revision?: number
 ) =>
-    request<IndexedResult<FileVersion>>(
+    request<FileHistoryResult>(
         `/api/files/history?id=${encodeURIComponent(repositoryId)}` +
             `&path=${encodeURIComponent(path)}` +
             (source ? `&source=${encodeURIComponent(source)}` : "") +
@@ -853,6 +865,59 @@ export const restoreSelection = (input: {
 	}>;
     conflictMode: string;
 }) => post<TrackedOperationStart>("/api/restore-selection", input);
+
+/* ------------------------------------------------------------------ */
+/* Single-file download                                                */
+/* ------------------------------------------------------------------ */
+
+// One file in one backup, named the way a selected restore names it: the
+// backup, its exact native root and the path under that root. An empty path
+// is a single-file source itself.
+export interface DownloadTarget {
+	repositoryId: string;
+	snapshotId: string;
+	nativeRootId: string;
+	path: string;
+}
+
+export interface DownloadTicket {
+	url: string;
+	fileName: string;
+	expiresInSeconds: number;
+}
+
+// The ticket request makes every check (vault, backup, path, regular file,
+// vault not busy) without taking the vault or recording anything. The
+// returned url works once, for about 30 seconds, and only for the browser's
+// own download; see startBrowserDownload.
+export const requestDownloadTicket = (target: DownloadTarget) =>
+	post<DownloadTicket>("/api/download/ticket", target);
+
+// startBrowserDownload hands a ticket's url to the browser's own download
+// manager: a same-origin link with the download attribute, clicked once.
+// The server offers the file under its own name (a browser may change
+// characters it doesn't allow in a file name: Chromium replaced a double quote
+// with "_" and dropped a leading dot), the browser shows the transfer in its
+// own download list, and the page stays where it is. When the address answers
+// an error instead of the file (a used ticket, a vault that became busy since
+// the ticket), the page can't see that answer; Chromium lists a failed
+// download and saves nothing (Firefox and Safari have not been tested). The
+// file must never be fetched into the page and saved from there: the page
+// would hold the whole file in memory. Don't swap this for window.location,
+// window.open or a form submit either: those navigate (or open a tab) when
+// the answer isn't an attachment.
+export function startBrowserDownload(url: string) {
+	const link = document.createElement("a");
+	link.href = url;
+	link.download = "";
+	link.hidden = true;
+	document.body.append(link);
+	try {
+		link.click();
+	} finally {
+		link.remove();
+	}
+}
 
 /* ------------------------------------------------------------------ */
 /* Backup jobs                                                         */

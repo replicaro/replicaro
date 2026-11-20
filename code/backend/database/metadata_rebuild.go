@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 
@@ -199,6 +200,9 @@ func RebuildMetadataCache(ctx context.Context, db *sql.DB, repositoryID string, 
 		if _, err := tx.ExecContext(ctx, `UPDATE metadata_cache_snapshots SET entry_set_id=?,status='ready',indexed_at=? WHERE snapshot_id=?`, setID, time.Now().UTC().Format(time.RFC3339), snapshot.ID); err != nil {
 			return err
 		}
+		if err := rebuildSnapshotMarks(ctx, source.readers, tx, snapshot.ID); err != nil {
+			return err
+		}
 	}
 	if err := finishNative(); err != nil {
 		return err
@@ -271,7 +275,7 @@ func rebuildCachedEntries(ctx context.Context, db *sql.DB, snapshot models.Snaps
 	if err != nil {
 		return nil, false, err
 	}
-	rows, err := db.QueryContext(ctx, `SELECT f.root,f.parent_path,f.name,v.mode,v.size,v.is_dir FROM metadata_cache_entries e
+	rows, err := db.QueryContext(ctx, `SELECT f.root,f.parent_path,f.name,v.mode,v.size,v.is_dir,v.mtime,v.object_id FROM metadata_cache_entries e
  JOIN metadata_cache_files f ON f.file_id=e.file_id JOIN metadata_cache_file_versions v ON v.file_id=e.file_id AND v.file_version_id=e.file_version_id
  WHERE e.entry_set_id=? ORDER BY f.file_id`, setID)
 	if err != nil {
@@ -282,13 +286,109 @@ func rebuildCachedEntries(ctx context.Context, db *sql.DB, snapshot models.Snaps
 	for rows.Next() {
 		var entry models.SnapshotEntry
 		var parent string
-		if err := rows.Scan(&entry.SourceRoot, &parent, &entry.Name, &entry.Mode, &entry.Size, &entry.IsDir); err != nil {
+		if err := rows.Scan(&entry.SourceRoot, &parent, &entry.Name, &entry.Mode, &entry.Size, &entry.IsDir, &entry.Modified, &entry.ObjectID); err != nil {
 			return nil, false, err
 		}
 		entry.Path = joinMetadataRelative(parent, entry.Name)
 		entries = append(entries, entry)
 	}
 	return entries, true, rows.Err()
+}
+
+// rebuildSnapshotMarks copies a Restic snapshot's diff marks into the
+// replacement cache, matching files by path because file IDs differ between
+// the two. The marks only depend on the two native snapshots, so they stay
+// right as long as the snapshot's files are cataloged under the same roots.
+// They are copied only when the snapshot's cached roots (native and grouping)
+// are the same in both caches; otherwise a mark could land on a same-named
+// path under a root the snapshot no longer has. A snapshot whose roots changed,
+// or whose marks can't all be matched, gets none and keeps marks_base NULL, so
+// the next refresh runs its diff again. Never keep part of a snapshot's marks
+// with marks_base set: File History would then miss versions without any sign
+// that marks are missing.
+//
+// Every statement names repository_database_id so SQLite can use the primary
+// key and unique indexes; without it each mark scans metadata_cache_files.
+const (
+	rebuildMarksReadSQL = `SELECT f.root,f.parent_path,f.name FROM metadata_cache_snapshot_marks m
+		JOIN metadata_cache_files f ON f.file_id=m.file_id
+		WHERE m.repository_database_id=1 AND m.snapshot_id=?`
+	rebuildMarkInsertSQL = `INSERT OR IGNORE INTO metadata_cache_snapshot_marks(repository_database_id,snapshot_id,file_id)
+		SELECT 1,?,file_id FROM metadata_cache_files WHERE repository_database_id=1 AND root=? AND parent_path=? AND name=?`
+	rebuildMarksDeleteSQL = `DELETE FROM metadata_cache_snapshot_marks WHERE repository_database_id=1 AND snapshot_id=?`
+)
+
+func rebuildSnapshotMarks(ctx context.Context, source *sql.DB, tx *sql.Tx, snapshotID string) error {
+	var base sql.NullString
+	err := source.QueryRowContext(ctx, `SELECT marks_base FROM metadata_cache_snapshots
+		WHERE repository_database_id=1 AND snapshot_id=? AND status='ready'`, snapshotID).Scan(&base)
+	if errors.Is(err, sql.ErrNoRows) || err == nil && !base.Valid {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	oldRoots, err := cachedSnapshotRoots(ctx, source, snapshotID)
+	if err != nil {
+		return err
+	}
+	newRoots, err := cachedSnapshotRoots(ctx, tx, snapshotID)
+	if err != nil {
+		return err
+	}
+	if !slices.Equal(oldRoots, newRoots) {
+		return nil
+	}
+	rows, err := source.QueryContext(ctx, rebuildMarksReadSQL, snapshotID)
+	if err != nil {
+		return err
+	}
+	var files [][3]string
+	for rows.Next() {
+		var file [3]string
+		if err := rows.Scan(&file[0], &file[1], &file[2]); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		files = append(files, file)
+	}
+	if err := closeRows(rows); err != nil {
+		return err
+	}
+	for _, file := range files {
+		result, err := tx.ExecContext(ctx, rebuildMarkInsertSQL, snapshotID, file[0], file[1], file[2])
+		if err != nil {
+			return err
+		}
+		if inserted, err := result.RowsAffected(); err != nil {
+			return err
+		} else if inserted != 1 {
+			_, err := tx.ExecContext(ctx, rebuildMarksDeleteSQL, snapshotID)
+			return err
+		}
+	}
+	_, err = tx.ExecContext(ctx, `UPDATE metadata_cache_snapshots SET marks_base=? WHERE repository_database_id=1 AND snapshot_id=?`, base.String, snapshotID)
+	return err
+}
+
+// cachedSnapshotRoots returns a snapshot's cached roots in order, each as its
+// native path, grouping root, user and host.
+func cachedSnapshotRoots(ctx context.Context, reader metadataRowsReader, snapshotID string) ([]string, error) {
+	rows, err := reader.QueryContext(ctx, `SELECT path,normalized_root,native_user,native_host FROM metadata_cache_snapshot_roots
+		WHERE repository_database_id=1 AND snapshot_id=? ORDER BY root_ordinal`, snapshotID)
+	if err != nil {
+		return nil, err
+	}
+	var roots []string
+	for rows.Next() {
+		var path, grouping, user, host string
+		if err := rows.Scan(&path, &grouping, &user, &host); err != nil {
+			_ = rows.Close()
+			return nil, err
+		}
+		roots = append(roots, path+"\x00"+grouping+"\x00"+user+"\x00"+host)
+	}
+	return roots, closeRows(rows)
 }
 
 func metadataReplacementPrefix(path string) string {

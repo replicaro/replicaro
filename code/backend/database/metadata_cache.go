@@ -135,7 +135,7 @@ func metadataRepositoryDatabaseIDForAuthority(ctx context.Context, reader metada
 	return repositoryDatabaseID, err
 }
 
-func repositoryMetadataIndexState(ctx context.Context, reader metadataIndexStateReader, authority MetadataReadAuthority) (MetadataIndexState, error) {
+func repositoryMetadataIndexState(ctx context.Context, reader metadataRowsReader, authority MetadataReadAuthority) (MetadataIndexState, error) {
 	var state MetadataIndexState
 	repositoryDatabaseID, err := metadataRepositoryDatabaseIDForAuthority(ctx, reader, authority)
 	if err != nil {
@@ -157,6 +157,17 @@ func repositoryMetadataIndexState(ctx context.Context, reader metadataIndexState
 		return state, err
 	}
 	state.RequiredGeneration = authority.RequiredGeneration
+	// An indexed Restic snapshot without marks against its previous backup
+	// can't show file versions yet, so it counts as pending, not ready, and
+	// keeps the vault from reading as complete (see metadata_versions.go).
+	if state.ReadySnapshots > 0 {
+		pendingMarks, err := metadataMarksPendingCount(ctx, reader, repositoryDatabaseID)
+		if err != nil {
+			return state, err
+		}
+		state.ReadySnapshots -= pendingMarks
+		state.PendingSnapshots += pendingMarks
+	}
 	var attemptedAt, failureText string
 	err = reader.QueryRowContext(ctx, `SELECT COALESCE(f.attempted_at,''),COALESCE(f.error,'')
 		FROM repositories r LEFT JOIN metadata_cache_failures f ON f.repository_database_id=r.database_id WHERE r.database_id=?`, repositoryDatabaseID).Scan(&attemptedAt, &failureText)
@@ -291,6 +302,11 @@ func metadataReadRevisionAndGate(ctx context.Context, tx *sql.Tx, authority Meta
 		return revision, repositoryDatabaseID, err
 	}
 	if unavailable != 0 {
+		return revision, repositoryDatabaseID, ErrMetadataIndexingUnavailable
+	}
+	if pendingMarks, err := metadataMarksPendingCount(ctx, tx, repositoryDatabaseID); err != nil {
+		return revision, repositoryDatabaseID, err
+	} else if pendingMarks != 0 {
 		return revision, repositoryDatabaseID, ErrMetadataIndexingUnavailable
 	}
 	if expectedRevision != nil && *expectedRevision != revision {
@@ -523,6 +539,8 @@ func ReadyMetadataFileHistory(ctx context.Context, db *sql.DB, repositoryID, pat
 
 type metadataVersionRow struct {
 	version   models.FileVersion
+	modified  int64
+	objectID  string
 	engine    string
 	client    string
 	machine   string
@@ -543,8 +561,8 @@ const metadataHistoryFileLookupSQL = `SELECT f.file_id,
 // Start from the selected file's blocks before expanding lists and snapshots.
 // Starting from all ready snapshots can multiply a frequently changed file's
 // blocks by its snapshot count rather than following each actual reference.
-const metadataDirectHistorySQL = `SELECT s.snapshot_id,s.timestamp,v.size,v.is_dir,r.path,r.native_user,r.native_host,
-		setrow.engine,s.presentation_client_uuid,s.presentation_machine_label
+const metadataDirectHistorySQL = `SELECT s.snapshot_id,s.timestamp,v.size,v.is_dir,v.mode,r.path,r.native_user,r.native_host,
+		setrow.engine,s.presentation_client_uuid,s.presentation_machine_label,v.mtime,v.object_id
 	FROM metadata_cache_block_entries e INDEXED BY metadata_cache_block_entries_file_version
  CROSS JOIN metadata_cache_block_list_items l ON l.block_id=e.block_id
  CROSS JOIN metadata_cache_entry_sets setrow ON setrow.block_list_id=l.block_list_id
@@ -585,16 +603,21 @@ func ReadyMetadataFileHistoryPage(ctx context.Context, db *sql.DB, repositoryID,
 	if err != nil {
 		return nil, 0, err
 	}
-	return readyMetadataFileHistoryPageForAuthority(ctx, db, authority, path, source, limit, offset, expectedRevision, nil)
+	return readyMetadataFileHistoryPageForAuthority(ctx, db, authority, path, source, limit, offset, expectedRevision, nil, nil)
 }
 
-func ReadyMetadataFileHistoryPageForAuthority(ctx context.Context, db *sql.DB, authority MetadataReadAuthority, path, source string, limit, offset int, expectedRevision *int64) ([]models.FileVersion, int64, MetadataIndexState, error) {
+// ReadyMetadataFileHistoryWithVersionsForAuthority is the History read with
+// the file's versions as well (see metadata_versions.go). The versions are
+// always the file's complete list, whatever page of per-backup rows is
+// asked for; a folder has none, because folders stay per backup date.
+func ReadyMetadataFileHistoryWithVersionsForAuthority(ctx context.Context, db *sql.DB, authority MetadataReadAuthority, path, source string, limit, offset int, expectedRevision *int64) ([]models.FileVersion, []models.FileHistoryVersion, int64, MetadataIndexState, error) {
 	var state MetadataIndexState
-	items, revision, err := readyMetadataFileHistoryPageForAuthority(ctx, db, authority, path, source, limit, offset, expectedRevision, &state)
-	return items, revision, state, err
+	versions := []models.FileHistoryVersion{}
+	items, revision, err := readyMetadataFileHistoryPageForAuthority(ctx, db, authority, path, source, limit, offset, expectedRevision, &state, &versions)
+	return items, versions, revision, state, err
 }
 
-func readyMetadataFileHistoryPageForAuthority(ctx context.Context, db *sql.DB, authority MetadataReadAuthority, path, source string, limit, offset int, expectedRevision *int64, stateOut *MetadataIndexState) ([]models.FileVersion, int64, error) {
+func readyMetadataFileHistoryPageForAuthority(ctx context.Context, db *sql.DB, authority MetadataReadAuthority, path, source string, limit, offset int, expectedRevision *int64, stateOut *MetadataIndexState, versionsOut *[]models.FileHistoryVersion) ([]models.FileVersion, int64, error) {
 	if limit <= 0 || limit > 201 {
 		limit = 201
 	}
@@ -667,12 +690,15 @@ func readyMetadataFileHistoryPageForAuthority(ctx context.Context, db *sql.DB, a
 	for rows.Next() {
 		var row metadataVersionRow
 		var isDir int
-		if err := rows.Scan(&row.version.SnapshotID, &row.version.Timestamp, &row.version.Size, &isDir,
-			&row.version.Source, &row.rootUser, &row.rootHost, &row.engine, &row.client, &row.machine); err != nil {
+		var mode string
+		if err := rows.Scan(&row.version.SnapshotID, &row.version.Timestamp, &row.version.Size, &isDir, &mode,
+			&row.version.Source, &row.rootUser, &row.rootHost, &row.engine, &row.client, &row.machine, &row.modified, &row.objectID); err != nil {
 			_ = rows.Close()
 			return nil, revision, err
 		}
 		row.version.IsDir, row.version.Present = isDir != 0, true
+		row.version.RegularFile = !row.version.IsDir && models.RegularFileMode(mode)
+		row.version.Modified = models.NativeModifiedText(row.modified)
 		row.version.NativeRootID = models.SnapshotNativeRootIdentity(models.SnapshotSourceRoot{Path: row.version.Source, User: row.rootUser, Host: row.rootHost})
 		all = append(all, row)
 	}
@@ -697,6 +723,19 @@ func readyMetadataFileHistoryPageForAuthority(ctx context.Context, db *sql.DB, a
 	// explicit empty directories skip the potentially large membership join.
 	if hasChild == 0 {
 		applyMetadataMachineLabels(all)
+		if versionsOut != nil && len(all) > 0 {
+			chains, err := loadMetadataChains(ctx, tx, repositoryDatabaseID)
+			if err != nil {
+				return nil, revision, err
+			}
+			marked := map[string]bool{}
+			if chains.engine == "restic" {
+				if marked, err = metadataMarkedSnapshotsTx(ctx, tx, repositoryDatabaseID, fileID); err != nil {
+					return nil, revision, err
+				}
+			}
+			*versionsOut = metadataFileVersions(chains, all, marked)
+		}
 		if offset > len(all) {
 			offset = len(all)
 		}
@@ -772,20 +811,15 @@ func applyMetadataMachineLabels(rows []metadataVersionRow) {
 		key, label, earliest string
 		latestMachineTime    string
 		latestHostTime       string
+		// unnamed is set when no name was found and label is the fallback.
+		unnamed bool
+		// number is the " #n" added to label, 0 when none was added.
+		number int
 	}
 	groups := map[string]*group{}
 	for index := range rows {
 		row := &rows[index]
-		switch {
-		case row.client != "":
-			row.groupKey = "client:" + row.client
-		case row.engine == "restic" && row.rootHost != "":
-			row.groupKey = "restic-host:" + row.rootHost
-		case row.engine == "kopia" && validMetadataClientUUID(row.rootUser):
-			row.groupKey = "kopia-user:" + row.rootUser
-		default:
-			row.groupKey = "previous"
-		}
+		row.groupKey = metadataComputerKey(row.client, row.engine, row.rootUser, row.rootHost)
 		g := groups[row.groupKey]
 		if g == nil {
 			g = &group{key: row.groupKey, earliest: row.version.Timestamp}
@@ -804,7 +838,10 @@ func applyMetadataMachineLabels(rows []metadataVersionRow) {
 	ordered := make([]*group, 0, len(groups))
 	for _, g := range groups {
 		if g.label == "" {
-			g.label = "Previous computer"
+			// The page shows its own translation for an unnamed group (see
+			// models.FileVersion); this English label stays for every other
+			// reader of MachineLabel.
+			g.label, g.unnamed = "Previous computer", true
 		}
 		ordered = append(ordered, g)
 	}
@@ -820,12 +857,12 @@ func applyMetadataMachineLabels(rows []metadataVersionRow) {
 		groupOrder[g.key] = index
 		byLabel[g.label] = append(byLabel[g.label], g)
 	}
-	final := map[string]string{}
+	final := map[string]*group{}
 	for label, labelGroups := range byLabel {
 		for index, g := range labelGroups {
-			final[g.key] = label
+			final[g.key] = g
 			if len(labelGroups) > 1 {
-				final[g.key] = fmt.Sprintf("%s #%d", label, index+1)
+				g.label, g.number = fmt.Sprintf("%s #%d", label, index+1), index+1
 			}
 		}
 	}
@@ -842,7 +879,11 @@ func applyMetadataMachineLabels(rows []metadataVersionRow) {
 		return rows[i].version.NativeRootID < rows[j].version.NativeRootID
 	})
 	for index := range rows {
-		rows[index].version.MachineLabel = final[rows[index].groupKey]
+		g := final[rows[index].groupKey]
+		rows[index].version.MachineLabel = g.label
+		if g.unnamed {
+			rows[index].version.UnnamedComputer, rows[index].version.UnnamedComputerNumber = true, g.number
+		}
 	}
 }
 
@@ -1027,6 +1068,13 @@ func metadataRootScope(snapshot models.Snapshot) (string, error) {
 	return string(encoded), err
 }
 
+// MetadataSnapshotRoots returns a snapshot's native roots and, index for
+// index, the grouping root its files are cached under (see
+// normalizedMetadataSnapshotRoots).
+func MetadataSnapshotRoots(snapshot models.Snapshot) ([]models.SnapshotSourceRoot, []string, error) {
+	return normalizedMetadataSnapshotRoots(snapshot)
+}
+
 // MetadataEntrySetRootScope exposes the exact normalized scope used by entry-set
 // lookup so coordinator batching cannot invent a second path normalization.
 func MetadataEntrySetRootScope(snapshot models.Snapshot) (string, error) {
@@ -1107,17 +1155,22 @@ func upsertMetadataSnapshotHeaderTxContext(ctx context.Context, tx *sql.Tx, repo
 			machine = snapshot.PresentationMachineLabel
 		}
 	}
+	nativePaths, err := metadataNativeSourcePaths(snapshot)
+	if err != nil {
+		return err
+	}
 	result, err := tx.ExecContext(ctx, `INSERT INTO metadata_cache_snapshots
 		(repository_database_id,snapshot_id,timestamp,size,duration,source,marker_status,marker_profile_uuid,marker_job_uuid,
-		 presentation_client_uuid,presentation_machine_label,status,indexed_at,error,total_file_count,native_root_type)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		 presentation_client_uuid,presentation_machine_label,status,indexed_at,error,total_file_count,native_root_type,native_source_paths)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 		ON CONFLICT(repository_database_id,snapshot_id) DO UPDATE SET
 		timestamp=excluded.timestamp,size=excluded.size,duration=excluded.duration,source=excluded.source,
 		marker_status=excluded.marker_status,marker_profile_uuid=excluded.marker_profile_uuid,marker_job_uuid=excluded.marker_job_uuid,
 		presentation_client_uuid=excluded.presentation_client_uuid,presentation_machine_label=excluded.presentation_machine_label,
-		status=excluded.status,indexed_at=excluded.indexed_at,error=excluded.error,total_file_count=excluded.total_file_count,native_root_type=excluded.native_root_type`,
+		status=excluded.status,indexed_at=excluded.indexed_at,error=excluded.error,total_file_count=excluded.total_file_count,native_root_type=excluded.native_root_type,
+		native_source_paths=excluded.native_source_paths`,
 		repositoryDatabaseID, snapshot.ID, canonicalMetadataTimestamp(snapshot.Timestamp), snapshot.Size, snapshot.Duration, snapshot.Source,
-		markerStatus, markerProfile, markerJob, client, machine, status, indexedAt, safeError, snapshot.TotalFileCount, snapshot.NativeRootType)
+		markerStatus, markerProfile, markerJob, client, machine, status, indexedAt, safeError, snapshot.TotalFileCount, snapshot.NativeRootType, nativePaths)
 	if err != nil {
 		return err
 	}
@@ -1284,7 +1337,7 @@ func ListMetadataEntries(db *sql.DB, repositoryID, snapshotID, parentPath string
 // small folder. Source-root joins preserve the exact native restore address.
 const metadataSnapshotChildrenSelectSQL = `SELECT
  CASE WHEN f.parent_path='' THEN f.name ELSE f.parent_path||'/'||f.name END AS path,
- r.path,v.mode,v.size,v.is_dir
+ r.path,v.mode,v.size,v.is_dir,v.mtime
  FROM metadata_cache_snapshots s
  JOIN metadata_cache_entry_sets setrow ON setrow.entry_set_id=s.entry_set_id
  JOIN metadata_cache_snapshot_roots r ON r.repository_database_id=s.repository_database_id AND r.snapshot_id=s.snapshot_id
@@ -1369,7 +1422,7 @@ func readyMetadataSnapshotEntries(ctx context.Context, db *sql.DB, authority Met
 	for rows.Next() {
 		var entry models.SnapshotEntry
 		var isDir int
-		if err := rows.Scan(&entry.Path, &entry.SourceRoot, &entry.Mode, &entry.Size, &isDir); err != nil {
+		if err := rows.Scan(&entry.Path, &entry.SourceRoot, &entry.Mode, &entry.Size, &isDir, &entry.Modified); err != nil {
 			_ = rows.Close()
 			return models.Snapshot{}, nil, false, err
 		}
@@ -1463,8 +1516,28 @@ func replaceMetadataSnapshotWithIdentity(ctx context.Context, db *sql.DB, reposi
 }
 
 type stagedMetadataMembership struct {
-	root, parent, name, mode, size string
-	isDir                          bool
+	root, parent, name, mode, size, objectID string
+	isDir                                    bool
+	modified                                 int64
+}
+
+// metadataVersionFacts returns what one entry stores in its file version row
+// beyond mode and size: its native modified time, for files and folders, and
+// for files Kopia's object ID. Restore browse and File History's backup-date
+// lines show a folder's modified time, so it is kept. It is the time the
+// engine lists for the folder: Restic's is the folder's own and Kopia's is the
+// newest within it (see the Kopia directory reader,
+// engines/kopia_directory.go). A folder whose time
+// differs between backups gets one version row per time, which changes only
+// the blocks holding that folder. A folder's object ID is left out: nothing
+// shows or compares it, and it would add a version row for every change
+// inside the folder. Folders never get File History versions (see
+// metadataFileVersions); their history stays one choice per backup date.
+func metadataVersionFacts(entry models.SnapshotEntry) (int64, string) {
+	if entry.IsDir {
+		return entry.Modified, ""
+	}
+	return entry.Modified, entry.ObjectID
 }
 
 // SQLite builds in supported packages admit far more parameters, but measured
@@ -1595,13 +1668,16 @@ func insertMetadataEntriesBatchedTxContext(ctx context.Context, tx *sql.Tx, repo
 				return fmt.Errorf("metadata source root has more than one file entry")
 			}
 			rootFileEntries[entryRoot] = true
-			memberships[entryRoot+"\x00\x00"] = stagedMetadataMembership{root: entryRoot, mode: entry.Mode, size: entry.Size}
+			modified, objectID := metadataVersionFacts(entry)
+			memberships[entryRoot+"\x00\x00"] = stagedMetadataMembership{root: entryRoot, mode: entry.Mode, size: entry.Size, modified: modified, objectID: objectID}
 			continue
 		}
 		parent, name := splitMetadataRelative(path)
-		membership := stagedMetadataMembership{root: entryRoot, parent: parent, name: name, mode: entry.Mode, size: entry.Size, isDir: entry.IsDir}
+		modified, objectID := metadataVersionFacts(entry)
+		membership := stagedMetadataMembership{root: entryRoot, parent: parent, name: name, mode: entry.Mode, size: entry.Size, isDir: entry.IsDir,
+			modified: modified, objectID: objectID}
 		key := entryRoot + "\x00" + parent + "\x00" + name
-		if prior, ok := memberships[key]; ok && (prior.mode != membership.mode || prior.size != membership.size || prior.isDir != membership.isDir) {
+		if prior, ok := memberships[key]; ok && prior != membership {
 			return fmt.Errorf("metadata entry has conflicting cached facts")
 		}
 		memberships[key] = membership
@@ -1630,7 +1706,7 @@ func insertMetadataEntriesBatchedTxContext(ctx context.Context, tx *sql.Tx, repo
 	}
 	statements := []string{
 		`CREATE TEMP TABLE IF NOT EXISTS replicaro_metadata_staged_files(root TEXT,parent_path TEXT,name TEXT,PRIMARY KEY(root,parent_path,name)) WITHOUT ROWID`,
-		`CREATE TEMP TABLE IF NOT EXISTS replicaro_metadata_staged_memberships(root TEXT,parent_path TEXT,name TEXT,mode TEXT,size TEXT,is_dir INTEGER,PRIMARY KEY(root,parent_path,name)) WITHOUT ROWID`,
+		`CREATE TEMP TABLE IF NOT EXISTS replicaro_metadata_staged_memberships(root TEXT,parent_path TEXT,name TEXT,mode TEXT,size TEXT,is_dir INTEGER,mtime INTEGER,object_id TEXT,PRIMARY KEY(root,parent_path,name)) WITHOUT ROWID`,
 		`DELETE FROM replicaro_metadata_staged_files`, `DELETE FROM replicaro_metadata_staged_memberships`,
 	}
 	for _, statement := range statements {
@@ -1648,11 +1724,11 @@ func insertMetadataEntriesBatchedTxContext(ctx context.Context, tx *sql.Tx, repo
 	}
 	stagedMemberships := make([][]any, 0, len(memberships))
 	for _, row := range memberships {
-		stagedMemberships = append(stagedMemberships, []any{row.root, row.parent, row.name, row.mode, row.size, boolInt(row.isDir)})
+		stagedMemberships = append(stagedMemberships, []any{row.root, row.parent, row.name, row.mode, row.size, boolInt(row.isDir), row.modified, row.objectID})
 	}
 	if err := insertMetadataTempRows(ctx, tx,
-		`INSERT INTO replicaro_metadata_staged_memberships(root,parent_path,name,mode,size,is_dir) VALUES `,
-		`(?,?,?,?,?,?)`, 6, stagedMemberships); err != nil {
+		`INSERT INTO replicaro_metadata_staged_memberships(root,parent_path,name,mode,size,is_dir,mtime,object_id) VALUES `,
+		`(?,?,?,?,?,?,?,?)`, 8, stagedMemberships); err != nil {
 		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO metadata_cache_files(repository_database_id,root,parent_path,name)
@@ -1667,8 +1743,8 @@ func insertMetadataEntriesBatchedTxContext(ctx context.Context, tx *sql.Tx, repo
 		SELECT ?,root,parent_path,name FROM replicaro_metadata_staged_memberships`, repositoryDatabaseID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO metadata_cache_file_versions(file_id,mode,size,is_dir)
-		SELECT f.file_id,m.mode,m.size,m.is_dir FROM replicaro_metadata_staged_memberships m
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO metadata_cache_file_versions(file_id,mode,size,is_dir,mtime,object_id)
+		SELECT f.file_id,m.mode,m.size,m.is_dir,m.mtime,m.object_id FROM replicaro_metadata_staged_memberships m
 		JOIN metadata_cache_files f ON f.repository_database_id=? AND f.root=m.root AND f.parent_path=m.parent_path AND f.name=m.name`, repositoryDatabaseID); err != nil {
 		return err
 	}
@@ -1684,7 +1760,8 @@ func insertMetadataEntriesBatchedTxContext(ctx context.Context, tx *sql.Tx, repo
 		JOIN metadata_cache_entry_sets setrow ON setrow.entry_set_id=? AND setrow.repository_database_id=?
 		JOIN metadata_cache_files f ON f.repository_database_id=setrow.repository_database_id
 			AND f.root=m.root AND f.parent_path=m.parent_path AND f.name=m.name
-		JOIN metadata_cache_file_versions v ON v.file_id=f.file_id AND v.mode=m.mode AND v.size=m.size AND v.is_dir=m.is_dir`, entrySetID, repositoryDatabaseID); err != nil {
+		JOIN metadata_cache_file_versions v ON v.file_id=f.file_id AND v.mode=m.mode AND v.size=m.size AND v.is_dir=m.is_dir
+			AND v.mtime=m.mtime AND v.object_id=m.object_id`, entrySetID, repositoryDatabaseID); err != nil {
 		return err
 	}
 	var stagedCount, resolvedCount int
@@ -2125,7 +2202,7 @@ func ReadyMetadataSnapshotsForAuthority(ctx context.Context, db *sql.DB, authori
 
 func listMetadataSnapshotsTx(ctx context.Context, tx *sql.Tx, repositoryDatabaseID int64, snapshotIDs []string, readyOnly bool) ([]models.Snapshot, error) {
 	query := `SELECT snapshot_id,timestamp,size,duration,source,marker_status,marker_profile_uuid,marker_job_uuid,
-		presentation_client_uuid,presentation_machine_label,total_file_count,native_root_type
+		presentation_client_uuid,presentation_machine_label,total_file_count,native_root_type,native_source_paths
 		FROM metadata_cache_snapshots WHERE repository_database_id=?`
 	args := []any{repositoryDatabaseID}
 	if readyOnly {
@@ -2145,10 +2222,15 @@ func listMetadataSnapshotsTx(ctx context.Context, tx *sql.Tx, repositoryDatabase
 	result := []models.Snapshot{}
 	for rows.Next() {
 		var snapshot models.Snapshot
-		var markerStatus, client, machine string
+		var markerStatus, client, machine, nativePaths string
 		if err := rows.Scan(&snapshot.ID, &snapshot.Timestamp, &snapshot.Size, &snapshot.Duration, &snapshot.Source,
-			&markerStatus, &snapshot.OwnershipMarker.ProfileID, &snapshot.OwnershipMarker.JobID, &client, &machine, &snapshot.TotalFileCount, &snapshot.NativeRootType); err != nil {
+			&markerStatus, &snapshot.OwnershipMarker.ProfileID, &snapshot.OwnershipMarker.JobID, &client, &machine, &snapshot.TotalFileCount, &snapshot.NativeRootType, &nativePaths); err != nil {
+			_ = rows.Close()
 			return nil, err
+		}
+		if err := json.Unmarshal([]byte(nativePaths), &snapshot.NativeSourcePaths); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("read native source paths of cached snapshot %s: %w", snapshot.ID, err)
 		}
 		snapshot.OwnershipMarker.Status = models.SnapshotOwnershipMarkerStatus(markerStatus)
 		snapshot.PresentationClientUUID, snapshot.PresentationMachineLabel = client, machine
@@ -2176,7 +2258,7 @@ func MetadataSnapshotsNeedingIndex(db *sql.DB, repositoryID string, now time.Tim
 	defer release()
 	db = handle.readers
 	rows, err := db.Query(`SELECT s.snapshot_id,s.timestamp,s.size,s.duration,s.source,s.marker_status,s.marker_profile_uuid,s.marker_job_uuid,
-			s.presentation_client_uuid,s.presentation_machine_label,s.total_file_count,s.native_root_type
+			s.presentation_client_uuid,s.presentation_machine_label,s.total_file_count,s.native_root_type,s.native_source_paths
 		FROM metadata_cache_snapshots s JOIN repositories r ON r.database_id=s.repository_database_id
 		WHERE r.id=? AND (s.status='pending' OR (s.status='failed' AND (? OR s.indexed_at='' OR s.indexed_at<=?)))
 		ORDER BY s.timestamp DESC,s.snapshot_id`, repositoryID, bypassCooldown, cutoff)
@@ -2187,11 +2269,14 @@ func MetadataSnapshotsNeedingIndex(db *sql.DB, repositoryID string, now time.Tim
 	result := []models.Snapshot{}
 	for rows.Next() {
 		var snapshot models.Snapshot
-		var markerStatus string
+		var markerStatus, nativePaths string
 		if err := rows.Scan(&snapshot.ID, &snapshot.Timestamp, &snapshot.Size, &snapshot.Duration, &snapshot.Source,
 			&markerStatus, &snapshot.OwnershipMarker.ProfileID, &snapshot.OwnershipMarker.JobID,
-			&snapshot.PresentationClientUUID, &snapshot.PresentationMachineLabel, &snapshot.TotalFileCount, &snapshot.NativeRootType); err != nil {
+			&snapshot.PresentationClientUUID, &snapshot.PresentationMachineLabel, &snapshot.TotalFileCount, &snapshot.NativeRootType, &nativePaths); err != nil {
 			return nil, err
+		}
+		if err := json.Unmarshal([]byte(nativePaths), &snapshot.NativeSourcePaths); err != nil {
+			return nil, fmt.Errorf("read native source paths of cached snapshot %s: %w", snapshot.ID, err)
 		}
 		snapshot.OwnershipMarker.Status = models.SnapshotOwnershipMarkerStatus(markerStatus)
 		result = append(result, snapshot)
@@ -2245,12 +2330,12 @@ func reconcileMetadataSnapshotHeadersTx(ctx context.Context, tx *sql.Tx, reposit
 	}
 	for _, snapshot := range snapshots {
 		var existing models.Snapshot
-		var markerStatus, existingClient, existingMachine string
+		var markerStatus, existingClient, existingMachine, existingPaths string
 		err := tx.QueryRowContext(ctx, `SELECT timestamp,size,duration,source,marker_status,marker_profile_uuid,marker_job_uuid
-			,presentation_client_uuid,presentation_machine_label,native_root_type
+			,presentation_client_uuid,presentation_machine_label,native_root_type,native_source_paths
 			FROM metadata_cache_snapshots WHERE repository_database_id=? AND snapshot_id=?`, repositoryDatabaseID, snapshot.ID).Scan(
 			&existing.Timestamp, &existing.Size, &existing.Duration, &existing.Source, &markerStatus,
-			&existing.OwnershipMarker.ProfileID, &existing.OwnershipMarker.JobID, &existingClient, &existingMachine, &existing.NativeRootType)
+			&existing.OwnershipMarker.ProfileID, &existing.OwnershipMarker.JobID, &existingClient, &existingMachine, &existing.NativeRootType, &existingPaths)
 		if errors.Is(err, sql.ErrNoRows) {
 			delta.changed = true
 			if err := upsertMetadataSnapshotHeaderTxContext(ctx, tx, repositoryID, snapshot, "pending", "", ""); err != nil {
@@ -2271,9 +2356,14 @@ func reconcileMetadataSnapshotHeadersTx(ctx context.Context, tx *sql.Tx, reposit
 		if rootsErr != nil {
 			return delta, rootsErr
 		}
+		wantPaths, pathsErr := metadataNativeSourcePaths(snapshot)
+		if pathsErr != nil {
+			return delta, pathsErr
+		}
 		if existing.Timestamp != canonicalMetadataTimestamp(snapshot.Timestamp) || existing.Size != snapshot.Size || existing.Duration != snapshot.Duration ||
 			existing.Source != snapshot.Source || markerStatus != wantStatus || existing.OwnershipMarker.ProfileID != wantProfile || existing.OwnershipMarker.JobID != wantJob ||
-			existingClient != wantClient || existingMachine != wantMachine || existing.NativeRootType != snapshot.NativeRootType || !rootsEqual {
+			existingClient != wantClient || existingMachine != wantMachine || existing.NativeRootType != snapshot.NativeRootType || !rootsEqual ||
+			existingPaths != wantPaths {
 			delta.changed = true
 			if err := detachMetadataSnapshotsTx(ctx, tx, repositoryID, []string{snapshot.ID}); err != nil {
 				return delta, err
