@@ -429,7 +429,7 @@ func strongerRequest(current, next syncRequest) syncRequest {
 	}
 	current.postBackup = current.postBackup || next.postBackup
 	current.retainedSizing = current.retainedSizing || next.retainedSizing || manualHeaders
-	current.backupSnapshotIDs = append(current.backupSnapshotIDs, next.backupSnapshotIDs...)
+	current.backupSnapshotIDs = mergeBackupSnapshotIDs(current.backupSnapshotIDs, next.backupSnapshotIDs)
 	current.repository = next.repository
 	current.bypassEntryCooldown = current.bypassEntryCooldown || next.bypassEntryCooldown
 	if currentWasGeneral || nextIsGeneral {
@@ -448,6 +448,30 @@ func strongerRequest(current, next syncRequest) syncRequest {
 	}
 	current.snapshotIDs = merged
 	return current
+}
+
+// mergeBackupSnapshotIDs returns the IDs of both lists, each one once, in the
+// order they first appear. A sync that a backup interrupts is merged into the
+// pending request more than once before it resumes, so a plain append would
+// double or triple the list on every interruption, and a long index rebuild
+// under frequent backups would grow it until memory ran out. The only reader
+// uses the IDs as a set. The result is a new slice, so the request that is
+// still active never shares it with the pending one.
+func mergeBackupSnapshotIDs(current, next []string) []string {
+	if len(current) == 0 && len(next) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(current)+len(next))
+	merged := make([]string, 0, len(current)+len(next))
+	for _, ids := range [][]string{current, next} {
+		for _, id := range ids {
+			if !seen[id] {
+				seen[id] = true
+				merged = append(merged, id)
+			}
+		}
+	}
+	return merged
 }
 
 func scheduleRepositorySync(db *sql.DB, request syncRequest, rerunIfActive bool) bool {

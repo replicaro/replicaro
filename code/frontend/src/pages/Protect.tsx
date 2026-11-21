@@ -2751,7 +2751,7 @@ function ErrorCorrectionFields({
 	const enabled = form.eccOverheadPercent > 0;
 	return <section className="advanced-setting">
 		<label className="check"><input type="checkbox" checked={enabled} disabled={disabled} onChange={(event) => onChange({ ...form, eccOverheadPercent: event.target.checked ? DEFAULT_ECC_OVERHEAD_PERCENT : 0 })} />{t("ui.protect.enableErrorCorrection")}</label>
-		<small>{t("ui.protect.errorCorrectionHelp", { algorithm: ECC_ALGORITHM })}</small>
+		<small className="object-lock-help">{t("ui.protect.errorCorrectionHelp", { algorithm: ECC_ALGORITHM })}</small>
 		{enabled && <label className="field error-correction-overhead"><span>{t("ui.protect.errorCorrectionOverheadLabel")}</span><select value={form.eccOverheadPercent} disabled={disabled} onChange={(event) => onChange({ ...form, eccOverheadPercent: Number(event.target.value) })}>{ECC_OVERHEAD_PERCENTS.map((percent) => <option key={percent} value={percent}>{t("ui.protect.errorCorrectionPercent", { percent })}</option>)}</select></label>}
 	</section>;
 }
