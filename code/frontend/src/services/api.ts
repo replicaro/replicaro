@@ -884,6 +884,9 @@ export interface DownloadTicket {
 	url: string;
 	fileName: string;
 	expiresInSeconds: number;
+	// The ID the download is recorded under once the browser's request has
+	// started it (see getOperation); nothing exists under it before that.
+	operationId: string;
 }
 
 // The ticket request makes every check (vault, backup, path, regular file,
@@ -900,8 +903,10 @@ export const requestDownloadTicket = (target: DownloadTarget) =>
 // with "_" and dropped a leading dot), the browser shows the transfer in its
 // own download list, and the page stays where it is. When the address answers
 // an error instead of the file (a used ticket, a vault that became busy since
-// the ticket), the page can't see that answer; Chromium lists a failed
-// download and saves nothing (Firefox and Safari have not been tested). The
+// the ticket), the page can't see that answer, only that no download was
+// recorded under the ticket's operation ID (see FileDownloadButton); Chromium
+// lists a failed download and saves nothing (Firefox and Safari have not been
+// tested). The
 // file must never be fetched into the page and saved from there: the page
 // would hold the whole file in memory. Don't swap this for window.location,
 // window.open or a form submit either: those navigate (or open a tab) when

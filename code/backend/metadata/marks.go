@@ -36,9 +36,12 @@ type resticMarksResult struct {
 // for every indexed snapshot whose marks are missing or were made against a
 // backup that is no longer its previous one, and stores the files it marked.
 // It is part of indexing: it runs inside the same refresh, under the same
-// low-priority shared vault lock, after the content listings, and each diff
-// is one more read-only native command per neighbouring pair (two backups
-// removed in a row still cost one diff for the survivor after them).
+// low-priority shared vault lock, and each diff is one more read-only native
+// command per neighbouring pair (two backups removed in a row still cost one
+// diff for the survivor after them). The refresh calls it after each window
+// of content listings, for the pairs listed by then, and once more after the
+// last window; a pair is compared in the first call after both its backups
+// are listed, so each pair still costs one diff per refresh.
 //
 // A diff that fails although both backups are listed is a failed indexing
 // step for that snapshot: it is marked failed like a failed listing, with the

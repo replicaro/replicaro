@@ -30,16 +30,30 @@ func StartOperation(
 	startedAt time.Time,
 ) (string, error) {
 	id := uuid.New().String()
+	if err := StartOperationWithID(db, id, kind, title, jobID, repositoryID, startedAt); err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// StartOperationWithID is StartOperation for an ID the caller chose earlier.
+// A single-file download uses it: its ID is handed to the page with the
+// ticket, before the browser's request records the download.
+func StartOperationWithID(
+	db *sql.DB,
+	id, kind, title, jobID, repositoryID string,
+	startedAt time.Time,
+) error {
 	if _, err := db.Exec(
 		`INSERT INTO operations
 			(id, kind, status, title, job_id, repository_id, engine, started_at)
 			VALUES (?, ?, 'running', ?, ?, ?, COALESCE((SELECT engine FROM repositories WHERE id = ?), ''), ?)`,
 		id, kind, title, jobID, repositoryID, repositoryID, formatSortableTimestamp(startedAt),
 	); err != nil {
-		return "", err
+		return err
 	}
 	dashboardChanged()
-	return id, nil
+	return nil
 }
 
 // QueuedOperation describes a request-started operation (restore, manual

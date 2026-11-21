@@ -138,7 +138,7 @@
     --ink: #0a0c10;
     --ok: #54e0a8;
     --warn: #f2c063;
-    --running: #3b82f6;
+    --running: #0ea5e9;
     --danger: #f0776f;
     --danger-hover: #f79790;
     --rule: rgba(255, 255, 255, 0.07);
@@ -202,7 +202,7 @@
     --ink: #ffffff;
     --ok: #0f7a4e;
     --warn: #8a6209;
-    --running: #1d5fd0;
+    --running: #0284c7;
     --danger: #c3352c;
     --danger-hover: #d84a3f;
     --rule: rgba(13, 60, 70, 0.13);
@@ -254,7 +254,7 @@
     --ink: #ffffff;
     --ok: #14653f;
     --warn: #8f5f06;
-    --running: #1d5fd0;
+    --running: #0284c7;
     --danger: #a52521;
     --danger-hover: #bf332d;
     --rule: rgba(16, 26, 26, 0.14);
@@ -306,7 +306,7 @@
         --ink: #ffffff;
         --ok: #0f7a4e;
         --warn: #8a6209;
-        --running: #1d5fd0;
+        --running: #0284c7;
         --danger: #c3352c;
         --danger-hover: #d84a3f;
         --rule: rgba(13, 60, 70, 0.13);
@@ -3585,7 +3585,7 @@ select option {
    The cap keeps a long translation of the two buttons from taking the names'
    room on a wide screen; past it the buttons wrap. The space around "|" is
    the separator's margin rather than a column gap, because a gap would also
-   come before the refused download's message below and widen the column. */
+   come before the download's message below and widen the column. */
 .file-row-actions {
     display: flex;
     flex-wrap: wrap;
@@ -3600,14 +3600,28 @@ select option {
     font-size: 10px;
 }
 
-/* The actions column is shared by every row, so a refused download's message
-   must not size it: it has no width of its own (width: 0) and takes the full
-   line under its buttons (min-width: 100%), so it wraps at whatever width the
-   buttons gave the column instead of widening the column for every row. */
+/* The actions column is shared by every row, so the download's message (a
+   refused ticket, a download that did not start or failed) must not size it:
+   it has no width of its own (width: 0) and takes the full line under its
+   buttons (min-width: 100%), so it wraps at whatever width the buttons gave
+   the column instead of widening the column for every row. */
 .file-row-actions .download-message {
     width: 0;
     min-width: 100%;
     text-align: start;
+}
+
+/* Nor may the spinner shown beside Download while it runs: its negative end
+   margin cancels its width and its gap from the button, so it takes no room
+   in the column. When this row's buttons are what make the column as wide as
+   it is, the spinner hangs into the row's 16 px end padding, so it is sized
+   to the 10 px label and, with its gap, stays 3 px clear of the list's edge,
+   which clips anything beyond it. */
+.file-row-actions .spinner {
+    width: 10px;
+    height: 10px;
+    align-self: center;
+    margin-inline: 3px -13px;
 }
 
 .file-empty {
@@ -4375,9 +4389,11 @@ select option {
     cursor: not-allowed;
 }
 
-/* A Download button waiting for its ticket is only marked aria-disabled, so it
-   keeps keyboard focus; it looks and reacts like a disabled button (the
-   generic button:disabled look plus the rule above, without hover motion). */
+/* A busy Download button is marked aria-disabled rather than disabled, so it
+   keeps keyboard focus. It is busy from the click until its ticket was
+   refused, its download has ended or the page has given up on it starting;
+   meanwhile it looks and reacts like a disabled button (the generic
+   button:disabled look plus the rule above, without hover motion). */
 .find-selected-item button[aria-disabled="true"],
 .file-row .restore-file[aria-disabled="true"] {
     color: var(--idle);
@@ -4387,12 +4403,13 @@ select option {
     box-shadow: none;
 }
 
-/* A refused download's message sits on its own line under the row's buttons
-   (File History's selected item, the Restore page's file row), after every
-   other part of the row whatever its place in the markup. Its reason often
-   holds a path or another long unbroken word, and the column it sits in can
-   be narrow, so long words break inside it rather than being cut off or
-   running out of its box. */
+/* The download's message (a refused ticket, a download that did not start or
+   failed) sits on its own line under the row's buttons (File History's
+   selected item, the Restore page's file row), after every other part of the
+   row whatever its place in the markup. A refusal's reason often holds a path
+   or another long unbroken word, and the column it sits in can be narrow, so
+   long words break inside it rather than being cut off or running out of its
+   box. */
 .download-message {
     flex-basis: 100%;
     order: 1;

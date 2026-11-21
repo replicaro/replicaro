@@ -1286,6 +1286,11 @@ export default function Overview() {
 	);
 	const detailedOperation = operationDetail?.operation ?? selectedActiveOperation;
 	const detailedOperationActive = detailedOperation ? operationIsActive(detailedOperation) : false;
+	// A download's live log holds only the engine's error output, so it is
+	// usually empty while the file transfers; its waiting line says so.
+	const waitingForOutput = detailedOperation?.kind === "download"
+		? t("ui.pages.overview.waiting.for.the.download")
+		: t("ui.pages.overview.waiting.for.output");
 	const canceling = cancelAccepted || Boolean(operationDetail?.live.cancelRequested);
 
     return (
@@ -1437,14 +1442,16 @@ export default function Overview() {
 							</div>
 						)}
 						{backupLockedFilesSkipped(detailedOperation) && <SkippedLockedFiles operationID={detailedOperation.id} />}
-						<div className="modal-section-label">{t("ui.pages.overview.live.log")}</div>
+						{/* The heading's spinner shows the operation is still running even
+						    when its log has gone quiet. */}
+						<div className="modal-section-label row">{t("ui.pages.overview.live.log")}{detailedOperationActive && <span className="spinner" aria-hidden="true" />}</div>
                         {!detailedOperationActive && <button type="button" className="text-button" aria-pressed={showRawLog} onClick={() => setShowRawLog((raw) => !raw)}>{showRawLog ? t("ui.pages.overview.show.readable.log") : t("ui.pages.overview.show.raw.log")}</button>}
 						{detailedOperationActive ? !operationDetail ? (
-							<p className="row muted"><span className="spinner" />{t("ui.pages.overview.waiting.for.output")}</p>
+							<p className="row muted"><span className="spinner" />{waitingForOutput}</p>
 						) : !operationDetail.live.available ? (
 							<p className="muted">{t("ui.pages.overview.live.output.is.unavailable.for.this.operation")}</p>
 						) : operationDetail.live.entries.length === 0 ? (
-							<p className="row muted"><span className="spinner" />{t("ui.pages.overview.waiting.for.output")}</p>
+							<p className="row muted"><span className="spinner" />{waitingForOutput}</p>
 						) : (
 							<pre className="output operation-live-log" aria-live="polite">{[
 								// The live log is never translated, including this marker;

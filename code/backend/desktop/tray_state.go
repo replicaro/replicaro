@@ -50,7 +50,7 @@ func trayStateFor(running bool, failedRuns, warningRuns int) trayState {
 
 // trayRunningColor is the blue of the running state. Warnings and errors use
 // the notification icons' amber and red.
-var trayRunningColor = color.NRGBA{R: 0x3b, G: 0x82, B: 0xf6, A: 0xff}
+var trayRunningColor = color.NRGBA{R: 0x0e, G: 0xa5, B: 0xe9, A: 0xff}
 
 // trayStateTint returns the colour the icon is repainted in for state. Idle
 // has none: it shows Replicaro's own icon, unchanged.

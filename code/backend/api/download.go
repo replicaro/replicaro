@@ -16,6 +16,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/google/uuid"
 	"github.com/local/replicaro/command"
 	"github.com/local/replicaro/database"
 	"github.com/local/replicaro/engines"
@@ -38,6 +39,11 @@ import (
 // recorded as a "download" operation (timeline, Active now, live error output,
 // Cancel). It ends when the browser's connection drops, on Cancel, when the
 // application stops, or after downloadStallLimit without progress.
+//
+// The ticket also names the ID the download will be recorded under, so the
+// page can follow the operation (GET /api/operations?id=) once the browser
+// has started it. Until then the ID exists only in the ticket: a ticket that
+// is refused or never used leaves no record under it.
 const (
 	downloadPath          = "/api/download"
 	downloadTicketPath    = "/api/download/ticket"
@@ -80,7 +86,10 @@ type DownloadTicketRequest struct {
 type downloadTicket struct {
 	request  DownloadTicketRequest
 	fileName string
-	expires  time.Time
+	// operationID is a random UUID v4, the ID serveDownload records the
+	// download under.
+	operationID string
+	expires     time.Time
 }
 
 // downloadTickets lives in memory only, one store per API handler, so a
@@ -94,12 +103,18 @@ func newDownloadTickets() *downloadTickets {
 	return &downloadTickets{tickets: map[string]downloadTicket{}}
 }
 
-func (store *downloadTickets) issue(request DownloadTicketRequest, fileName string) (string, error) {
+// issue stores a new ticket and returns its token and the operation ID the
+// download will be recorded under.
+func (store *downloadTickets) issue(request DownloadTicketRequest, fileName string) (string, string, error) {
 	var raw [32]byte
 	if _, err := rand.Read(raw[:]); err != nil {
-		return "", err
+		return "", "", err
 	}
 	token := base64.RawURLEncoding.EncodeToString(raw[:])
+	operationID, err := uuid.NewRandom()
+	if err != nil {
+		return "", "", err
+	}
 	now := time.Now()
 	store.mu.Lock()
 	defer store.mu.Unlock()
@@ -108,8 +123,8 @@ func (store *downloadTickets) issue(request DownloadTicketRequest, fileName stri
 			delete(store.tickets, key)
 		}
 	}
-	store.tickets[token] = downloadTicket{request: request, fileName: fileName, expires: now.Add(downloadTicketLifetime)}
-	return token, nil
+	store.tickets[token] = downloadTicket{request: request, fileName: fileName, operationID: operationID.String(), expires: now.Add(downloadTicketLifetime)}
+	return token, operationID.String(), nil
 }
 
 // redeem hands out a ticket once. A used, unknown or expired ticket gives
@@ -313,7 +328,7 @@ func issueDownloadTicket(db *sql.DB, tickets *downloadTickets, w http.ResponseWr
 		writeDownloadRefusal(w, errDownloadVaultBusy)
 		return
 	}
-	token, err := tickets.issue(request, target.fileName)
+	token, operationID, err := tickets.issue(request, target.fileName)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
@@ -322,6 +337,7 @@ func issueDownloadTicket(db *sql.DB, tickets *downloadTickets, w http.ResponseWr
 		"url":              downloadPath + "?ticket=" + token,
 		"fileName":         target.fileName,
 		"expiresInSeconds": int(downloadTicketLifetime / time.Second),
+		"operationId":      operationID,
 	})
 }
 
@@ -448,13 +464,12 @@ func serveDownload(db *sql.DB, runtimeManager *operationruntime.Manager, w http.
 		writeDownloadRefusal(w, err)
 		return
 	}
-	operationID, err := database.StartOperation(db, downloadOperationKind, downloadTitle(ticket.fileName), "", repo.ID, time.Now())
-	if err != nil {
+	if err := database.StartOperationWithID(db, ticket.operationID, downloadOperationKind, downloadTitle(ticket.fileName), "", repo.ID, time.Now()); err != nil {
 		release()
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
-	succeeded := runDownloadOperation(db, runtimeManager, lifetime, w, r, repo, ticket, operationID, release)
+	succeeded := runDownloadOperation(db, runtimeManager, lifetime, w, r, repo, ticket, ticket.operationID, release)
 	release()
 	if !succeeded {
 		panic(http.ErrAbortHandler)

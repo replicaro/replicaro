@@ -727,6 +727,9 @@ function VaultFileHistory({
 	const [browsePages, setBrowsePages] = useState<BrowsePageMap>({});
 	const [expandedBrowseKeys, setExpandedBrowseKeys] = useState<string[]>([]);
 	const [browseErrors, setBrowseErrors] = useState<BrowseErrorMap>({});
+	// Set while the preparation below loads the snapshots and the root of the
+	// tree, so the tree's block shows its loading line instead of nothing.
+	const [rootLoading, setRootLoading] = useState(false);
     const generation = useRef(0);
     const searchGeneration = useRef(0);
     const snapshotRequest = useRef<AbortController | null>(null);
@@ -793,6 +796,7 @@ function VaultFileHistory({
 		setChosenFileVersions({});
 		setBrowseItems({});
 		setBrowsePages({ [browseRootKey]: emptyPageState() });
+		setRootLoading(false);
 		void (async () => {
 			try {
 				let status = await prepareMetadata(selected, action);
@@ -833,10 +837,14 @@ function VaultFileHistory({
 						status = await prepareMetadata(selected, "access");
 						continue;
 					}
+					setRootLoading(true);
 					const [nextSnapshots, catalogRoot] = await Promise.all([
 						listSnapshots(selected, controller.signal),
 						browseFiles(selected, "", "", 0, controller.signal),
-					]);
+					]).finally(() => {
+						// A later run starts with its own state; this one must not end its loading line.
+						if (preparationRun.current === run) setRootLoading(false);
+					});
 					if (controller.signal.aborted || generation.current !== vaultGeneration) return;
 					const pendingGeneration = pendingDirtyGeneration.current;
 					const appliedGeneration = Math.max(
@@ -1469,7 +1477,7 @@ function VaultFileHistory({
 								<div className="browse-vault-panel">
 									{(() => { const key = browseRootKey; const items = browseItems[key]; const page = browsePages[key]; return <section className="find-presentation-group without-heading" aria-label={allVaults ? t("ui.fileHistory.browseNamedVaultFiles", { vault: repository.name }) : t("ui.fileHistory.browseVaultFiles")}>
 									{browseErrors[key] && <div className="inline-error" role="alert">{browseErrors[key]} <button type="button" className="btn" onClick={() => void loadBrowsePage(null, false)}>{t("ui.pages.findfile.retry.vault.browser")}</button></div>}
-									{page?.loading && items === undefined && <div className="browse-tree" role="list" aria-label={t("ui.pages.findfile.vault.file.history")}><div role="listitem" className="browse-tree-status"><span className="spinner" /> {t("ui.pages.findfile.loading.vault.contents")}</div></div>}
+									{(rootLoading || page?.loading) && items === undefined && <div className="browse-tree" role="list" aria-label={t("ui.pages.findfile.vault.file.history")}><div role="listitem" className="browse-tree-status"><span className="spinner" /> {t("ui.pages.findfile.loading.file.history")}</div></div>}
 									{items && items.length > 0 && <div className="browse-tree" role="list" aria-label={t("ui.pages.findfile.vault.file.history")}>{renderBrowseRows(items, 0)}</div>}
 									{page?.hasMore && <button type="button" className="btn browse-load-more" disabled={page.loading} onClick={() => void loadBrowsePage(null, true)}>{page.loading && <span className="spinner" />}{t("ui.pages.findfile.load.more.sources")}</button>}
 									{items?.length === 0 && !page?.loading && <div className="browse-tree" role="list" aria-label={t("ui.pages.findfile.vault.file.history")}><div role="listitem" className="browse-tree-status">{t("ui.pages.findfile.no.files.or.folders.found.yet")}</div></div>}

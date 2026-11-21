@@ -1287,12 +1287,37 @@ func syncRepositoryLocked(ctx context.Context, db *sql.DB, repo models.Repositor
 	var firstErr error
 	var persistenceErr error
 	setCoordinatorStage(db, repo, "indexing_entries")
+	// The entry phase also spans the Restic diffs that run between its
+	// windows; each of those calls reports its own snapshot_version_marks
+	// phase.
 	entryPhase := beginIndexPhase("snapshot_entry_index")
 	entryDiagnostic := IndexPhaseDiagnostic{Snapshots: len(orderedSnapshots)}
 	defer func() { entryPhase.finish(entryDiagnostic) }()
 	readerLimit := 1
 	if request.intent == intentHeaders && indexSession != nil {
 		readerLimit = snapshotIndexReadersPerRepository
+	}
+	// runResticMarks runs the Restic diffs whose two backups are both listed
+	// by now (see indexResticMarks). Restic marks need the snapshots' file
+	// rows, so a diff waits for both listings. A failed diff is kept as the
+	// refresh's error, like a failed listing, and the refresh goes on; a
+	// cancellation or any other error ends it.
+	runResticMarks := func() error {
+		err := indexResticMarks(ctx, db, manager, repo, readerLimit)
+		if err == nil {
+			return nil
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		var native *engineError
+		if !errors.As(err, &native) {
+			return err
+		}
+		if firstErr == nil {
+			firstErr = err
+		}
+		return nil
 	}
 	for start := 0; start < len(orderedSnapshots); start += readerLimit {
 		setCoordinatorStage(db, repo, "indexing_entries")
@@ -1384,6 +1409,16 @@ func syncRepositoryLocked(ctx context.Context, db *sql.DB, repo models.Repositor
 				persistenceErr = replaceErr
 			}
 		}
+		// The diffs that can run now run before the next window is listed, so
+		// the index state, which counts a listed Restic snapshot as pending
+		// until its diff has run, moves while the listings go on. After a
+		// failed cache write the remaining listings are still made, but no
+		// diff runs, as after the loop.
+		if persistenceErr == nil {
+			if err := runResticMarks(); err != nil {
+				return err
+			}
+		}
 	}
 	entryPhase.finish(entryDiagnostic)
 	uiDiagnostic.Snapshots = entryDiagnostic.Snapshots
@@ -1393,19 +1428,11 @@ func syncRepositoryLocked(ctx context.Context, db *sql.DB, repo models.Repositor
 	if persistenceErr != nil {
 		return persistenceErr
 	}
-	// Restic marks need the snapshots' file rows, so they come after the
-	// listings. A failed listing doesn't stop the marks of the others.
-	if err := indexResticMarks(ctx, db, manager, repo, readerLimit); err != nil {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return ctxErr
-		}
-		var native *engineError
-		if !errors.As(err, &native) {
-			return err
-		}
-		if firstErr == nil {
-			firstErr = err
-		}
+	// Whatever diffs are left run now: those of an entry-only refresh that
+	// listed nothing, for example. A failed listing doesn't stop the marks of
+	// the others.
+	if err := runResticMarks(); err != nil {
+		return err
 	}
 	if err := closeIndexSession(); err != nil {
 		return errors.Join(err,
